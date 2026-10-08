@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Tubefast">
+  <circle cx="50" cy="50" r="48" fill="#F4623F"/>
+  <circle cx="50" cy="50" r="27.5" fill="none" stroke="#0A0B0D" stroke-width="2"/>
+  <circle cx="50" cy="50" r="8.5" fill="#0A0B0D"/>
+</svg>
