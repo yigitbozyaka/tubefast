@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Tubefast: YouTube Music, native and fast</title>
-<meta name="description" content="A lightweight YouTube Music player for Windows, written in Rust with no browser engine inside. One exe of about 9 MB, about 100 MB of memory while playing.">
+<meta name="description" content="A lightweight YouTube Music player for Windows, macOS and Linux, written in Rust with no browser engine inside. A download of about 9 MB, about 100 MB of memory while playing.">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0E0F12">
 <link rel="canonical" href="https://tubefast.dev/">
@@ -12,7 +12,7 @@
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Tubefast">
 <meta property="og:title" content="Tubefast: YouTube Music, native and fast">
-<meta property="og:description" content="A lightweight YouTube Music player for Windows, written in Rust with no browser engine inside.">
+<meta property="og:description" content="A lightweight YouTube Music player for Windows, macOS and Linux, written in Rust with no browser engine inside.">
 <meta property="og:url" content="https://tubefast.dev/">
 <meta property="og:image" content="https://tubefast.dev/home.png">
 <meta property="og:image:width" content="1360">
@@ -65,6 +65,19 @@ code{font-family:var(--mono);font-size:.92em}
 .button{display:inline-block;padding:15px 28px;border-radius:999px;background:var(--accent);color:var(--on-accent);font-weight:600;text-decoration:none}
 .button:hover{background:#FF7653;color:var(--on-accent)}
 .fine{margin-top:18px;font-size:14.5px;color:var(--faint)}
+.others{margin-top:6px;font-size:14.5px;color:var(--faint)}
+.others a{color:var(--muted)}
+.picker{display:none;gap:6px;margin-bottom:36px;padding:4px;width:max-content;max-width:100%;border-radius:999px;box-shadow:inset 0 0 0 1px var(--line)}
+.js .picker{display:flex}
+.pick{padding:8px 18px;border:0;border-radius:999px;background:none;color:var(--muted);font:600 15px/1.2 var(--body);cursor:pointer}
+.pick:hover{color:var(--text)}
+.pick[aria-pressed="true"]{background:var(--text);color:var(--base)}
+.os ~ .os{margin-top:56px}
+.os ~ .step{margin-top:44px}
+.js .os ~ .os{margin-top:0}
+.js .os[hidden]{display:none}
+.os-name{font:800 30px/1 var(--display);letter-spacing:.01em;margin-bottom:24px}
+.js .os-name{display:none}
 
 .stage{position:relative;isolation:isolate;margin-top:clamp(48px,7vw,96px);padding-right:23%}
 .shot{position:relative;z-index:1;display:block;width:100%;height:auto;border-radius:10px;box-shadow:0 0 0 1px rgba(255,255,255,.08),0 48px 90px -24px rgba(0,0,0,.75)}
@@ -127,12 +140,13 @@ code{font-family:var(--mono);font-size:.92em}
 
 <section class="wrap hero">
   <h1 class="headline">YouTube Music,<br>native and fast.</h1>
-  <p class="lede">Tubefast is a desktop player for Windows, written in Rust. It talks to YouTube directly, decodes the audio itself and draws every pixel natively. There is no Chromium and no WebView inside.</p>
+  <p class="lede">Tubefast is a desktop player for Windows, macOS and Linux, written in Rust. It talks to YouTube directly, decodes the audio itself and draws every pixel natively. There is no Chromium and no WebView inside.</p>
   <div class="actions">
-    <a class="button" href="https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast-windows-x64.zip">Download for Windows</a>
+    <a class="button" id="download" href="#install">Download</a>
     <a href="https://github.com/yigitbozyaka/tubefast">Read the source on GitHub</a>
   </div>
-  <p class="fine">One exe, about 9 MB, no installer. It is not code signed yet, so see <a href="#install">how to install</a>.</p>
+  <p class="fine" id="fine">For Windows, macOS and Linux. See <a href="#install">how to install</a> on yours.</p>
+  <p class="others" id="others" hidden></p>
   <div class="stage">
     <svg class="disc" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="50" fill="#F4623F"/><circle cx="50" cy="50" r="28.6" fill="none" stroke="#0A0B0D" stroke-width="2.1"/><circle cx="50" cy="50" r="8.9" fill="#0E0F12"/></svg>
     <img class="shot" src="home.png" width="1360" height="891" alt="Tubefast playing a track, with the home feed in the middle and the queue on the right">
@@ -194,7 +208,7 @@ code{font-family:var(--mono);font-size:.92em}
     </li>
     <li>
       <h3 class="name">Media keys</h3>
-      <p class="text">Play, pause, next and previous work from any window, and the track shows up in the Windows media overlay.</p>
+      <p class="text">Play, pause, next and previous work from any window, and the track shows up in the Windows media overlay, in Now Playing on macOS and in the media controls of Linux desktops.</p>
     </li>
     <li>
       <h3 class="name">Updates itself</h3>
@@ -240,22 +254,56 @@ code{font-family:var(--mono);font-size:.92em}
 <section class="wrap band" aria-labelledby="install">
   <h2 class="title" id="install">Install</h2>
   <div class="steps">
-    <h3 class="step">With Scoop</h3>
-    <p class="para"><a href="https://scoop.sh">Scoop</a> installs it without a Windows warning.</p>
-    <pre class="cmd"><code>scoop install https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast.json</code></pre>
+    <div class="picker" role="group" aria-label="Your system">
+      <button class="pick" type="button" data-os="windows" aria-pressed="false">Windows</button>
+      <button class="pick" type="button" data-os="macos" aria-pressed="false">macOS</button>
+      <button class="pick" type="button" data-os="linux" aria-pressed="false">Linux</button>
+    </div>
 
-    <h3 class="step">By hand</h3>
-    <ol class="list">
-      <li>Download <a href="https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast-windows-x64.zip">tubefast-windows-x64.zip</a>.</li>
-      <li>Right-click the zip, choose Properties, tick Unblock and press OK.</li>
-      <li>Unzip it anywhere and run <code>tubefast.exe</code>.</li>
-    </ol>
-    <p class="para">Step 2 is there because Tubefast is not code signed. Windows trusts a new program only after enough people have run it, so without that step the first launch shows “Windows protected your PC”. If you see it, choose More info, then Run anyway.</p>
+    <div class="os" id="install-windows" data-os="windows">
+      <h3 class="os-name">Windows</h3>
+      <h3 class="step">With Scoop</h3>
+      <p class="para"><a href="https://scoop.sh">Scoop</a> installs it without a Windows warning.</p>
+      <pre class="cmd"><code>scoop install https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast.json</code></pre>
+
+      <h3 class="step">By hand</h3>
+      <ol class="list">
+        <li>Download <a href="https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast-windows-x64.zip">tubefast-windows-x64.zip</a>.</li>
+        <li>Right-click the zip, choose Properties, tick Unblock and press OK.</li>
+        <li>Unzip it anywhere and run <code>tubefast.exe</code>.</li>
+      </ol>
+      <p class="para">Step 2 is there because Tubefast is not code signed. Windows trusts a new program only after enough people have run it, so without that step the first launch shows “Windows protected your PC”. If you see it, choose More info, then Run anyway.</p>
+    </div>
+
+    <div class="os" id="install-macos" data-os="macos">
+      <h3 class="os-name">macOS</h3>
+      <h3 class="step">Apple silicon and Intel, macOS 11 or later</h3>
+      <ol class="list">
+        <li>Download <a href="https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast-macos-universal.zip">tubefast-macos-universal.zip</a> and unzip it.</li>
+        <li>Move <code>Tubefast.app</code> to Applications.</li>
+        <li>Clear the download flag once, then open it as usual:</li>
+      </ol>
+      <pre class="cmd"><code>xattr -dr com.apple.quarantine /Applications/Tubefast.app</code></pre>
+      <p class="para">Step 3 is there because Tubefast is not notarized by Apple yet. Without it, macOS says the app “is damaged and can’t be opened”.</p>
+    </div>
+
+    <div class="os" id="install-linux" data-os="linux">
+      <h3 class="os-name">Linux</h3>
+      <h3 class="step">AppImage</h3>
+      <p class="para">For x86-64 distributions with glibc 2.35 or newer, such as Ubuntu 22.04, Debian 12 or Fedora 36. Download <a href="https://github.com/yigitbozyaka/tubefast/releases/latest/download/Tubefast-x86_64.AppImage">Tubefast-x86_64.AppImage</a>, make it executable and run it:</p>
+      <pre class="cmd"><code>chmod +x Tubefast-x86_64.AppImage
+./Tubefast-x86_64.AppImage</code></pre>
+
+      <h3 class="step">Installed, with a menu entry</h3>
+      <p class="para">Download <a href="https://github.com/yigitbozyaka/tubefast/releases/latest/download/tubefast-linux-x64.tar.gz">tubefast-linux-x64.tar.gz</a> and run its installer. It puts Tubefast in <code>~/.local/bin</code> and adds it to your app menu. <code>install.sh --uninstall</code> removes it again.</p>
+      <pre class="cmd"><code>tar -xzf tubefast-linux-x64.tar.gz
+tubefast/install.sh</code></pre>
+    </div>
 
     <h3 class="step">Check what you downloaded</h3>
     <p class="para">Every release is built by GitHub from the public source. You can confirm that your download is one of them:</p>
     <pre class="cmd"><code>gh attestation verify tubefast-windows-x64.zip --repo yigitbozyaka/tubefast</code></pre>
-    <p class="para">Each release also lists the SHA-256 of the zip in <code>SHA256SUMS.txt</code>.</p>
+    <p class="para">Use the name of the file you downloaded. Each release also lists the SHA-256 of every download in <code>SHA256SUMS.txt</code>.</p>
 
     <h3 class="step">Build it yourself</h3>
     <p class="para">You need <a href="https://rustup.rs">Rust</a> 1.90 or newer.</p>
@@ -281,8 +329,8 @@ cargo run --release</code></pre>
       <p class="text">At start it reads <code>clients.json</code> and checks whether a newer release exists. Nothing about you is sent, and there is no telemetry.</p>
     </li>
     <li>
-      <h3 class="name">Windows only, for now</h3>
-      <p class="text">The code also builds and passes its tests on Linux, but nobody has used it there yet. Linux and macOS ports are welcome.</p>
+      <h3 class="name">Linux builds are new</h3>
+      <p class="text">Windows and macOS are where it is used most. On Linux the fallback font for non-Latin scripts is still missing, and bug reports from Linux are very welcome.</p>
     </li>
     <li>
       <h3 class="name">Audio is 128 kbps AAC, for now</h3>
@@ -307,7 +355,7 @@ cargo run --release</code></pre>
 
 <footer class="wrap">
   <div class="foot">
-    <p>Tubefast is open source under the MIT license. YouTube and YouTube Music are trademarks of Google LLC. This page runs no scripts and loads nothing from other sites.</p>
+    <p>Tubefast is open source under the MIT license. YouTube and YouTube Music are trademarks of Google LLC. The one script on this page picks the download for your system, and the page loads nothing from other sites.</p>
     <p class="footlinks">
       <a href="https://github.com/yigitbozyaka/tubefast">Source</a>
       <a href="https://github.com/yigitbozyaka/tubefast/releases">Releases</a>
@@ -316,5 +364,64 @@ cargo run --release</code></pre>
   </div>
 </footer>
 
+<script>
+(function () {
+  var files = {
+    windows: { name: "Windows", file: "tubefast-windows-x64.zip", fine: "One exe, about 9 MB, no installer. It is not code signed yet, so see " },
+    macos: { name: "macOS", file: "tubefast-macos-universal.zip", fine: "For Apple silicon and Intel, macOS 11 or later. It is not notarized yet, so see " },
+    linux: { name: "Linux", file: "Tubefast-x86_64.AppImage", fine: "An AppImage for x86-64. There is also a tarball with a menu entry, so see " }
+  };
+  var order = ["windows", "macos", "linux"];
+
+  function detect() {
+    var ua = navigator.userAgent;
+    var platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+    if (/android|iphone|ipad|ipod|cros/i.test(ua) || (/mac/i.test(platform) && navigator.maxTouchPoints > 1)) return null;
+    if (/win/i.test(platform)) return "windows";
+    if (/mac/i.test(platform)) return "macos";
+    if (/linux/i.test(platform) && !/arm|aarch64/i.test(platform)) return "linux";
+    return null;
+  }
+
+  function show(os) {
+    document.querySelectorAll(".pick").forEach(function (pick) {
+      pick.setAttribute("aria-pressed", String(pick.dataset.os === os));
+    });
+    document.querySelectorAll(".os").forEach(function (block) {
+      block.hidden = block.dataset.os !== os;
+    });
+  }
+
+  document.documentElement.classList.add("js");
+  var os = detect();
+  show(os || "windows");
+  document.querySelectorAll(".pick").forEach(function (pick) {
+    pick.addEventListener("click", function () { show(pick.dataset.os); });
+  });
+  if (!os) return;
+
+  var button = document.getElementById("download");
+  button.href = "https://github.com/yigitbozyaka/tubefast/releases/latest/download/" + files[os].file;
+  button.textContent = "Download for " + files[os].name;
+  var fine = document.getElementById("fine");
+  fine.textContent = files[os].fine;
+  var how = document.createElement("a");
+  how.href = "#install";
+  how.textContent = "how to install";
+  fine.append(how, ".");
+  var others = document.getElementById("others");
+  others.append("Also for ");
+  order.filter(function (other) { return other !== os; }).forEach(function (other, index) {
+    if (index) others.append(" and ");
+    var link = document.createElement("a");
+    link.href = "#install";
+    link.textContent = files[other].name;
+    link.addEventListener("click", function () { show(other); });
+    others.append(link);
+  });
+  others.append(".");
+  others.hidden = false;
+})();
+</script>
 </body>
 </html>
