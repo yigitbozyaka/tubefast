@@ -106,8 +106,9 @@ fn mapped(path: &std::path::Path) -> Option<&'static [u8]> {
     Some(&Box::leak(Box::new(map))[..])
 }
 
-/// Fonts Linux distributions ship for the scripts Onest lacks, in fallback order. Every Noto font follows them, the sans ones first.
-const LINUX_FONTS: [&str; 9] = [
+/// Fonts each system ships for the scripts the fonts above lack, in fallback order. Every Noto font follows them, the sans ones first.
+const FALLBACK_FONTS: [&str; 43] = [
+    // Linux
     "NotoSansCJK-Regular.ttc",
     "NotoSansCJK-VF.ttc",
     "DroidSansFallbackFull.ttf",
@@ -117,12 +118,60 @@ const LINUX_FONTS: [&str; 9] = [
     "Lohit-Devanagari.ttf",
     "DejaVuSans.ttf",
     "FreeSans.ttf",
+    // macOS
+    "SFArabic.ttf",
+    "GeezaPro.ttc",
+    "SFHebrew.ttf",
+    "SFArmenian.ttf",
+    "SFGeorgian.ttf",
+    "KohinoorBangla.ttc",
+    "KohinoorGujarati.ttc",
+    "KohinoorTelugu.ttc",
+    "MuktaMahee.ttc",
+    "Tamil Sangam MN.ttc",
+    "Kannada Sangam MN.ttc",
+    "Malayalam Sangam MN.ttc",
+    "Oriya Sangam MN.ttc",
+    "Sinhala Sangam MN.ttc",
+    "Khmer Sangam MN.ttf",
+    "Lao Sangam MN.ttf",
+    "Myanmar Sangam MN.ttc",
+    "KefaIII.ttf",
+    "Kailasa.ttc",
+    "Arial Unicode.ttf",
+    // Windows
+    "msjh.ttc",
+    "YuGothR.ttc",
+    "ebrima.ttf",
+    "mmrtext.ttf",
+    "himalaya.ttf",
+    "monbaiti.ttf",
+    "gadugi.ttf",
+    "javatext.ttf",
+    "msyi.ttf",
+    "taile.ttf",
+    "ntailu.ttf",
+    "phagspa.ttf",
+    "seguihis.ttf",
+    "simsunb.ttf",
 ];
 
-fn linux_fonts() -> Vec<(String, &'static [u8])> {
-    let mut dirs: Vec<std::path::PathBuf> = vec!["/usr/share/fonts".into(), "/usr/local/share/fonts".into()];
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.extend([".local/share/fonts", ".fonts"].map(|dir| std::path::Path::new(&home).join(dir)));
+fn fallback_fonts() -> Vec<(String, &'static [u8])> {
+    let mut dirs: Vec<std::path::PathBuf> = [
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/System/Library/Fonts",
+        "/Library/Fonts",
+    ]
+    .map(Into::into)
+    .into();
+    for (var, below) in [
+        ("HOME", ".local/share/fonts"),
+        ("HOME", ".fonts"),
+        ("HOME", "Library/Fonts"),
+        ("WINDIR", "Fonts"),
+    ] {
+        dirs.extend(std::env::var_os(var).map(|root| std::path::Path::new(&root).join(below)));
     }
     let mut found = Vec::new();
     while let Some(dir) = dirs.pop() {
@@ -131,12 +180,12 @@ fn linux_fonts() -> Vec<(String, &'static [u8])> {
             let noto = name.starts_with("Noto")
                 && !name.contains("Italic")
                 && ["-Regular.ttf", "-Regular.otf", "[wght].ttf"].iter().any(|end| name.ends_with(end));
-            let listed = LINUX_FONTS.iter().position(|font| name == *font);
+            let listed = FALLBACK_FONTS.iter().position(|font| name.eq_ignore_ascii_case(font));
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 dirs.push(entry.path());
             } else if listed.is_some() || noto {
-                let rank = listed.unwrap_or(LINUX_FONTS.len() + usize::from(!name.starts_with("NotoSans")));
-                found.push((rank, name, entry.path()));
+                let rank = listed.unwrap_or(FALLBACK_FONTS.len() + usize::from(!name.starts_with("NotoSans")));
+                found.push((rank, name.to_lowercase(), entry.path()));
             }
         }
     }
@@ -202,8 +251,8 @@ pub fn install(ctx: &egui::Context) {
             fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
         }
     }
-    let linux = linux_fonts();
-    for (name, bytes) in &linux {
+    let fallback = fallback_fonts();
+    for (name, bytes) in &fallback {
         fonts.font_data.insert(name.clone(), Arc::new(FontData::from_static(bytes)));
     }
     let known = fonts.font_data.clone();
@@ -222,7 +271,7 @@ pub fn install(ctx: &egui::Context) {
         ];
         own.into_iter()
             .chain(fallbacks)
-            .chain(linux.iter().map(|(name, _)| name.as_str()))
+            .chain(fallback.iter().map(|(name, _)| name.as_str()))
             .filter(|name| known.contains_key(*name))
             .map(str::to_owned)
             .collect()
@@ -2525,7 +2574,7 @@ mod tests {
 
     #[test]
     fn draws_text_with_every_system_font_it_finds() {
-        for (name, bytes) in linux_fonts() {
+        for (name, bytes) in fallback_fonts() {
             let mut fonts = FontDefinitions::empty();
             fonts.font_data.insert(name.clone(), Arc::new(FontData::from_static(bytes)));
             fonts.families.insert(FontFamily::Proportional, vec![name.clone()]);
