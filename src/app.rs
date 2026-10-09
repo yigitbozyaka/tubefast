@@ -1,6 +1,6 @@
 use crate::art::Art;
 use crate::auth;
-use crate::discord::Discord;
+use crate::discord::{Discord, Headline};
 use crate::media::Media;
 use crate::player::Player;
 use crate::ui;
@@ -78,6 +78,7 @@ pub struct Saved {
     pub position_ms: u64,
     pub lyrics_open: bool,
     pub discord: bool,
+    pub discord_headline: Headline,
 }
 
 pub enum Words {
@@ -143,6 +144,7 @@ impl Default for Saved {
             position_ms: 0,
             lyrics_open: false,
             discord: false,
+            discord_headline: Headline::App,
         }
     }
 }
@@ -193,6 +195,7 @@ pub enum Action {
     ClearHistory,
     RestoreHistory(Vec<Item>),
     ShowOnDiscord(bool),
+    DiscordHeadline(Headline),
 }
 
 enum Event {
@@ -941,6 +944,7 @@ impl App {
                 self.discord_linked = None;
                 self.discord = shown.then(|| link_discord(&self.sender, &self.ctx));
             }
+            Action::DiscordHeadline(headline) => self.saved.discord_headline = headline,
         }
     }
 }
@@ -971,7 +975,7 @@ impl eframe::App for App {
         }
         if let Some(discord) = self.discord.as_mut().filter(|_| !self.player.loading()) {
             let track = item.filter(|_| playing).map(|item| (item, self.saved.covers.of(item)));
-            discord.show(track, position_ms, duration_ms);
+            discord.show(track, self.saved.discord_headline, position_ms, duration_ms);
         }
     }
 

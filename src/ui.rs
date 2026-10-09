@@ -1,6 +1,7 @@
 use crate::APP_NAME;
 use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
 use crate::art::Art;
+use crate::discord::Headline;
 use crate::ytm::{Item, Layout};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
@@ -1764,6 +1765,20 @@ fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
                 let at = pos2(line.left() + 46.0, line.center().y - 4.0);
                 label(ui, at, Align2::LEFT_CENTER, status, sans(12.0), MUTED, line.width() - 58.0);
                 response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, status));
+                menu_divider(ui);
+                for (headline, text) in [
+                    (Headline::App, "Listening to Tubefast"),
+                    (Headline::Artist, "Listening to the artist"),
+                    (Headline::Song, "Listening to the song"),
+                ] {
+                    let chosen = app.saved.discord_headline == headline;
+                    let symbol = if chosen { icon::CHECK } else { "" };
+                    let row = menu_row(ui, symbol, glyph(15.0), ACCENT, text);
+                    row.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, chosen, text));
+                    if row.clicked() {
+                        out.push(Action::DiscordHeadline(headline));
+                    }
+                }
             }
         });
     row.max.x -= 36.0;

@@ -1,4 +1,5 @@
 use crate::ytm::{self, Item};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -17,9 +18,17 @@ const COVER_SIDE: u32 = 512;
 const SHORTEST_LINE: usize = 2;
 const LONGEST_LINE: usize = 128;
 
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub enum Headline {
+    #[default]
+    App,
+    Artist,
+    Song,
+}
+
 pub struct Discord {
     updates: Sender<Option<Value>>,
-    shown: Option<(String, String, u64)>,
+    shown: Option<(String, String, Headline, u64)>,
 }
 
 impl Discord {
@@ -29,15 +38,15 @@ impl Discord {
         Self { updates, shown: None }
     }
 
-    pub fn show(&mut self, track: Option<(&Item, &str)>, position_ms: u64, duration_ms: u64) {
+    pub fn show(&mut self, track: Option<(&Item, &str)>, headline: Headline, position_ms: u64, duration_ms: u64) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_millis() as u64);
         let started = now.saturating_sub(position_ms);
         let track = track.filter(|_| duration_ms > 0);
         let unchanged = match (&self.shown, track) {
-            (Some((video_id, art, shown)), Some((item, cover))) => {
-                *video_id == item.video_id && art == cover && shown.abs_diff(started) < SEEK_TOLERANCE_MS
+            (Some((video_id, art, named, shown)), Some((item, cover))) => {
+                *video_id == item.video_id && art == cover && *named == headline && shown.abs_diff(started) < SEEK_TOLERANCE_MS
             }
             (None, None) => true,
             _ => false,
@@ -45,10 +54,10 @@ impl Discord {
         if unchanged {
             return;
         }
-        self.shown = track.map(|(item, cover)| (item.video_id.clone(), cover.to_owned(), started));
+        self.shown = track.map(|(item, cover)| (item.video_id.clone(), cover.to_owned(), headline, started));
         let _ = self
             .updates
-            .send(track.map(|(item, cover)| activity(item, cover, started, duration_ms)));
+            .send(track.map(|(item, cover)| activity(item, cover, headline, started, duration_ms)));
     }
 }
 
@@ -145,9 +154,10 @@ fn exchange(pipe: &mut (impl Read + Write), opcode: u32, payload: &Value) -> io:
     Ok(())
 }
 
-fn activity(item: &Item, cover: &str, started: u64, duration_ms: u64) -> Value {
+fn activity(item: &Item, cover: &str, headline: Headline, started: u64, duration_ms: u64) -> Value {
     let mut activity = json!({
         "type": LISTENING,
+        "status_display_type": headline as u8,
         "details": line(&item.title),
         "state": line(artist(item)),
         "timestamps": { "start": started, "end": started + duration_ms },
@@ -234,8 +244,12 @@ mod tests {
             ..Item::default()
         };
         let cover = "https://lh3.googleusercontent.com/abc=w120-h120-l90-rj";
-        let shown = activity(&song("Get Lucky", "Daft Punk • Random Access Memories", &[]), cover, 1000, 248_000);
+        let lucky = song("Get Lucky", "Daft Punk • Random Access Memories", &[]);
+        let shown = activity(&lucky, cover, Headline::App, 1000, 248_000);
         assert_eq!(shown["type"], 2);
+        assert_eq!(shown["status_display_type"], 0);
+        assert_eq!(activity(&lucky, cover, Headline::Artist, 0, 1)["status_display_type"], 1);
+        assert_eq!(activity(&lucky, cover, Headline::Song, 0, 1)["status_display_type"], 2);
         assert_eq!(shown["details"], "Get Lucky");
         assert_eq!(shown["state"], "Daft Punk");
         assert_eq!(shown["timestamps"], json!({ "start": 1000, "end": 249_000 }));
@@ -244,13 +258,25 @@ mod tests {
             "https://lh3.googleusercontent.com/abc=w512-h512-l90-rj"
         );
 
-        let video = activity(&song("7", "Video • Prince • 12M views", &["Prince"]), "", 0, 1);
+        let video = activity(&song("7", "Video • Prince • 12M views", &["Prince"]), "", Headline::App, 0, 1);
         assert_eq!(video["details"], "7 ");
         assert_eq!(video["state"], "Prince");
         assert!(video["assets"].is_null());
 
-        let unnamed = activity(&song(&"é😀".repeat(100), "", &[]), "", 0, 1);
+        let unnamed = activity(&song(&"é😀".repeat(100), "", &[]), "", Headline::App, 0, 1);
         assert_eq!(unnamed["details"].as_str().unwrap().encode_utf16().count(), 127);
         assert!(unnamed["state"].is_null());
+
+        let (updates, inbox) = mpsc::channel();
+        let mut discord = Discord { updates, shown: None };
+        discord.show(Some((&lucky, cover)), Headline::App, 0, 248_000);
+        discord.show(Some((&lucky, cover)), Headline::App, 0, 248_000);
+        discord.show(Some((&lucky, cover)), Headline::Artist, 0, 248_000);
+        let sent: Vec<_> = inbox
+            .try_iter()
+            .flatten()
+            .map(|shown| shown["status_display_type"].clone())
+            .collect();
+        assert_eq!(sent, [0, 1]);
     }
 }
