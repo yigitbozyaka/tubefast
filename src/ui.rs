@@ -1753,6 +1753,18 @@ fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
             if switch_row(ui, icon::DISCORD_LOGO, "Show on Discord", app.saved.discord) {
                 out.push(Action::ShowOnDiscord(!app.saved.discord));
             }
+            if app.saved.discord {
+                let status = match app.discord_linked {
+                    Some(true) if app.playing() => "Connected to Discord",
+                    Some(true) => "Shows while a song is playing",
+                    Some(false) => "Discord is not running",
+                    None => "",
+                };
+                let (line, response) = ui.allocate_exact_size(vec2(MENU_WIDTH, 22.0), Sense::hover());
+                let at = pos2(line.left() + 46.0, line.center().y - 4.0);
+                label(ui, at, Align2::LEFT_CENTER, status, sans(12.0), MUTED, line.width() - 58.0);
+                response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, status));
+            }
         });
     row.max.x -= 36.0;
     let avatar = Rect::from_center_size(pos2(row.left() + 24.0, row.center().y), Vec2::splat(32.0));

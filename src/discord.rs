@@ -23,9 +23,9 @@ pub struct Discord {
 }
 
 impl Discord {
-    pub fn start() -> Self {
+    pub fn start(report: impl Fn(bool) + Send + 'static) -> Self {
         let (updates, inbox) = mpsc::channel();
-        std::thread::spawn(move || run(inbox));
+        std::thread::spawn(move || run(inbox, report));
         Self { updates, shown: None }
     }
 
@@ -52,32 +52,38 @@ impl Discord {
     }
 }
 
-fn run(updates: Receiver<Option<Value>>) {
+fn run(updates: Receiver<Option<Value>>, report: impl Fn(bool)) {
     let (mut pipe, mut activity, mut delivered, mut nonce) = (None, None, false, 0u64);
+    let mut linked = None;
     loop {
+        if pipe.is_none() {
+            (pipe, delivered) = (connect(), false);
+        }
+        if let Some(open) = &mut pipe {
+            let sent = if delivered {
+                exchange(open, PING, &json!({}))
+            } else {
+                nonce += 1;
+                let args = json!({ "pid": std::process::id(), "activity": activity });
+                exchange(
+                    open,
+                    FRAME,
+                    &json!({ "cmd": "SET_ACTIVITY", "args": args, "nonce": nonce.to_string() }),
+                )
+            };
+            delivered = sent.is_ok();
+            if !delivered {
+                pipe = None;
+            }
+        }
+        if linked != Some(pipe.is_some()) {
+            linked = Some(pipe.is_some());
+            report(pipe.is_some());
+        }
         match updates.recv_timeout(CHECK_EVERY) {
             Ok(update) => (activity, delivered) = (updates.try_iter().last().unwrap_or(update), false),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
-        }
-        if pipe.is_none() && activity.is_some() {
-            pipe = connect();
-        }
-        let Some(open) = &mut pipe else { continue };
-        let sent = if delivered {
-            exchange(open, PING, &json!({}))
-        } else {
-            nonce += 1;
-            let args = json!({ "pid": std::process::id(), "activity": activity });
-            exchange(
-                open,
-                FRAME,
-                &json!({ "cmd": "SET_ACTIVITY", "args": args, "nonce": nonce.to_string() }),
-            )
-        };
-        delivered = sent.is_ok();
-        if !delivered {
-            pipe = None;
         }
     }
 }

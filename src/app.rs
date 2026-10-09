@@ -208,6 +208,7 @@ enum Event {
     Updated(Result<PathBuf, String>),
     Pressed(Action),
     Lyrics(String, Result<Option<Lyrics>, String>),
+    Discord(bool),
 }
 
 pub struct App {
@@ -246,6 +247,7 @@ pub struct App {
     pub notice: Option<Notice>,
     pub update: Option<String>,
     pub updating: bool,
+    pub discord_linked: Option<bool>,
     restart: Option<PathBuf>,
 }
 
@@ -276,6 +278,7 @@ impl App {
                 ctx.request_repaint();
             }
         });
+        let discord = saved.discord.then(|| link_discord(&sender, &ctx));
         let mut app = Self {
             art: Art::new(ctx.clone(), yt.agent.clone()),
             ctx,
@@ -292,7 +295,7 @@ impl App {
             cover_tried: HashSet::new(),
             cover_lookups: 0,
             media,
-            discord: saved.discord.then(Discord::start),
+            discord,
             replaced: None,
             curated: !saved.queue.is_empty(),
             resume_at: saved.current.map(|_| saved.position_ms),
@@ -312,6 +315,7 @@ impl App {
             notice: None,
             update: None,
             updating: false,
+            discord_linked: None,
             restart: None,
         };
         match query {
@@ -662,6 +666,7 @@ impl App {
                     }
                 }
                 Event::Pressed(action) => self.apply(action),
+                Event::Discord(linked) => self.discord_linked = Some(linked),
                 Event::Lyrics(video_id, found) => {
                     if let Some((_, words)) = self.lyrics.as_mut().filter(|(wanted, _)| *wanted == video_id) {
                         *words = match found {
@@ -933,7 +938,8 @@ impl App {
             }
             Action::ShowOnDiscord(shown) => {
                 self.saved.discord = shown;
-                self.discord = shown.then(Discord::start);
+                self.discord_linked = None;
+                self.discord = shown.then(|| link_discord(&self.sender, &self.ctx));
             }
         }
     }
@@ -986,6 +992,14 @@ impl eframe::App for App {
         self.saved.position_ms = self.resume_at.unwrap_or_else(|| self.player.position_ms());
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
+}
+
+fn link_discord(sender: &Sender<Event>, ctx: &egui::Context) -> Discord {
+    let (sender, ctx) = (sender.clone(), ctx.clone());
+    Discord::start(move |linked| {
+        let _ = sender.send(Event::Discord(linked));
+        ctx.request_repaint();
+    })
 }
 
 fn newer_version(release_url: &str, current: &str) -> Option<String> {
