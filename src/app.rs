@@ -1,5 +1,6 @@
 use crate::art::Art;
 use crate::auth;
+use crate::discord::Discord;
 use crate::media::Media;
 use crate::player::Player;
 use crate::ui;
@@ -76,6 +77,7 @@ pub struct Saved {
     pub current: Option<usize>,
     pub position_ms: u64,
     pub lyrics_open: bool,
+    pub discord: bool,
 }
 
 pub enum Words {
@@ -140,6 +142,7 @@ impl Default for Saved {
             current: None,
             position_ms: 0,
             lyrics_open: false,
+            discord: false,
         }
     }
 }
@@ -189,6 +192,7 @@ pub enum Action {
     ShowLyrics(bool),
     ClearHistory,
     RestoreHistory(Vec<Item>),
+    ShowOnDiscord(bool),
 }
 
 enum Event {
@@ -221,6 +225,7 @@ pub struct App {
     cover_tried: HashSet<String>,
     cover_lookups: usize,
     media: Option<Media>,
+    discord: Option<Discord>,
     replaced: Option<(Vec<Item>, Option<usize>, u64)>,
     curated: bool,
     resume_at: Option<u64>,
@@ -287,6 +292,7 @@ impl App {
             cover_tried: HashSet::new(),
             cover_lookups: 0,
             media,
+            discord: saved.discord.then(Discord::start),
             replaced: None,
             curated: !saved.queue.is_empty(),
             resume_at: saved.current.map(|_| saved.position_ms),
@@ -925,6 +931,10 @@ impl App {
                 self.saved.recent = recent;
                 self.notice = None;
             }
+            Action::ShowOnDiscord(shown) => {
+                self.saved.discord = shown;
+                self.discord = shown.then(Discord::start);
+            }
         }
     }
 }
@@ -947,14 +957,15 @@ impl eframe::App for App {
         if self.playing() || self.player.loading() {
             ctx.request_repaint_after(PROGRESS_TICK);
         }
+        let item = self.saved.current.and_then(|current| self.saved.queue.get(current));
+        let playing = item.is_some() && !self.player.paused();
+        let (position_ms, duration_ms) = (self.player.position_ms(), self.player.duration_ms());
         if let Some(media) = &mut self.media {
-            let item = self.saved.current.and_then(|current| self.saved.queue.get(current));
-            media.show(
-                item,
-                item.is_some() && !self.player.paused(),
-                self.player.position_ms(),
-                self.player.duration_ms(),
-            );
+            media.show(item, playing, position_ms, duration_ms);
+        }
+        if let Some(discord) = self.discord.as_mut().filter(|_| !self.player.loading()) {
+            let track = item.filter(|_| playing).map(|item| (item, self.saved.covers.of(item)));
+            discord.show(track, position_ms, duration_ms);
         }
     }
 
