@@ -97,14 +97,58 @@ fn system_font(file: &str) -> Option<&'static [u8]> {
     } else {
         std::path::Path::new(&std::env::var_os("WINDIR")?).join("Fonts")
     };
-    let file = std::fs::File::open(fonts.join(file)).ok()?;
+    mapped(&fonts.join(file))
+}
+
+fn mapped(path: &std::path::Path) -> Option<&'static [u8]> {
+    let file = std::fs::File::open(path).ok()?;
     let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
     Some(&Box::leak(Box::new(map))[..])
 }
 
+/// Fonts Linux distributions ship for the scripts Onest lacks, in fallback order.
+const LINUX_FONTS: [&str; 12] = [
+    "NotoSansCJK-Regular.ttc",
+    "NotoSansCJK-VF.ttc",
+    "DroidSansFallbackFull.ttf",
+    "wqy-microhei.ttc",
+    "NanumGothic.ttf",
+    "NotoSansThai-Regular.ttf",
+    "NotoSansThai[wght].ttf",
+    "Loma.ttf",
+    "NotoSansDevanagari-Regular.ttf",
+    "NotoSansDevanagari[wght].ttf",
+    "Lohit-Devanagari.ttf",
+    "DejaVuSans.ttf",
+];
+
+fn linux_fonts() -> Vec<(&'static str, &'static [u8])> {
+    let mut dirs: Vec<std::path::PathBuf> = vec!["/usr/share/fonts".into(), "/usr/local/share/fonts".into()];
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.extend([".local/share/fonts", ".fonts"].map(|dir| std::path::Path::new(&home).join(dir)));
+    }
+    let mut found = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                dirs.push(entry.path());
+            } else if let Some(rank) = LINUX_FONTS.iter().position(|font| name == **font) {
+                found.push((rank, entry.path()));
+            }
+        }
+    }
+    found.sort();
+    found.dedup_by_key(|(rank, _)| *rank);
+    found
+        .into_iter()
+        .filter_map(|(rank, path)| Some((LINUX_FONTS[rank], mapped(&path)?)))
+        .collect()
+}
+
 pub fn install(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    let embedded: [(&str, &'static [u8]); 9] = [
+    let embedded: [(&str, &'static [u8]); 8] = [
         ("onest-400", include_bytes!("../assets/fonts/onest-latin-400.ttf")),
         ("onest-400-ext", include_bytes!("../assets/fonts/onest-latin-ext-400.ttf")),
         ("onest-500", include_bytes!("../assets/fonts/onest-latin-500.ttf")),
@@ -119,7 +163,6 @@ pub fn install(ctx: &egui::Context) {
             "shoulders-800-ext",
             include_bytes!("../assets/fonts/big-shoulders-display-latin-ext-800.ttf"),
         ),
-        ("unifont", include_bytes!("../assets/fonts/unifont-16.0.04.ttf")),
     ];
     for (name, bytes) in embedded {
         fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
@@ -157,63 +200,9 @@ pub fn install(ctx: &egui::Context) {
             fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
         }
     }
-
-    // Discover and register many system fonts from common font directories so
-    // egui can fallback to them for wide Unicode coverage.
-    let mut system_font_keys: Vec<String> = Vec::new();
-    {
-        use std::ffi::OsStr;
-        use std::path::Path;
-        let font_dirs = [
-            "/usr/share/fonts",
-            "/usr/local/share/fonts",
-            &format!("{}/.local/share/fonts", std::env::var("HOME").unwrap_or_default()),
-        ];
-        for d in &font_dirs {
-            let dir = Path::new(d);
-            if !dir.exists() {
-                continue;
-            }
-            let mut stack_dirs = vec![dir.to_path_buf()];
-            while let Some(p) = stack_dirs.pop() {
-                let Ok(entries) = std::fs::read_dir(&p) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        stack_dirs.push(path);
-                        continue;
-                    }
-
-                    // Filter by font file extensions
-                    let Some(ext) = path.extension().and_then(OsStr::to_str) else {
-                        continue;
-                    };
-                    let ext = ext.to_ascii_lowercase();
-                    if !matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
-                        continue;
-                    }
-
-                    // Extract file stem and build font key
-                    let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
-                        continue;
-                    };
-                    let key = format!("sys-{}", stem.replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
-                    if fonts.font_data.contains_key(&key) {
-                        continue;
-                    }
-
-                    // Read file and insert font data
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        fonts.font_data.insert(key.clone(), Arc::new(FontData::from_owned(bytes)));
-                        system_font_keys.push(key);
-                    }
-                }
-            }
-        }
+    for (name, bytes) in linux_fonts() {
+        fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
     }
-
     let known = fonts.font_data.clone();
     let stack = |own: [&str; 2], system: &str| -> Vec<String> {
         let fallbacks = [
@@ -228,16 +217,12 @@ pub fn install(ctx: &egui::Context) {
             "symbols",
             "Ubuntu-Light",
         ];
-        // Build an ordered chain including embedded names, configured fallbacks,
-        // and discovered system font keys.
-        let mut chain_iter: Vec<String> = own.into_iter().map(|s| s.to_owned()).collect();
-        for f in &fallbacks {
-            chain_iter.push(f.to_string());
-        }
-        chain_iter.extend(system_font_keys.iter().cloned());
-        // Ensure unifont is used as the very last fallback
-        chain_iter.push("unifont".to_string());
-        chain_iter.into_iter().filter(|name| known.contains_key(name.as_str())).collect()
+        own.into_iter()
+            .chain(fallbacks)
+            .chain(LINUX_FONTS)
+            .filter(|name| known.contains_key(*name))
+            .map(str::to_owned)
+            .collect()
     };
     fonts
         .families
@@ -2533,5 +2518,29 @@ mod tests {
         assert!(contrast(TEXT, tint) > 4.5);
         assert!(tint.g() > tint.r() && tint.r() > tint.b());
         assert_eq!(dimmed(PANEL, STAGE_LUMINANCE), PANEL);
+    }
+
+    #[test]
+    fn draws_text_with_every_system_font_it_finds() {
+        for (name, bytes) in linux_fonts() {
+            let mut fonts = FontDefinitions::empty();
+            fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+            fonts.families.insert(FontFamily::Proportional, vec![name.to_owned()]);
+            fonts.families.insert(FontFamily::Monospace, vec![name.to_owned()]);
+            let ctx = egui::Context::default();
+            ctx.set_fonts(fonts);
+            let _ = ctx.run(Default::default(), |_| {});
+            let text: String = "A中한กक∀"
+                .chars()
+                .filter(|c| ctx.fonts_mut(|fonts| fonts.has_glyph(&sans(16.0), *c)))
+                .collect();
+            let galley = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(text.clone(), sans(16.0), TEXT));
+            let blank = galley
+                .rows
+                .iter()
+                .flat_map(|row| &row.glyphs)
+                .any(|glyph| glyph.uv_rect.size == Vec2::ZERO);
+            assert!(!text.is_empty() && !blank, "{name} cannot draw {text:?}");
+        }
     }
 }
