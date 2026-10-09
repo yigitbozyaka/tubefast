@@ -43,7 +43,7 @@ cargo test
 | `src/ytm.rs` | The YouTube client: requests, response parsing, stream lookup. |
 | `clients.json` | The client name, version and user agent YouTube expects. The values that change when YouTube breaks something. |
 | `src/player.rs` | Progressive download, decoding thread and audio output. |
-| `src/media.rs` | Media keys and the Windows media overlay. |
+| `src/media.rs` | Media keys, the Windows media overlay, macOS Now Playing and Linux MPRIS. |
 | `src/update.rs` | The in-app updater: download, checksum, replacing the running program, restart. |
 | `src/auth.rs` | Sign-in: cookie handling, request signing, encrypted storage, the browser flow. |
 | `src/art.rs` | Artwork download, decode and texture cache with a memory budget. |

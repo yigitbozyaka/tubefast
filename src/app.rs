@@ -182,7 +182,7 @@ pub enum Action {
     Undo,
     GetUpdate,
     OpenRelease,
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
     Pause(bool),
     Move(usize, usize),
     Expand(bool),
@@ -949,7 +949,12 @@ impl eframe::App for App {
         }
         if let Some(media) = &mut self.media {
             let item = self.saved.current.and_then(|current| self.saved.queue.get(current));
-            media.show(item, item.is_some() && !self.player.paused());
+            media.show(
+                item,
+                item.is_some() && !self.player.paused(),
+                self.player.position_ms(),
+                self.player.duration_ms(),
+            );
         }
     }
 

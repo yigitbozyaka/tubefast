@@ -1,6 +1,6 @@
 [package]
 name = "tubefast"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -28,6 +28,18 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSData", "NSDictionary", "NSGeometry", "NSString", "NSValue"] }
+objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+async-channel = "2"
+futures-lite = "2"
+mpris-server = "0.10"
 
 [profile.release]
 lto = "fat"

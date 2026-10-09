@@ -92,7 +92,11 @@ fn solid(size: f32) -> FontId {
 }
 
 fn system_font(file: &str) -> Option<&'static [u8]> {
-    let fonts = std::path::Path::new(&std::env::var_os("WINDIR")?).join("Fonts");
+    let fonts = if cfg!(target_os = "macos") {
+        std::path::PathBuf::from("/System/Library/Fonts")
+    } else {
+        std::path::Path::new(&std::env::var_os("WINDIR")?).join("Fonts")
+    };
     let file = std::fs::File::open(fonts.join(file)).ok()?;
     let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
     Some(&Box::leak(Box::new(map))[..])
@@ -126,17 +130,29 @@ pub fn install(ctx: &egui::Context) {
     fonts
         .font_data
         .insert("phosphor-fill".to_owned(), Arc::new(egui_phosphor::Variant::Fill.font_data()));
-    let system = [
-        ("segoe", "segoeui.ttf"),
-        ("segoe-bold", "segoeuib.ttf"),
-        ("yahei", "msyh.ttc"),
-        ("malgun", "malgun.ttf"),
-        ("thai", "leelawui.ttf"),
-        ("indic", "Nirmala.ttc"),
-        ("indic-legacy", "Nirmala.ttf"),
-        ("symbols", "seguisym.ttf"),
-    ];
-    for (name, file) in system {
+    let system: &[_] = if cfg!(target_os = "macos") {
+        &[
+            ("segoe", "SFNS.ttf"),
+            ("segoe-bold", "SFNS.ttf"),
+            ("yahei", "Hiragino Sans GB.ttc"),
+            ("malgun", "AppleSDGothicNeo.ttc"),
+            ("thai", "ThonburiUI.ttc"),
+            ("indic", "Kohinoor.ttc"),
+            ("symbols", "Apple Symbols.ttf"),
+        ]
+    } else {
+        &[
+            ("segoe", "segoeui.ttf"),
+            ("segoe-bold", "segoeuib.ttf"),
+            ("yahei", "msyh.ttc"),
+            ("malgun", "malgun.ttf"),
+            ("thai", "leelawui.ttf"),
+            ("indic", "Nirmala.ttc"),
+            ("indic-legacy", "Nirmala.ttf"),
+            ("symbols", "seguisym.ttf"),
+        ]
+    };
+    for &(name, file) in system {
         if let Some(bytes) = system_font(file) {
             fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
         }

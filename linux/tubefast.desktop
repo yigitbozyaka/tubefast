@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Tubefast
+GenericName=Music Player
+Comment=YouTube Music, native and fast
+Exec=tubefast
+Icon=tubefast
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=youtube;music;player;
+StartupWMClass=tubefast

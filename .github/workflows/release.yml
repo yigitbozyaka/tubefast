@@ -28,12 +28,11 @@ jobs:
           Copy-Item assets/fonts/OFL-*.txt dist/licenses/
           Compress-Archive -Path dist/* -DestinationPath tubefast-windows-x64.zip
           Copy-Item target/release/tubefast.exe tubefast.exe
-          "tubefast-windows-x64.zip", "tubefast.exe" | ForEach-Object { "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $_" } | Out-File -Encoding ascii SHA256SUMS.txt
       - name: Write the Scoop manifest
         shell: pwsh
         run: |
           $version = "${{ github.ref_name }}".TrimStart("v")
-          $hash = ((Get-Content SHA256SUMS.txt | Where-Object { $_ -like "*tubefast-windows-x64.zip" }) -split "\s+")[0]
+          $hash = (Get-FileHash tubefast-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
           $manifest = @"
           {
               "version": "$version",
@@ -56,7 +55,86 @@ jobs:
           subject-path: |
             tubefast-windows-x64.zip
             tubefast.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            tubefast-windows-x64.zip
+            tubefast.exe
+            tubefast.json
+
+  macos:
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.90 --profile minimal --target aarch64-apple-darwin --target x86_64-apple-darwin
+          rustup default 1.90
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          lipo -create -output tubefast target/aarch64-apple-darwin/release/tubefast target/x86_64-apple-darwin/release/tubefast
+          macos/bundle.sh tubefast .
+          ditto -c -k --keepParent Tubefast.app tubefast-macos-universal.zip
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: tubefast-macos-universal.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: tubefast-macos-universal.zip
+
+  linux:
+    # The oldest supported runner, so the binary runs on any distribution with glibc 2.35 or newer.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux audio headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.90 --profile minimal
+          rustup default 1.90
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Install appimagetool
+        run: |
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          sudo mv appimagetool /usr/local/bin/
+      - name: Package
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: linux/package.sh target/release/tubefast .
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            tubefast-linux-x64.tar.gz
+            Tubefast-x86_64.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            tubefast-linux-x64.tar.gz
+            Tubefast-x86_64.AppImage
+
+  publish:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish
+        working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create ${{ github.ref_name }} tubefast-windows-x64.zip tubefast.exe tubefast.json SHA256SUMS.txt --title "Tubefast ${{ github.ref_name }}" --generate-notes
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum tubefast-windows-x64.zip tubefast.exe tubefast-macos-universal.zip tubefast-linux-x64.tar.gz Tubefast-x86_64.AppImage > SHA256SUMS.txt
+          gh release create ${{ github.ref_name }} * --title "Tubefast ${{ github.ref_name }}" --generate-notes
