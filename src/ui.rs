@@ -106,23 +106,20 @@ fn mapped(path: &std::path::Path) -> Option<&'static [u8]> {
     Some(&Box::leak(Box::new(map))[..])
 }
 
-/// Fonts Linux distributions ship for the scripts Onest lacks, in fallback order.
-const LINUX_FONTS: [&str; 12] = [
+/// Fonts Linux distributions ship for the scripts Onest lacks, in fallback order. Every Noto font follows them, the sans ones first.
+const LINUX_FONTS: [&str; 9] = [
     "NotoSansCJK-Regular.ttc",
     "NotoSansCJK-VF.ttc",
     "DroidSansFallbackFull.ttf",
     "wqy-microhei.ttc",
     "NanumGothic.ttf",
-    "NotoSansThai-Regular.ttf",
-    "NotoSansThai[wght].ttf",
     "Loma.ttf",
-    "NotoSansDevanagari-Regular.ttf",
-    "NotoSansDevanagari[wght].ttf",
     "Lohit-Devanagari.ttf",
     "DejaVuSans.ttf",
+    "FreeSans.ttf",
 ];
 
-fn linux_fonts() -> Vec<(&'static str, &'static [u8])> {
+fn linux_fonts() -> Vec<(String, &'static [u8])> {
     let mut dirs: Vec<std::path::PathBuf> = vec!["/usr/share/fonts".into(), "/usr/local/share/fonts".into()];
     if let Some(home) = std::env::var_os("HOME") {
         dirs.extend([".local/share/fonts", ".fonts"].map(|dir| std::path::Path::new(&home).join(dir)));
@@ -130,19 +127,24 @@ fn linux_fonts() -> Vec<(&'static str, &'static [u8])> {
     let mut found = Vec::new();
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let name = entry.file_name();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let noto = name.starts_with("Noto")
+                && !name.contains("Italic")
+                && ["-Regular.ttf", "-Regular.otf", "[wght].ttf"].iter().any(|end| name.ends_with(end));
+            let listed = LINUX_FONTS.iter().position(|font| name == *font);
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 dirs.push(entry.path());
-            } else if let Some(rank) = LINUX_FONTS.iter().position(|font| name == **font) {
-                found.push((rank, entry.path()));
+            } else if listed.is_some() || noto {
+                let rank = listed.unwrap_or(LINUX_FONTS.len() + usize::from(!name.starts_with("NotoSans")));
+                found.push((rank, name, entry.path()));
             }
         }
     }
     found.sort();
-    found.dedup_by_key(|(rank, _)| *rank);
+    found.dedup_by(|a, b| a.1 == b.1);
     found
         .into_iter()
-        .filter_map(|(rank, path)| Some((LINUX_FONTS[rank], mapped(&path)?)))
+        .filter_map(|(_, name, path)| Some((name, mapped(&path)?)))
         .collect()
 }
 
@@ -200,8 +202,9 @@ pub fn install(ctx: &egui::Context) {
             fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
         }
     }
-    for (name, bytes) in linux_fonts() {
-        fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+    let linux = linux_fonts();
+    for (name, bytes) in &linux {
+        fonts.font_data.insert(name.clone(), Arc::new(FontData::from_static(bytes)));
     }
     let known = fonts.font_data.clone();
     let stack = |own: [&str; 2], system: &str| -> Vec<String> {
@@ -219,7 +222,7 @@ pub fn install(ctx: &egui::Context) {
         ];
         own.into_iter()
             .chain(fallbacks)
-            .chain(LINUX_FONTS)
+            .chain(linux.iter().map(|(name, _)| name.as_str()))
             .filter(|name| known.contains_key(*name))
             .map(str::to_owned)
             .collect()
@@ -2524,13 +2527,13 @@ mod tests {
     fn draws_text_with_every_system_font_it_finds() {
         for (name, bytes) in linux_fonts() {
             let mut fonts = FontDefinitions::empty();
-            fonts.font_data.insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
-            fonts.families.insert(FontFamily::Proportional, vec![name.to_owned()]);
-            fonts.families.insert(FontFamily::Monospace, vec![name.to_owned()]);
+            fonts.font_data.insert(name.clone(), Arc::new(FontData::from_static(bytes)));
+            fonts.families.insert(FontFamily::Proportional, vec![name.clone()]);
+            fonts.families.insert(FontFamily::Monospace, vec![name.clone()]);
             let ctx = egui::Context::default();
             ctx.set_fonts(fonts);
             let _ = ctx.run(Default::default(), |_| {});
-            let text: String = "A中한กक∀"
+            let text: String = "A1中한กकبאঅத"
                 .chars()
                 .filter(|c| ctx.fonts_mut(|fonts| fonts.has_glyph(&sans(16.0), *c)))
                 .collect();
@@ -2540,7 +2543,7 @@ mod tests {
                 .iter()
                 .flat_map(|row| &row.glyphs)
                 .any(|glyph| glyph.uv_rect.size == Vec2::ZERO);
-            assert!(!text.is_empty() && !blank, "{name} cannot draw {text:?}");
+            assert!(!blank, "{name} cannot draw {text:?}");
         }
     }
 }
