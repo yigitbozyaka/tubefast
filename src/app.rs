@@ -182,7 +182,7 @@ pub enum Action {
     Undo,
     GetUpdate,
     OpenRelease,
-    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
     Pause(bool),
     Move(usize, usize),
     Expand(bool),

@@ -79,9 +79,9 @@ impl Media {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 const SEEK_SLACK_MS: u64 = 1500;
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 const COVER_PX: u32 = 600;
 
 #[cfg(target_os = "macos")]
@@ -223,10 +223,148 @@ fn publish(item: Option<&Item>, playing: bool, position_ms: u64, duration_ms: u6
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos")))]
+const POSITION_EVERY_MS: u64 = 1000;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+struct Update {
+    item: Option<Item>,
+    playing: bool,
+    position_ms: u64,
+    duration_ms: u64,
+    seeked: bool,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub struct Media {
+    updates: async_channel::Sender<Update>,
+    shown: (String, bool, u64),
+    at: (std::time::Instant, u64),
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Media {
+    pub fn new(_cc: &eframe::CreationContext<'_>, press: impl Fn(Action) + Send + 'static) -> Option<Self> {
+        let (updates, received) = async_channel::unbounded();
+        std::thread::Builder::new()
+            .name("mpris".to_owned())
+            .spawn(move || {
+                if let Err(error) = futures_lite::future::block_on(serve(press, received)) {
+                    eprintln!("Media keys are off, MPRIS is not available: {error}");
+                }
+            })
+            .ok()?;
+        Some(Self {
+            updates,
+            shown: Default::default(),
+            at: (std::time::Instant::now(), 0),
+        })
+    }
+
+    pub fn show(&mut self, item: Option<&Item>, playing: bool, position_ms: u64, duration_ms: u64) {
+        let track = item.map_or("", |item| item.video_id.as_str());
+        let elapsed = self.at.0.elapsed().as_millis() as u64;
+        let expected = self.at.1 + if self.shown.1 { elapsed } else { 0 };
+        let jumped = expected.abs_diff(position_ms) >= SEEK_SLACK_MS;
+        let shown = (track.to_owned(), playing, duration_ms);
+        if self.shown == shown && !jumped && (!playing || elapsed < POSITION_EVERY_MS) {
+            return;
+        }
+        let seeked = self.shown.0 == shown.0 && jumped;
+        (self.shown, self.at) = (shown, (std::time::Instant::now(), position_ms));
+        let _ = self.updates.try_send(Update {
+            item: item.cloned(),
+            playing,
+            position_ms,
+            duration_ms,
+            seeked,
+        });
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn serve(press: impl Fn(Action) + 'static, updates: async_channel::Receiver<Update>) -> mpris_server::zbus::Result<()> {
+    use mpris_server::{Player, Time};
+
+    let player = Player::builder(&format!("tubefast.instance{}", std::process::id()))
+        .identity(crate::APP_NAME)
+        .desktop_entry("tubefast")
+        .can_play(true)
+        .can_pause(true)
+        .can_go_next(true)
+        .can_go_previous(true)
+        .can_seek(true)
+        .build()
+        .await?;
+    let press = std::rc::Rc::new(press);
+    let on = |action: fn() -> Action| {
+        let press = press.clone();
+        move |_: &Player| press(action())
+    };
+    player.connect_play(on(|| Action::Pause(false)));
+    player.connect_pause(on(|| Action::Pause(true)));
+    player.connect_stop(on(|| Action::Pause(true)));
+    player.connect_play_pause(on(|| Action::Toggle));
+    player.connect_next(on(|| Action::Next));
+    player.connect_previous(on(|| Action::Previous));
+    let seek_to = |to: Time| Action::Seek(to.as_millis().max(0) as u64);
+    player.connect_set_position({
+        let press = press.clone();
+        move |_, _, to| press(seek_to(to))
+    });
+    player.connect_seek({
+        let press = press.clone();
+        move |player, by| press(seek_to(player.position() + by))
+    });
+
+    let follow = async {
+        let mut track = (String::new(), 0);
+        while let Ok(update) = updates.recv().await {
+            follow(&player, &mut track, update).await;
+        }
+    };
+    futures_lite::future::or(player.run(), follow).await;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+async fn follow(player: &mpris_server::Player, track: &mut (String, u64), update: Update) {
+    use mpris_server::{Metadata, PlaybackStatus as Status, Time, TrackId};
+
+    let id = update.item.as_ref().map_or("", |item| item.video_id.as_str());
+    if (id, update.duration_ms) != (track.0.as_str(), track.1) {
+        *track = (id.to_owned(), update.duration_ms);
+        let mut metadata = Metadata::new();
+        if let Some(item) = &update.item {
+            let path = format!("/dev/tubefast/track/{}", item.video_id.replace('-', "_"));
+            metadata.set_trackid(TrackId::try_from(path).ok());
+            metadata.set_title(Some(&item.title));
+            metadata.set_artist(Some([&item.subtitle]));
+            let cover = crate::ytm::sized(&item.thumb, COVER_PX);
+            metadata.set_art_url(Some(cover).filter(|cover| !cover.is_empty()));
+            metadata.set_length(Some(Time::from_millis(update.duration_ms as i64)).filter(|_| update.duration_ms > 0));
+        }
+        let _ = player.set_metadata(metadata).await;
+    }
+    let status = match (&update.item, update.playing) {
+        (None, _) => Status::Stopped,
+        (Some(_), true) => Status::Playing,
+        (Some(_), false) => Status::Paused,
+    };
+    if player.playback_status() != status {
+        let _ = player.set_playback_status(status).await;
+    }
+    let at = Time::from_millis(update.position_ms as i64);
+    player.set_position(at);
+    if update.seeked {
+        let _ = player.seeked(at).await;
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 pub struct Media;
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, unix)))]
 impl Media {
     pub fn new(_cc: &eframe::CreationContext<'_>, _press: impl Fn(Action) + Send + 'static) -> Option<Self> {
         None

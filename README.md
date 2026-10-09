@@ -4,7 +4,7 @@
 
 <h1 align="center">Tubefast</h1>
 
-<p align="center"><strong>YouTube Music, native and fast.</strong><br>A lightweight desktop player for Windows and macOS with no browser engine inside.</p>
+<p align="center"><strong>YouTube Music, native and fast.</strong><br>A lightweight desktop player for Windows, macOS and Linux with no browser engine inside.</p>
 
 <p align="center">
   <a href="https://github.com/yigitbozyaka/tubefast/releases/latest"><strong>Download</strong></a> ·
@@ -41,7 +41,7 @@ Numbers are from the release build on Windows 11. Memory is the working set a fe
 | **A queue you cannot lose** | Close the app and the queue, the track and the position are still there next time. Replace a queue you built by accident and **Undo** brings it back. Drag a row to reorder what plays next. |
 | **Now playing and lyrics** | Click the cover or the title in the bar for a full-window view of the track. Its lyrics tab follows the song line by line when YouTube Music has timed lyrics, and shows plain text when it does not. |
 | **Updates itself** | When a new version is out, Tubefast tells you and installs it with one click, then restarts with your queue where it was. |
-| **Media keys** | Play, pause, next and previous keys work from any window, and the track shows up in the Windows media overlay and in Now Playing on macOS, with its cover and progress. |
+| **Media keys** | Play, pause, next and previous keys work from any window, and the track shows up in the Windows media overlay in Now Playing on macOS and in the Linux desktop's media controls (MPRIS), with its cover and progress. |
 | **A home feed that knows you** | Signed out, the feed is built from what you played here. Signed in, you get your own YouTube Music feed and playlists. |
 | **Your library, kept locally** | Liked songs, listening history and saved albums, playlists and artists live on your computer. |
 | **Real covers** | Music videos show the album cover of the song instead of a video frame whenever YouTube knows which song it is. |
@@ -74,15 +74,31 @@ Step 2 is there because Tubefast is not code signed. Windows trusts a new progra
 xattr -dr com.apple.quarantine /Applications/Tubefast.app
 ```
 
+**On Linux** (x86-64, any distribution with glibc 2.35 or newer, such as Ubuntu 22.04, Debian 12 or Fedora 36):
+
+- **AppImage:** download `Tubefast-x86_64.AppImage` from the [latest release](https://github.com/yigitbozyaka/tubefast/releases/latest), make it executable and run it:
+
+  ```sh
+  chmod +x Tubefast-x86_64.AppImage
+  ./Tubefast-x86_64.AppImage
+  ```
+
+- **Installed for your user, with a menu entry:** download `tubefast-linux-x64.tar.gz`, unpack it and run the installer. It puts Tubefast in `~/.local/bin` and adds it to your app menu. `./install.sh --uninstall` removes it again.
+
+  ```sh
+  tar -xzf tubefast-linux-x64.tar.gz
+  tubefast/install.sh
+  ```
+
 You can check that a download was built from this repository by GitHub, not by anyone else:
 
 ```sh
 gh attestation verify tubefast-windows-x64.zip --repo yigitbozyaka/tubefast
 ```
 
-Each release also lists the SHA-256 of the zip in `SHA256SUMS.txt`.
+Each release also lists the SHA-256 of every download in `SHA256SUMS.txt`.
 
-Windows and macOS are the platforms it is used on. On macOS the session file is protected by file permissions instead of encryption, and a new version opens the download page instead of installing itself. The code also builds and passes its tests on Linux in CI, but media keys and the font fallback for non-Latin scripts are missing there. A Linux port is welcome. See [Contributing](CONTRIBUTING.md).
+Windows and macOS are the platforms it is used on most. On macOS and Linux the session file is protected by file permissions instead of encryption, and a new version opens the download page instead of installing itself. Linux builds are new: the font fallback for non-Latin scripts is still missing there, and bug reports from Linux are very welcome. See [Contributing](CONTRIBUTING.md).
 
 ## Signing in
 
@@ -91,7 +107,7 @@ Everything except your personal feed and your playlists works without an account
 - **Continue in browser** opens a separate Edge or Chrome window. Sign in to Google there and the window closes by itself.
 - **Paste your cookie** if the browser window is refused by Google. The dialog lists the three steps.
 
-Your session never leaves your computer. It is stored in your user profile, encrypted with your Windows account (DPAPI) or, on macOS, in a file only your user can read, and is sent only to YouTube. Sign out removes it.
+Your session never leaves your computer. It is stored in your user profile, encrypted with your Windows account (DPAPI) or, on macOS and Linux, in a file only your user can read, and is sent only to YouTube. Sign out removes it.
 
 ## Shortcuts
 
@@ -129,6 +145,8 @@ cargo run --release
 
 On macOS, `cargo build --release && macos/bundle.sh` makes `target/Tubefast.app`, which is what gives Now Playing its name and icon.
 
+On Linux, install the ALSA headers first (`sudo apt install libasound2-dev` on Debian and Ubuntu, `sudo dnf install alsa-lib-devel` on Fedora). `linux/package.sh` turns a release build into the same tarball the releases ship, and into an AppImage too when `appimagetool` is installed.
+
 ## How it works
 
 - **Data** comes from the same internal API the YouTube Music website uses. Responses are parsed while streaming and the parts Tubefast never shows are skipped before they are allocated.
@@ -140,13 +158,13 @@ On macOS, `cargo build --release && macos/bundle.sh` makes `target/Tubefast.app`
 - **Tubefast is unofficial.** It is not affiliated with, endorsed by or sponsored by YouTube or Google. YouTube and YouTube Music are trademarks of Google LLC.
 - **It can break.** YouTube changes its internal API without notice. The settings that usually need changing live in one small file, [`clients.json`](clients.json). When playback fails, Tubefast fetches the current copy from this repository and tries again, so most breakages are fixed for everyone with one commit and no new download. `tubefast --selftest` tells you which step failed.
 - **What it talks to.** YouTube, and GitHub. At start it reads `clients.json` and checks whether a newer release exists. A new version is downloaded only when you click **Update**, from this repository's releases, and is installed only if it matches the SHA-256 published with the release. Copies installed with Scoop are updated with `scoop update tubefast` instead. Nothing about you is sent, and there is no telemetry.
-- **If it crashes,** the reason is written to `crash.log` next to your data (`%APPDATA%\tubefast\data`). Attach it to your bug report.
+- **If it crashes,** the reason is written to `crash.log` next to your data (`%APPDATA%\tubefast\data` on Windows, `~/.local/share/tubefast` on Linux). Attach it to your bug report.
 - **Use it at your own risk.** YouTube's Terms of Service do not provide for third-party clients. Nobody can promise how YouTube treats accounts that use one. If that worries you, stay signed out.
 - **Audio quality** is 128 kbps AAC for now.
 
 ## Not there yet
 
-A tray icon, syncing likes back to your account, higher audio quality, a light theme, an installer, a notarized macOS build, and Linux builds. Pull requests for any of these are welcome.
+A tray icon, syncing likes back to your account, higher audio quality, a light theme, an installer, a notarized macOS build, and Flathub and AUR packages. Pull requests for any of these are welcome.
 
 ## Acknowledgements
 
