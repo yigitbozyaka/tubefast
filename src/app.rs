@@ -79,6 +79,7 @@ pub struct Saved {
     pub lyrics_open: bool,
     pub discord: bool,
     pub discord_headline: Headline,
+    pub discord_name: String,
 }
 
 pub enum Words {
@@ -145,6 +146,7 @@ impl Default for Saved {
             lyrics_open: false,
             discord: false,
             discord_headline: Headline::App,
+            discord_name: String::new(),
         }
     }
 }
@@ -196,6 +198,7 @@ pub enum Action {
     RestoreHistory(Vec<Item>),
     ShowOnDiscord(bool),
     DiscordHeadline(Headline),
+    DiscordName(String),
 }
 
 enum Event {
@@ -945,6 +948,10 @@ impl App {
                 self.discord = shown.then(|| link_discord(&self.sender, &self.ctx));
             }
             Action::DiscordHeadline(headline) => self.saved.discord_headline = headline,
+            Action::DiscordName(name) => {
+                self.saved.discord_name = name;
+                self.saved.discord_headline = Headline::Custom;
+            }
         }
     }
 }
@@ -975,7 +982,8 @@ impl eframe::App for App {
         }
         if let Some(discord) = self.discord.as_mut().filter(|_| !self.player.loading()) {
             let track = item.filter(|_| playing).map(|item| (item, self.saved.covers.of(item)));
-            discord.show(track, self.saved.discord_headline, position_ms, duration_ms);
+            let (headline, name) = (self.saved.discord_headline, &self.saved.discord_name);
+            discord.show(track, headline, name, position_ms, duration_ms);
         }
     }
 

@@ -1779,6 +1779,30 @@ fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
                         out.push(Action::DiscordHeadline(headline));
                     }
                 }
+                let (row, _) = ui.allocate_exact_size(vec2(MENU_WIDTH, 38.0), Sense::hover());
+                if app.saved.discord_headline == Headline::Custom {
+                    let at = pos2(row.left() + 22.0, row.center().y);
+                    ui.painter().text(at, Align2::CENTER_CENTER, icon::CHECK, glyph(15.0), ACCENT);
+                }
+                let field = Rect::from_min_max(
+                    pos2(row.left() + 38.0, row.top() + 4.0),
+                    pos2(row.right() - 8.0, row.bottom() - 4.0),
+                );
+                ui.painter().rect_filled(field, 7.0, veil(0.07));
+                let mut name = app.saved.discord_name.clone();
+                let edit = egui::TextEdit::singleline(&mut name)
+                    .id(Id::new("discord-name"))
+                    .frame(false)
+                    .margin(Margin::ZERO)
+                    .font(medium(13.5))
+                    .text_color(TEXT)
+                    .vertical_align(Align::Center)
+                    .hint_text(RichText::new("Your own text").color(FAINT));
+                let typed = ui.put(field.shrink2(vec2(8.0, 0.0)), edit);
+                typed.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Your own text"));
+                if typed.changed() || typed.gained_focus() {
+                    out.push(Action::DiscordName(name));
+                }
             }
         });
     row.max.x -= 36.0;
