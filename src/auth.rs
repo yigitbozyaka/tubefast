@@ -1,7 +1,7 @@
 use crate::app_id;
 use serde_json::{Value, json};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -130,9 +130,15 @@ struct Socket {
 }
 
 impl Socket {
-    fn open(active_port: &str) -> Option<Socket> {
-        let mut lines = active_port.lines().map(str::trim);
-        let (port, path) = (lines.next()?.parse::<u16>().ok()?, lines.next()?);
+    fn open(port: u16) -> Option<Socket> {
+        let version: Value = ureq::get(&format!("http://127.0.0.1:{port}/json/version"))
+            .timeout(Duration::from_secs(2))
+            .call()
+            .ok()?
+            .into_json()
+            .ok()?;
+        let address = version["webSocketDebuggerUrl"].as_str()?;
+        let path = &address[address.find("/devtools/")?..];
         let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
         stream.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
         let request = format!(
@@ -225,7 +231,11 @@ fn youtube_cookie(reply: &Value) -> Option<String> {
     sapisid(&cookie).is_some().then_some(cookie)
 }
 
-fn launch(profile: &Path, extra: &[&str]) -> Result<Child, String> {
+fn launch(profile: &Path, extra: &[&str]) -> Result<(Child, u16), String> {
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map_err(|e| e.to_string())?
+        .port();
     let installed = BROWSERS
         .iter()
         .filter_map(|(root, path)| Some(PathBuf::from(std::env::var_os(root)?).join(path)));
@@ -240,15 +250,17 @@ fn launch(profile: &Path, extra: &[&str]) -> Result<Child, String> {
         .find_map(|program| {
             Command::new(program)
                 .arg(format!("--user-data-dir={}", profile.display()))
-                .args(["--remote-debugging-port=0", "--no-first-run", "--no-default-browser-check"])
+                .arg(format!("--remote-debugging-port={port}"))
+                .args(["--no-first-run", "--no-default-browser-check"])
                 .args(extra)
                 .spawn()
                 .ok()
         })
+        .map(|browser| (browser, port))
         .ok_or_else(|| "Neither Edge nor Chrome was found on this computer.".to_owned())
 }
 
-fn watch(browser: &mut Child, profile: &Path, cancel: &AtomicBool) -> Result<String, String> {
+fn watch(browser: &mut Child, port: u16, cancel: &AtomicBool) -> Result<String, String> {
     let started = Instant::now();
     let mut socket: Option<Socket> = None;
     let mut settled = 0;
@@ -264,9 +276,7 @@ fn watch(browser: &mut Child, profile: &Path, cancel: &AtomicBool) -> Result<Str
         }
         std::thread::sleep(POLL_EVERY);
         let Some(connection) = &mut socket else {
-            socket = std::fs::read_to_string(profile.join("DevToolsActivePort"))
-                .ok()
-                .and_then(|text| Socket::open(&text));
+            socket = Socket::open(port);
             continue;
         };
         let Ok(reply) = connection.call("Storage.getCookies", json!({})) else {
@@ -298,8 +308,8 @@ pub fn browser_sign_in(cancel: &AtomicBool) -> Result<String, String> {
         .ok_or("There is no folder for the sign-in window.")?
         .join("signin-profile");
     let app = format!("--app={LOGIN_URL}");
-    let mut browser = launch(&profile, &["--window-size=520,760", &app])?;
-    let cookie = watch(&mut browser, &profile, cancel);
+    let (mut browser, port) = launch(&profile, &["--window-size=520,760", &app])?;
+    let cookie = watch(&mut browser, port, cancel);
     discard(browser, &profile);
     cookie
 }
@@ -346,12 +356,11 @@ mod tests {
     #[ignore = "needs Edge or Chrome installed"]
     fn reads_the_session_out_of_a_real_browser() {
         let profile = std::env::temp_dir().join(format!("{}-signin-test-{}", app_id(), std::process::id()));
-        let mut browser = launch(&profile, &["--headless=new", "about:blank"]).unwrap();
-        let port_file = profile.join("DevToolsActivePort");
+        let (mut browser, port) = launch(&profile, &["--headless=new", "about:blank"]).unwrap();
         let mut socket = (0..100)
             .find_map(|_| {
                 std::thread::sleep(Duration::from_millis(200));
-                Socket::open(&std::fs::read_to_string(&port_file).ok()?)
+                Socket::open(port)
             })
             .expect("the browser never opened its control port");
         let cookie =
@@ -362,7 +371,7 @@ mod tests {
             cookie("SAPISID", "wrong-site", ".example.com"),
         ] });
         assert!(socket.call("Storage.setCookies", cookies).unwrap()["error"].is_null());
-        let found = watch(&mut browser, &profile, &AtomicBool::new(false));
+        let found = watch(&mut browser, port, &AtomicBool::new(false));
         discard(browser, &profile);
         let found = found.unwrap();
         assert!(
