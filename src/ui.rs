@@ -1,6 +1,7 @@
 use crate::APP_NAME;
 use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
 use crate::art::Art;
+use crate::discord::Headline;
 use crate::ytm::{Item, Layout};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
@@ -706,7 +707,7 @@ fn clock(ms: u64) -> String {
     format!("{}:{:02}", ms / 60_000, ms / 1000 % 60)
 }
 
-fn menu_row(ui: &mut Ui, symbol: &str, font: FontId, tint: Color32, text: &str) -> bool {
+fn menu_row(ui: &mut Ui, symbol: &str, font: FontId, tint: Color32, text: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(vec2(MENU_WIDTH, 38.0), Sense::click());
     let hover = hover_of(ui, &response);
     ui.painter().rect_filled(rect, 7.0, veil(0.08 * hover));
@@ -723,6 +724,17 @@ fn menu_row(ui: &mut Ui, symbol: &str, font: FontId, tint: Color32, text: &str) 
         rect.width() - 58.0,
     );
     describe(&response, text);
+    response
+}
+
+fn switch_row(ui: &mut Ui, symbol: &str, text: &str, on: bool) -> bool {
+    let response = menu_row(ui, symbol, glyph(17.0), MUTED, text);
+    let lit = ui.ctx().animate_bool_with_time(response.id.with("switch"), on, HOVER_TIME);
+    let track = Rect::from_center_size(pos2(response.rect.right() - 27.0, response.rect.center().y), vec2(30.0, 18.0));
+    ui.painter().rect_filled(track, 9.0, veil(0.16).lerp_to_gamma(ACCENT, lit));
+    let knob = pos2(egui::lerp(track.left() + 9.0..=track.right() - 9.0, lit), track.center().y);
+    ui.painter().circle_filled(knob, 6.0, TEXT.lerp_to_gamma(ON_ACCENT, lit));
+    response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, on, text));
     response.clicked()
 }
 
@@ -762,10 +774,10 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     menu_divider(ui);
 
     let mut choice = None;
-    if menu_row(ui, icon::ARROW_BEND_DOWN_RIGHT, glyph(17.0), MUTED, "Play next") {
+    if menu_row(ui, icon::ARROW_BEND_DOWN_RIGHT, glyph(17.0), MUTED, "Play next").clicked() {
         choice = Some(Action::PlayNext(item.clone()));
     }
-    if menu_row(ui, icon::LIST_PLUS, glyph(17.0), MUTED, "Add to queue") {
+    if menu_row(ui, icon::LIST_PLUS, glyph(17.0), MUTED, "Add to queue").clicked() {
         choice = Some(Action::Enqueue(item.clone()));
     }
     let (font, tint, text) = if cx.is_liked(item) {
@@ -773,16 +785,16 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     } else {
         (glyph(17.0), MUTED, "Add to Liked songs")
     };
-    if menu_row(ui, icon::HEART, font, tint, text) {
+    if menu_row(ui, icon::HEART, font, tint, text).clicked() {
         choice = Some(Action::Like(item.clone()));
     }
     if !item.artist_id.is_empty() || !item.album_id.is_empty() {
         menu_divider(ui);
     }
-    if !item.artist_id.is_empty() && menu_row(ui, icon::MICROPHONE_STAGE, glyph(17.0), MUTED, "Go to artist") {
+    if !item.artist_id.is_empty() && menu_row(ui, icon::MICROPHONE_STAGE, glyph(17.0), MUTED, "Go to artist").clicked() {
         choice = Some(Action::Go(Route::Browse(item.artist_id.clone())));
     }
-    if !item.album_id.is_empty() && menu_row(ui, icon::VINYL_RECORD, glyph(17.0), MUTED, "Go to album") {
+    if !item.album_id.is_empty() && menu_row(ui, icon::VINYL_RECORD, glyph(17.0), MUTED, "Go to album").clicked() {
         choice = Some(Action::Go(Route::Browse(item.album_id.clone())));
     }
     if let Some(action) = choice {
@@ -1730,7 +1742,70 @@ fn update_offer(app: &App, ui: &Ui, slot: Rect, out: &mut Vec<Action>) {
 
 fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
     ui.painter().hline(foot.x_range(), foot.top(), Stroke::new(1.0, veil(0.06)));
-    let row = foot.shrink2(vec2(12.0, 10.0));
+    let mut row = foot.shrink2(vec2(12.0, 10.0));
+    let slot = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), Vec2::splat(34.0));
+    let settings = icon_button(ui, slot, Id::new("settings"), icon::GEAR_SIX, glyph(17.0), MUTED, "Settings");
+    egui::Popup::menu(&settings)
+        .gap(4.0)
+        .align(egui::RectAlign::TOP_START)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_width(MENU_WIDTH);
+            if switch_row(ui, icon::DISCORD_LOGO, "Show on Discord", app.saved.discord) {
+                out.push(Action::ShowOnDiscord(!app.saved.discord));
+            }
+            if app.saved.discord {
+                let status = match app.discord_linked {
+                    Some(true) if app.playing() => "Connected to Discord",
+                    Some(true) => "Shows while a song is playing",
+                    Some(false) => "Discord is not running",
+                    None => "",
+                };
+                let (line, response) = ui.allocate_exact_size(vec2(MENU_WIDTH, 22.0), Sense::hover());
+                let at = pos2(line.left() + 46.0, line.center().y - 4.0);
+                label(ui, at, Align2::LEFT_CENTER, status, sans(12.0), MUTED, line.width() - 58.0);
+                response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, status));
+                menu_divider(ui);
+                for (headline, text) in [
+                    (Headline::App, "Listening to Tubefast"),
+                    (Headline::Artist, "Listening to the artist"),
+                    (Headline::Song, "Listening to the song"),
+                ] {
+                    let chosen = app.saved.discord_headline == headline;
+                    let symbol = if chosen { icon::CHECK } else { "" };
+                    let row = menu_row(ui, symbol, glyph(15.0), ACCENT, text);
+                    row.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, chosen, text));
+                    if row.clicked() {
+                        out.push(Action::DiscordHeadline(headline));
+                    }
+                }
+                let (row, _) = ui.allocate_exact_size(vec2(MENU_WIDTH, 38.0), Sense::hover());
+                if app.saved.discord_headline == Headline::Custom {
+                    let at = pos2(row.left() + 22.0, row.center().y);
+                    ui.painter().text(at, Align2::CENTER_CENTER, icon::CHECK, glyph(15.0), ACCENT);
+                }
+                let field = Rect::from_min_max(
+                    pos2(row.left() + 38.0, row.top() + 4.0),
+                    pos2(row.right() - 8.0, row.bottom() - 4.0),
+                );
+                ui.painter().rect_filled(field, 7.0, veil(0.07));
+                let mut name = app.saved.discord_name.clone();
+                let edit = egui::TextEdit::singleline(&mut name)
+                    .id(Id::new("discord-name"))
+                    .frame(false)
+                    .margin(Margin::ZERO)
+                    .font(medium(13.5))
+                    .text_color(TEXT)
+                    .vertical_align(Align::Center)
+                    .hint_text(RichText::new("Your own text").color(FAINT));
+                let typed = ui.put(field.shrink2(vec2(8.0, 0.0)), edit);
+                typed.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Your own text"));
+                if typed.changed() || typed.gained_focus() {
+                    out.push(Action::DiscordName(name));
+                }
+            }
+        });
+    row.max.x -= 36.0;
     let avatar = Rect::from_center_size(pos2(row.left() + 24.0, row.center().y), Vec2::splat(32.0));
     let (left, mid) = (avatar.right() + 12.0, row.center().y);
     match &app.saved.account {

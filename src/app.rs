@@ -1,5 +1,6 @@
 use crate::art::Art;
 use crate::auth;
+use crate::discord::{Discord, Headline};
 use crate::media::Media;
 use crate::player::Player;
 use crate::ui;
@@ -76,6 +77,9 @@ pub struct Saved {
     pub current: Option<usize>,
     pub position_ms: u64,
     pub lyrics_open: bool,
+    pub discord: bool,
+    pub discord_headline: Headline,
+    pub discord_name: String,
 }
 
 pub enum Words {
@@ -140,6 +144,9 @@ impl Default for Saved {
             current: None,
             position_ms: 0,
             lyrics_open: false,
+            discord: false,
+            discord_headline: Headline::App,
+            discord_name: String::new(),
         }
     }
 }
@@ -189,6 +196,9 @@ pub enum Action {
     ShowLyrics(bool),
     ClearHistory,
     RestoreHistory(Vec<Item>),
+    ShowOnDiscord(bool),
+    DiscordHeadline(Headline),
+    DiscordName(String),
 }
 
 enum Event {
@@ -204,6 +214,7 @@ enum Event {
     Updated(Result<PathBuf, String>),
     Pressed(Action),
     Lyrics(String, Result<Option<Lyrics>, String>),
+    Discord(bool),
 }
 
 pub struct App {
@@ -221,6 +232,7 @@ pub struct App {
     cover_tried: HashSet<String>,
     cover_lookups: usize,
     media: Option<Media>,
+    discord: Option<Discord>,
     replaced: Option<(Vec<Item>, Option<usize>, u64)>,
     curated: bool,
     resume_at: Option<u64>,
@@ -241,6 +253,7 @@ pub struct App {
     pub notice: Option<Notice>,
     pub update: Option<String>,
     pub updating: bool,
+    pub discord_linked: Option<bool>,
     restart: Option<PathBuf>,
 }
 
@@ -271,6 +284,7 @@ impl App {
                 ctx.request_repaint();
             }
         });
+        let discord = saved.discord.then(|| link_discord(&sender, &ctx));
         let mut app = Self {
             art: Art::new(ctx.clone(), yt.agent.clone()),
             ctx,
@@ -287,6 +301,7 @@ impl App {
             cover_tried: HashSet::new(),
             cover_lookups: 0,
             media,
+            discord,
             replaced: None,
             curated: !saved.queue.is_empty(),
             resume_at: saved.current.map(|_| saved.position_ms),
@@ -306,6 +321,7 @@ impl App {
             notice: None,
             update: None,
             updating: false,
+            discord_linked: None,
             restart: None,
         };
         match query {
@@ -656,6 +672,7 @@ impl App {
                     }
                 }
                 Event::Pressed(action) => self.apply(action),
+                Event::Discord(linked) => self.discord_linked = Some(linked),
                 Event::Lyrics(video_id, found) => {
                     if let Some((_, words)) = self.lyrics.as_mut().filter(|(wanted, _)| *wanted == video_id) {
                         *words = match found {
@@ -925,6 +942,16 @@ impl App {
                 self.saved.recent = recent;
                 self.notice = None;
             }
+            Action::ShowOnDiscord(shown) => {
+                self.saved.discord = shown;
+                self.discord_linked = None;
+                self.discord = shown.then(|| link_discord(&self.sender, &self.ctx));
+            }
+            Action::DiscordHeadline(headline) => self.saved.discord_headline = headline,
+            Action::DiscordName(name) => {
+                self.saved.discord_name = name;
+                self.saved.discord_headline = Headline::Custom;
+            }
         }
     }
 }
@@ -947,14 +974,16 @@ impl eframe::App for App {
         if self.playing() || self.player.loading() {
             ctx.request_repaint_after(PROGRESS_TICK);
         }
+        let item = self.saved.current.and_then(|current| self.saved.queue.get(current));
+        let playing = item.is_some() && !self.player.paused();
+        let (position_ms, duration_ms) = (self.player.position_ms(), self.player.duration_ms());
         if let Some(media) = &mut self.media {
-            let item = self.saved.current.and_then(|current| self.saved.queue.get(current));
-            media.show(
-                item,
-                item.is_some() && !self.player.paused(),
-                self.player.position_ms(),
-                self.player.duration_ms(),
-            );
+            media.show(item, playing, position_ms, duration_ms);
+        }
+        if let Some(discord) = self.discord.as_mut().filter(|_| !self.player.loading()) {
+            let track = item.filter(|_| playing).map(|item| (item, self.saved.covers.of(item)));
+            let (headline, name) = (self.saved.discord_headline, &self.saved.discord_name);
+            discord.show(track, headline, name, position_ms, duration_ms);
         }
     }
 
@@ -975,6 +1004,14 @@ impl eframe::App for App {
         self.saved.position_ms = self.resume_at.unwrap_or_else(|| self.player.position_ms());
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
+}
+
+fn link_discord(sender: &Sender<Event>, ctx: &egui::Context) -> Discord {
+    let (sender, ctx) = (sender.clone(), ctx.clone());
+    Discord::start(move |linked| {
+        let _ = sender.send(Event::Discord(linked));
+        ctx.request_repaint();
+    })
 }
 
 fn newer_version(release_url: &str, current: &str) -> Option<String> {

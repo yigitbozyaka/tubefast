@@ -3,6 +3,7 @@
 mod app;
 mod art;
 mod auth;
+mod discord;
 mod media;
 mod player;
 mod ui;
