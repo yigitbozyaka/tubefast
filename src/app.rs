@@ -367,16 +367,21 @@ impl App {
         if !self.expanded || !self.saved.lyrics_open {
             return;
         }
-        let Some(video_id) = self.now_playing().map(|item| item.video_id.clone()) else {
+        let Some(song) = self.now_playing() else {
             return;
         };
-        if self.lyrics.as_ref().is_some_and(|(known, _)| *known == video_id) {
+        if self.lyrics.as_ref().is_some_and(|(known, _)| *known == song.video_id) {
             return;
         }
-        self.lyrics = Some((video_id.clone(), Words::Loading));
+        if self.player.loading() {
+            self.lyrics = None;
+            return;
+        }
+        let (song, seconds) = (song.clone(), self.player.duration_ms() / 1000);
+        self.lyrics = Some((song.video_id.clone(), Words::Loading));
         self.background(move |yt| {
-            let found = yt.lyrics(&video_id);
-            Some(Event::Lyrics(video_id, found))
+            let found = yt.lyrics(&song, seconds);
+            Some(Event::Lyrics(song.video_id, found))
         });
     }
 

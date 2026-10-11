@@ -40,7 +40,7 @@ cargo test
 
 | File | What it does |
 |---|---|
-| `src/ytm.rs` | The YouTube client: requests, response parsing, stream lookup. |
+| `src/ytm.rs` | The YouTube client: requests, response parsing, stream lookup. Also the lyrics lookup on lrclib.net. |
 | `clients.json` | The client name, version and user agent YouTube expects. The values that change when YouTube breaks something. |
 | `src/player.rs` | Progressive download, decoding thread and audio output. |
 | `src/media.rs` | Media keys, the Windows media overlay, macOS Now Playing and Linux MPRIS. |

@@ -2028,7 +2028,7 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
                 ui,
                 icon::SUBTITLES,
                 "No lyrics for this song",
-                "YouTube Music does not have them yet.",
+                "YouTube Music and lrclib do not have them yet.",
             );
             return;
         }

@@ -35,6 +35,11 @@ const LYRICS_CLIENT: &str = "ANDROID_MUSIC";
 const LYRICS_VERSION: &str = "7.21.50";
 const LYRICS_CLIENT_ID: &str = "21";
 const LYRICS_UA: &str = "com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 14) gzip";
+const LRCLIB_API: &str = "https://lrclib.net/api/get";
+const LRCLIB_UA: &str = concat!("Tubefast ", env!("CARGO_PKG_VERSION"), " (", env!("CARGO_PKG_REPOSITORY"), ")");
+const LRCLIB_WAIT: Duration = Duration::from_secs(6);
+const LRCLIB_SOURCE: &str = "Source: lrclib.net";
+const LYRICS_PAUSE: &str = "♪";
 const AAC_ITAG: u64 = 140;
 const RELATED_ITEMS: usize = 18;
 const EXPLORE_ORDER: usize = 100;
@@ -396,7 +401,42 @@ impl Client {
         Ok(parse_page(&self.music("next", body, &[])?).songs())
     }
 
-    pub fn lyrics(&self, video_id: &str) -> Result<Option<Lyrics>, String> {
+    pub fn lyrics(&self, song: &Item, seconds: u64) -> Result<Option<Lyrics>, String> {
+        let known = self.youtube_lyrics(&song.video_id);
+        if matches!(&known, Ok(Some(lyrics)) if lyrics.synced) {
+            return known;
+        }
+        match self.lrclib_lyrics(song, seconds) {
+            Some(found) if found.synced || !matches!(known, Ok(Some(_))) => Ok(Some(found)),
+            _ => known,
+        }
+    }
+
+    fn lrclib_lyrics(&self, song: &Item, seconds: u64) -> Option<Lyrics> {
+        let seconds = match seconds {
+            0 => self.stream(&song.video_id).ok()?.duration_ms / 1000,
+            played => played,
+        };
+        let artist = match song.artists.first() {
+            Some((name, _)) => name,
+            None => song.subtitle.split(" • ").next()?,
+        };
+        let request = self
+            .agent
+            .get(LRCLIB_API)
+            .set("User-Agent", LRCLIB_UA)
+            .timeout(LRCLIB_WAIT)
+            .query("track_name", &song.title)
+            .query("artist_name", artist)
+            .query("duration", &seconds.to_string());
+        let found = request.clone().call().or_else(|refused| match refused {
+            ureq::Error::Status(500.., _) => request.call(),
+            other => Err(other),
+        });
+        lrclib_lyrics(&found.ok()?.into_json().ok()?)
+    }
+
+    fn youtube_lyrics(&self, video_id: &str) -> Result<Option<Lyrics>, String> {
         let watch = self.music("next", json!({ "videoId": video_id }), &[])?;
         let tabs = find(&watch, "tabs").and_then(Value::as_array);
         let Some(id) = tabs
@@ -564,6 +604,27 @@ fn timed_lyrics(response: &Value) -> Option<Lyrics> {
         lines,
         synced: true,
         source: source.to_owned(),
+    })
+}
+
+fn lrclib_lyrics(found: &Value) -> Option<Lyrics> {
+    let timed = found["syncedLyrics"].as_str().unwrap_or_default().lines().filter_map(|line| {
+        let (stamp, words) = line.strip_prefix('[')?.split_once(']')?;
+        let (minutes, seconds) = stamp.split_once(':')?;
+        let start = minutes.parse::<u64>().ok()? * 60_000 + (seconds.parse::<f64>().ok()? * 1000.0).round() as u64;
+        let words = Some(words.trim()).filter(|words| !words.is_empty());
+        Some((start, words.unwrap_or(LYRICS_PAUSE).to_owned()))
+    });
+    let mut lines: Vec<(u64, String)> = timed.collect();
+    let synced = !lines.is_empty();
+    if !synced {
+        let plain = found["plainLyrics"].as_str().unwrap_or_default();
+        lines = plain.lines().map(|line| (0, line.trim().to_owned())).collect();
+    }
+    (!lines.is_empty()).then(|| Lyrics {
+        lines,
+        synced,
+        source: LRCLIB_SOURCE.to_owned(),
     })
 }
 
@@ -1009,6 +1070,33 @@ mod tests {
         assert_eq!(lines, ["First line", "", "Second line"]);
         assert!(!lyrics.synced);
         assert_eq!(plain_lyrics(&json!({ "messageRenderer": {} })), None);
+    }
+
+    #[test]
+    fn reads_lrclib_lines_by_their_time_stamps_and_plain_text_without_them() {
+        let stamped =
+            "[ar:Daft Punk]\n[00:31.48] Like the legend of the phoenix\n[01:05.5]\n[62:03.250] All ends with beginnings\nno time stamp";
+        let timed = json!({ "plainLyrics": "ignored when there are time stamps", "syncedLyrics": stamped });
+        let lyrics = lrclib_lyrics(&timed).unwrap();
+        let lines = [
+            (31_480, "Like the legend of the phoenix"),
+            (65_500, "♪"),
+            (3_723_250, "All ends with beginnings"),
+        ];
+        assert_eq!(lyrics.lines, lines.map(|(start, line)| (start, line.to_owned())));
+        assert!(lyrics.synced);
+        assert_eq!(lyrics.source, "Source: lrclib.net");
+
+        let plain = json!({ "plainLyrics": "First line\n\nSecond line", "syncedLyrics": null });
+        let lyrics = lrclib_lyrics(&plain).unwrap();
+        let lines: Vec<&str> = lyrics.lines.iter().map(|(_, line)| line.as_str()).collect();
+        assert_eq!(lines, ["First line", "", "Second line"]);
+        assert!(!lyrics.synced);
+        assert_eq!(
+            lrclib_lyrics(&json!({ "instrumental": true, "plainLyrics": null, "syncedLyrics": null })),
+            None
+        );
+        assert_eq!(lrclib_lyrics(&json!({ "code": 404, "name": "TrackNotFound" })), None);
     }
 
     #[test]
