@@ -271,7 +271,7 @@ impl App {
         }
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
         let ctx = cc.egui_ctx.clone();
-        let player = Player::new(yt.clone(), {
+        let mut player = Player::new(yt.clone(), {
             let ctx = ctx.clone();
             move || ctx.request_repaint()
         });
@@ -707,6 +707,7 @@ impl App {
             self.library.clear();
             self.notify("Your YouTube session ended. Sign in again.");
         }
+        self.player.follow_default_device();
         if let Some(message) = self.player.take_error() {
             self.player.set_paused(true);
             self.notify(message);

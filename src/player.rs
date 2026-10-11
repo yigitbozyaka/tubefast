@@ -25,8 +25,11 @@ const SILENCE_SAMPLES: usize = 512;
 const URL_LIFETIME: Duration = Duration::from_secs(3 * 60 * 60);
 const URL_CACHE_ENTRIES: usize = 64;
 const SELFTEST_FAR_SEEK_MS: u64 = 20 * 60 * 1000;
+const DEVICE_POLL: Duration = Duration::from_secs(2);
+const NO_OUTPUT: &str = "No audio output device was found";
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
+type Chunks = Arc<Mutex<Receiver<Chunk>>>;
 type Urls = Arc<Mutex<HashMap<String, (Instant, String, u64, u64)>>>;
 
 #[derive(Default)]
@@ -345,7 +348,7 @@ fn resolve(yt: &ytm::Client, urls: &Urls, video_id: &str) -> Result<(String, u64
 }
 
 struct PcmSource {
-    chunks: Receiver<Chunk>,
+    chunks: Chunks,
     samples: Vec<f32>,
     at: usize,
     rate: u32,
@@ -355,9 +358,21 @@ struct PcmSource {
 }
 
 impl PcmSource {
+    fn new(chunks: Chunks, shared: Arc<Shared>, wake: Wake) -> Self {
+        Self {
+            chunks,
+            samples: vec![0.0; SILENCE_SAMPLES],
+            at: 0,
+            rate: 44_100,
+            channels: 2,
+            shared,
+            wake,
+        }
+    }
+
     fn refill(&mut self) {
         self.at = 0;
-        while let Ok(chunk) = self.chunks.try_recv() {
+        while let Ok(chunk) = self.chunks.lock().unwrap().try_recv() {
             if chunk.epoch != self.shared.epoch.load(Relaxed) {
                 continue;
             }
@@ -532,10 +547,21 @@ fn decode_loop(
     }
 }
 
+fn default_device() -> Option<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    rodio::cpal::default_host().default_output_device()?.name().ok()
+}
+
 pub struct Player {
     commands: Sender<Cmd>,
     shared: Arc<Shared>,
     output: Option<(rodio::OutputStream, rodio::Sink)>,
+    device: Option<String>,
+    device_lost: Arc<AtomicBool>,
+    device_polled: Instant,
+    chunks: Chunks,
+    wake: Wake,
+    volume: f32,
     yt: Arc<ytm::Client>,
     urls: Urls,
 }
@@ -547,32 +573,62 @@ impl Player {
         let urls = Urls::default();
         let (commands, inbox) = mpsc::channel();
         let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
-        let output = rodio::OutputStreamBuilder::open_default_stream().ok().map(|mut stream| {
+        let worker = (commands.clone(), shared.clone(), yt.clone(), urls.clone(), wake.clone());
+        std::thread::spawn(move || decode_loop(inbox, worker.0, pcm, worker.1, worker.2, worker.3, worker.4));
+        let mut player = Self {
+            commands,
+            shared,
+            output: None,
+            device: None,
+            device_lost: Arc::default(),
+            device_polled: Instant::now(),
+            chunks: Arc::new(Mutex::new(chunks)),
+            wake,
+            volume: 1.0,
+            yt,
+            urls,
+        };
+        player.open_output();
+        if player.output.is_none() {
+            *player.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
+        }
+        player
+    }
+
+    fn open_output(&mut self) {
+        self.device_lost.store(false, Relaxed);
+        let lost = self.device_lost.clone();
+        let notice_loss = move |error| {
+            lost.fetch_or(matches!(error, rodio::cpal::StreamError::DeviceNotAvailable), Relaxed);
+        };
+        let stream = rodio::OutputStreamBuilder::from_default_device()
+            .and_then(|device| device.with_error_callback(notice_loss).open_stream_or_fallback())
+            .or_else(|_| rodio::OutputStreamBuilder::open_default_stream());
+        self.output = stream.ok().map(|mut stream| {
             stream.log_on_drop(false);
             let sink = rodio::Sink::connect_new(stream.mixer());
             sink.pause();
-            sink.append(PcmSource {
-                chunks,
-                samples: vec![0.0; SILENCE_SAMPLES],
-                at: 0,
-                rate: 44_100,
-                channels: 2,
-                shared: shared.clone(),
-                wake: wake.clone(),
-            });
+            sink.set_volume(self.volume * self.volume);
+            sink.append(PcmSource::new(self.chunks.clone(), self.shared.clone(), self.wake.clone()));
             (stream, sink)
         });
-        if output.is_none() {
-            *shared.error.lock().unwrap() = Some("No audio output device was found".to_owned());
+        self.device = default_device().filter(|_| self.output.is_some());
+    }
+
+    pub fn follow_default_device(&mut self) {
+        if self.device_polled.elapsed() < DEVICE_POLL {
+            return;
         }
-        let worker = (commands.clone(), shared.clone(), yt.clone(), urls.clone());
-        std::thread::spawn(move || decode_loop(inbox, worker.0, pcm, worker.1, worker.2, worker.3, wake));
-        Self {
-            commands,
-            shared,
-            output,
-            yt,
-            urls,
+        self.device_polled = Instant::now();
+        if default_device() == self.device && !self.device_lost.load(Relaxed) {
+            return;
+        }
+        let paused = self.paused();
+        let played = self.output.take().is_some();
+        self.open_output();
+        self.set_paused(paused);
+        if played && self.output.is_none() {
+            *self.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
         }
     }
 
@@ -615,7 +671,8 @@ impl Player {
         self.output.as_ref().is_none_or(|(_, sink)| sink.is_paused())
     }
 
-    pub fn set_volume(&self, volume: f32) {
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume;
         if let Some((_, sink)) = &self.output {
             sink.set_volume(volume * volume);
         }
@@ -690,4 +747,36 @@ pub fn selftest(query: &str) -> Result<String, String> {
         seeking.elapsed(),
         radio.len(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reopened_output_keeps_playing_the_queued_audio() {
+        let shared = Arc::new(Shared::default());
+        let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
+        let chunks: Chunks = Arc::new(Mutex::new(chunks));
+        let open = || PcmSource::new(chunks.clone(), shared.clone(), Arc::new(|| {}));
+        let queue = |start_ms| {
+            let chunk = Chunk {
+                samples: vec![0.5; 4],
+                start_ms,
+                epoch: 0,
+                rate: 48_000,
+                channels: 2,
+                end: false,
+            };
+            pcm.try_send(chunk).is_ok()
+        };
+        assert!(queue(1000) && queue(2000));
+        let mut first = open();
+        assert_eq!(first.by_ref().take(SILENCE_SAMPLES + 4).filter(|sample| *sample == 0.5).count(), 4);
+        drop(first);
+        let mut second = open();
+        assert_eq!(second.by_ref().take(SILENCE_SAMPLES + 4).filter(|sample| *sample == 0.5).count(), 4);
+        assert_eq!(shared.position_ms.load(Relaxed), 2000);
+        assert!(queue(3000));
+    }
 }
