@@ -233,7 +233,7 @@ code{font-family:var(--mono);font-size:.92em}
     </li>
     <li>
       <h3 class="name">Lyrics that follow the song</h3>
-      <p class="text">Line by line when YouTube Music has timed lyrics, plain text when it does not.</p>
+      <p class="text">Line by line when YouTube Music has timed lyrics. When it has none, Tubefast looks for them on <a href="https://lrclib.net">lrclib.net</a>, and shows plain text when neither has them.</p>
     </li>
     <li>
       <h3 class="name">Media keys</h3>
@@ -358,8 +358,8 @@ cargo run --release</code></pre>
       <p class="text">YouTube changes its internal API without notice. The settings that usually need changing live in one small file, <a href="https://github.com/yigitbozyaka/tubefast/blob/master/clients.json"><code>clients.json</code></a>. When playback fails, Tubefast fetches the current copy from the repository and tries again, so most breakages are fixed for everyone with one commit and no new download.</p>
     </li>
     <li>
-      <h3 class="name">It talks to YouTube and GitHub</h3>
-      <p class="text">At start it reads <code>clients.json</code> and checks whether a newer release exists. With Show on Discord turned on, the title, artist, cover and position of the playing song are also handed to the Discord app on your computer. Nothing else about you is sent, and there is no telemetry.</p>
+      <h3 class="name">It talks to YouTube, GitHub and lrclib.net</h3>
+      <p class="text">At start it reads <code>clients.json</code> and checks whether a newer release exists. When you open the lyrics of a song that YouTube Music has no timed lyrics for, its title, its first artist and its length are sent to lrclib.net to look for them there. With Show on Discord turned on, the title, artist, cover and position of the playing song are also handed to the Discord app on your computer. Nothing else about you is sent, and there is no telemetry.</p>
     </li>
     <li>
       <h3 class="name">Linux builds are new</h3>
