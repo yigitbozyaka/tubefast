@@ -232,18 +232,33 @@ impl Client {
 
     pub fn sign_in(&self, cookie: String) -> Result<Account, String> {
         self.set_session(Some(cookie));
-        let account = self.music("account/account_menu", json!({}), &[]).and_then(|response| {
-            let header = find(&response, "activeAccountHeaderRenderer").ok_or(SESSION_REJECTED)?;
-            Ok(Account {
-                name: text(&header["accountName"]),
-                photo: thumb(&header["accountPhoto"]),
-            })
-        });
+        let account = self.account();
         if account.is_err() {
             self.set_session(None);
             self.expired.store(false, Relaxed);
         }
         account
+    }
+
+    fn account(&self) -> Result<Account, String> {
+        let used = self.session.lock().unwrap().clone().unwrap_or_default();
+        let response = self.music("account/account_menu", json!({}), &[])?;
+        let Some(header) = find(&response, "activeAccountHeaderRenderer") else {
+            self.end_session(&used);
+            return Err(SESSION_REJECTED.to_owned());
+        };
+        Ok(Account {
+            name: text(&header["accountName"]),
+            photo: thumb(&header["accountPhoto"]),
+        })
+    }
+
+    fn end_session(&self, rejected: &str) {
+        let mut session = self.session.lock().unwrap();
+        if session.as_deref() == Some(rejected) {
+            *session = None;
+            self.expired.store(true, Relaxed);
+        }
     }
 
     pub fn cover(&self, video_id: &str) -> Result<String, String> {
@@ -267,12 +282,16 @@ impl Client {
 
     pub fn library(&self) -> Result<Vec<Item>, String> {
         let page = self.browse("FEmusic_liked_playlists")?;
-        Ok(page
+        let saved: Vec<Item> = page
             .sections
             .into_iter()
             .flat_map(|section| section.items)
             .filter(|item| !item.is_song())
-            .collect())
+            .collect();
+        if saved.is_empty() {
+            self.account()?;
+        }
+        Ok(saved)
     }
 
     fn feed(&self, order: usize, pages: usize, emit: &(dyn Fn(usize, Vec<Section>) + Sync)) -> Result<(), String> {
@@ -516,8 +535,7 @@ impl Client {
         let response = match request.send_json(body) {
             Ok(response) => read(response)?,
             Err(ureq::Error::Status(401, _)) if cookie.is_some() => {
-                self.set_session(None);
-                self.expired.store(true, Relaxed);
+                self.end_session(&cookie.unwrap_or_default());
                 return Err(SESSION_REJECTED.to_owned());
             }
             Err(error) => return Err(describe(error)),
@@ -967,6 +985,18 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ends_only_the_session_that_youtube_rejected() {
+        let yt = Client::new(String::new());
+        yt.set_session(Some("newer".to_owned()));
+        yt.end_session("older");
+        assert!(yt.signed_in() && !yt.take_expired());
+        yt.end_session("newer");
+        assert!(!yt.signed_in() && yt.take_expired());
+        yt.end_session("");
+        assert!(!yt.take_expired());
+    }
 
     #[test]
     fn resizes_thumbnails_without_touching_other_hosts() {
