@@ -160,6 +160,22 @@ impl Saved {
     }
 }
 
+fn share_link(item: &Item) -> String {
+    if item.is_song() {
+        return format!("https://music.youtube.com/watch?v={}", item.video_id);
+    }
+    if !item.browse_id.is_empty() {
+        return format!("https://music.youtube.com/browse/{}", item.browse_id);
+    }
+    if !item.artist_id.is_empty() {
+        return format!("https://music.youtube.com/channel/{}", item.artist_id);
+    }
+    if !item.album_id.is_empty() {
+        return format!("https://music.youtube.com/browse/{}", item.album_id);
+    }
+    String::new()
+}
+
 #[derive(Clone)]
 pub enum Action {
     Go(Route),
@@ -177,6 +193,7 @@ pub enum Action {
     Seek(u64),
     Volume(f32),
     Like(Item),
+    Share(Item),
     Pin(Item),
     ToggleQueue,
     ToggleShuffle,
@@ -843,6 +860,14 @@ impl App {
                         Some(Event::LikeRejected(item, format!("Like not saved. {problem}")))
                     });
                 }
+            }
+            Action::Share(item) => {
+                let link = share_link(&item);
+                if link.is_empty() {
+                    return;
+                }
+                self.ctx.copy_text(link);
+                self.notify("Copied share link");
             }
             Action::Pin(item) => toggle(&mut self.saved.pinned, item),
             Action::ToggleQueue => self.saved.queue_open ^= true,
