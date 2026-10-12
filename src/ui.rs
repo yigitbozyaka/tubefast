@@ -1157,7 +1157,17 @@ fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: b
         at.x = slot.right() + 10.0;
     }
     let share = Rect::from_min_size(at, Vec2::splat(42.0));
-    if icon_button(ui, share, ui.id().with("hero-share"), icon::SHARE_NETWORK, glyph(19.0), MUTED, "Copy link").clicked() {
+    if icon_button(
+        ui,
+        share,
+        ui.id().with("hero-share"),
+        icon::SHARE_NETWORK,
+        glyph(19.0),
+        MUTED,
+        "Copy link",
+    )
+    .clicked()
+    {
         cx.out.push(Action::Share(item.clone()));
     }
     bottom -= 60.0;
@@ -2404,8 +2414,16 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
                 out.push(Action::Like(item.clone()));
             }
             let share = Rect::from_center_size(pos2(slot.right() + 12.0, mid), Vec2::splat(34.0));
-            if icon_button(ui, share, Id::new("bar-share"), icon::SHARE_NETWORK, glyph(16.0), MUTED, "Copy playback URL")
-                .clicked()
+            if icon_button(
+                ui,
+                share,
+                Id::new("bar-share"),
+                icon::SHARE_NETWORK,
+                glyph(16.0),
+                MUTED,
+                "Copy playback URL",
+            )
+            .clicked()
             {
                 out.push(Action::Share(item.clone()));
             }
