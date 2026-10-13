@@ -555,7 +555,7 @@ fn artist_links(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, origin: Pos
     }
     for (index, (chars, browse_id)) in artist_spans(item).into_iter().enumerate() {
         let edge = |at: usize| galley.pos_from_cursor(CCursor::new(at));
-        let rect = Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2());
+        let rect = Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2() + galley.rect.min.to_vec2());
         if rect.width() < 1.0 {
             continue;
         }
