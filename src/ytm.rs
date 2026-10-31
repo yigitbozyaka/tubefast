@@ -909,7 +909,91 @@ fn tidy(it: &mut Item) {
     if timed && it.duration.is_empty() {
         it.duration = parts.pop().unwrap_or_default().to_owned();
     }
+    let credited;
+    if it.is_song()
+        && let Some(slot) = parts.iter().position(|part| *part != "Video")
+    {
+        let (title, featured) = clean_title(&it.title);
+        let prefix = format!("{} - ", parts[slot]).to_ascii_lowercase();
+        it.title = match title.to_ascii_lowercase().starts_with(&prefix) {
+            true if title.len() > prefix.len() => title[prefix.len()..].to_owned(),
+            _ => title,
+        };
+        let first = featured.split([',', '&']).next().unwrap_or_default().trim();
+        if !first.is_empty() && !it.subtitle.contains(first) {
+            credited = format!("{}, {featured}", parts[slot]);
+            parts[slot] = &credited;
+        }
+    }
     it.subtitle = parts.join(" • ");
+}
+
+/// Drops the "(Official Video)" style noise from a song title and returns the
+/// featured artists it named separately, so the byline can carry them.
+fn clean_title(title: &str) -> (String, String) {
+    let credit = |inner: &str| {
+        let inner = inner.trim();
+        let lower = inner.to_ascii_lowercase();
+        ["featuring ", "feat.", "feat ", "ft.", "ft "]
+            .into_iter()
+            .find(|mark| lower.starts_with(mark))
+            .map(|mark| inner[mark.len()..].trim().to_owned())
+    };
+    let noise = |inner: &str| {
+        let lower = inner.to_ascii_lowercase();
+        let tagged = ["official", "oficial", "officiel", "lyric"].iter().any(|word| lower.contains(word));
+        let words = [
+            "audio",
+            "video",
+            "music",
+            "visualizer",
+            "visualiser",
+            "hd",
+            "hq",
+            "4k",
+            "mv",
+            "clip",
+            "videoclip",
+        ];
+        let bare = !lower.trim().is_empty() && lower.split_whitespace().all(|word| words.contains(&word));
+        let kept = ["remix", "live", "version", "edit", "cover", "acoustic", "mix"]
+            .iter()
+            .any(|word| lower.contains(word));
+        (tagged || bare) && !kept
+    };
+    let (mut kept, mut featured, mut rest) = (String::new(), String::new(), title);
+    while let Some(open) = rest.find(['(', '[']) {
+        let close = if rest.as_bytes()[open] == b'(' { ')' } else { ']' };
+        let Some(length) = rest[open..].find(close) else { break };
+        let inner = &rest[open + 1..open + length];
+        kept.push_str(&rest[..open]);
+        match credit(inner) {
+            Some(names) if featured.is_empty() => featured = names,
+            Some(_) => {}
+            None if noise(inner) => {}
+            None => kept.push_str(&rest[open..=open + length]),
+        }
+        rest = &rest[open + length + 1..];
+    }
+    kept.push_str(rest);
+    let lower = kept.to_ascii_lowercase();
+    let inline = [" featuring ", " feat. ", " ft. "]
+        .into_iter()
+        .filter_map(|mark| lower.find(mark).map(|at| (at, mark.len())))
+        .min();
+    if let Some((at, length)) = inline.filter(|_| featured.is_empty()) {
+        let tail = &kept[at + length..];
+        let end = tail.find(['(', '[']).unwrap_or(tail.len());
+        featured = tail[..end].trim().to_owned();
+        kept = format!("{} {}", &kept[..at], &tail[end..]);
+    }
+    let clean = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    let clean = clean.trim_end_matches([' ', '-', '|', '–']).to_owned();
+    if clean.is_empty() {
+        (title.to_owned(), String::new())
+    } else {
+        (clean, featured)
+    }
 }
 
 fn header(node: &Value) -> Item {
@@ -1288,5 +1372,42 @@ mod tests {
             ("abcdefghijk", "UCartist", "large")
         );
         assert_eq!(page.songs().len(), 2);
+    }
+
+    #[test]
+    fn strips_title_noise_and_moves_featured_artists_to_the_byline() {
+        let song = |title: &str, subtitle: &str| {
+            let mut it = Item {
+                title: title.to_owned(),
+                subtitle: subtitle.to_owned(),
+                video_id: "v".to_owned(),
+                ..Item::default()
+            };
+            tidy(&mut it);
+            (it.title, it.subtitle)
+        };
+        let pair = |title: &str, subtitle: &str| (title.to_owned(), subtitle.to_owned());
+        assert_eq!(
+            song(
+                "Get Lucky (Official Audio) (feat. Pharrell Williams & Nile Rodgers)",
+                "Video • Daft Punk • 879M views"
+            ),
+            pair("Get Lucky", "Video • Daft Punk, Pharrell Williams & Nile Rodgers • 879M views")
+        );
+        assert_eq!(
+            song("I Feel It Coming ft. Daft Punk (Official Video)", "The Weeknd • 3:58"),
+            pair("I Feel It Coming", "The Weeknd, Daft Punk")
+        );
+        assert_eq!(song("Daft Punk - Voyager [Lyrics]", "Daft Punk"), pair("Voyager", "Daft Punk"));
+        assert_eq!(
+            song("Feels (feat. Pharrell Williams)", "Calvin Harris, Pharrell Williams"),
+            pair("Feels", "Calvin Harris, Pharrell Williams")
+        );
+        assert_eq!(
+            song("Lady (Official Remix) (Live)", "Modjo"),
+            pair("Lady (Official Remix) (Live)", "Modjo")
+        );
+        assert_eq!(song("(Official Video)", "Someone"), pair("(Official Video)", "Someone"));
+        assert_eq!(song("Çağrı (Lyric Video)", "Şehinşah"), pair("Çağrı", "Şehinşah"));
     }
 }

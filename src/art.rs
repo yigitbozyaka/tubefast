@@ -11,7 +11,8 @@ const WORKERS: usize = 4;
 const BUDGET_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 6 * 1024 * 1024;
 const RETRY_AFTER: Duration = Duration::from_secs(20);
-const SIZES: [u32; 4] = [64, 128, 256, 512];
+// ponytail: the 8 px size is the blur, stretched with linear filtering
+const SIZES: [u32; 5] = [8, 64, 128, 256, 512];
 
 type Sized = (String, u32);
 type Jobs = Arc<(Mutex<Vec<Sized>>, Condvar)>;

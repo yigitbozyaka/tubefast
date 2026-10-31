@@ -48,9 +48,11 @@ const PAGE_MARGIN: i8 = 32;
 const HOVER_TIME: f32 = 0.1;
 const MENU_WIDTH: f32 = 248.0;
 const QUEUE_ROW: f32 = 52.0;
+const QUEUE_ART: f32 = 76.0;
 const STICKY_HEIGHT: f32 = 60.0;
 const STAGE_ART: f32 = 512.0;
 const STAGE_LUMINANCE: f32 = 0.14;
+const STAGE_BLUR: u8 = 84;
 const PAGE_FADE: f64 = 0.12;
 
 const fn rgb(hex: u32) -> Color32 {
@@ -1967,6 +1969,13 @@ fn sign_in_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
 
 fn queue_panel(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let area = ui.max_rect();
+    let cover = app.now_playing().map(|item| app.saved.covers.of(item));
+    let tint = cover
+        .and_then(|cover| app.art.get(ui.ctx(), cover, BAR_ART))
+        .map(|picture| picture.tint);
+    let glow = mood(ui, "queue-glow", tint, PANEL, 0.3);
+    let haze = Rect::from_min_size(area.min, vec2(area.width(), AMBIENT_HEIGHT.min(area.height())));
+    wash(ui.painter(), haze, glow, PANEL);
     ui.painter().vline(area.left() + 0.5, area.y_range(), Stroke::new(1.0, veil(0.06)));
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         Frame::new().inner_margin(Margin::same(20)).show(ui, |ui| {
@@ -1980,28 +1989,30 @@ fn queue_panel(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
                 );
                 return;
             };
-            let (art, cover) = ui.allocate_exact_size(Vec2::splat(ui.available_width()), Sense::click());
-            artwork(ui, &app.art, app.saved.covers.of(item), art, 12.0);
+            eyebrow(ui, "Now playing", 0.0);
+            let (head, cover) = ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ART), Sense::click());
+            let art = Rect::from_min_size(head.min, Vec2::splat(QUEUE_ART));
+            artwork(ui, &app.art, app.saved.covers.of(item), art, ART_RADIUS);
             let lift = hover_of(ui, &cover);
-            ui.painter().rect_filled(art, 12.0, shade(0.4 * lift));
+            ui.painter().rect_filled(art, ART_RADIUS, shade(0.4 * lift));
             ui.painter().text(
                 art.center(),
                 Align2::CENTER_CENTER,
                 icon::ARROWS_OUT_SIMPLE,
-                glyph(30.0),
+                glyph(22.0),
                 TEXT.gamma_multiply(lift),
             );
             describe(&cover, "Now playing");
             if cover.clicked() {
                 out.push(Action::Expand(true));
             }
-            ui.add_space(18.0);
-            paragraph(ui, &item.title, bold(18.0), TEXT, 2);
-            ui.add_space(4.0);
-            let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-            let artist = Id::new("queue-artist");
-            byline(ui, out, item, artist, line.left_center(), sans(13.5), line.width());
-            ui.add_space(22.0);
+            let left = art.right() + 14.0;
+            let title = fit(ui, &item.title, bold(15.5), TEXT, head.right() - left, 2);
+            let top = head.center().y - (title.size().y + 22.0) / 2.0;
+            let below = pos2(left, top + title.size().y + 12.0);
+            ui.painter().galley(pos2(left, top), title, TEXT);
+            byline(ui, out, item, Id::new("queue-artist"), below, sans(13.0), head.right() - left);
+            ui.add_space(26.0);
             queue_rows(app, ui, true, out);
         });
     });
@@ -2212,8 +2223,18 @@ fn now_playing(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Color32 {
     let side = (stage.width() - 96.0).min(stage.height() - 230.0).clamp(120.0, STAGE_ART);
     let tint = |size: f32| app.art.get(ui.ctx(), cover, size).map(|picture| picture.tint);
     let glow = mood(ui, "stage", tint(side).or_else(|| tint(BAR_ART)), PANEL, 0.46);
-    let glow = dimmed(glow, STAGE_LUMINANCE);
-    wash(ui.painter(), area, glow, PANEL);
+    let mut glow = dimmed(glow, STAGE_LUMINANCE);
+    match app.art.get(ui.ctx(), cover, 1.0) {
+        Some(blur) => {
+            let fill = Rect::from_center_size(area.center(), Vec2::splat(area.width().max(area.height())));
+            let dark = Color32::from_gray(STAGE_BLUR);
+            egui::Image::from_texture((blur.id, fill.size())).tint(dark).paint_at(ui, fill);
+            wash(ui.painter(), area, Color32::TRANSPARENT, PANEL);
+            let scale = |channel: u8| (channel as u16 * STAGE_BLUR as u16 / 255) as u8;
+            glow = Color32::from_rgb(scale(blur.tint.r()), scale(blur.tint.g()), scale(blur.tint.b()));
+        }
+        None => wash(ui.painter(), area, glow, PANEL),
+    }
 
     let close = Rect::from_center_size(area.min + vec2(44.0, 42.0), Vec2::splat(38.0));
     if icon_button(ui, close, Id::new("stage-close"), icon::CARET_DOWN, glyph(19.0), MUTED, "Collapse").clicked() {
@@ -2299,6 +2320,11 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
     let mid = bar.center().y + 3.0;
     let duration = app.player.duration_ms();
     let item = app.now_playing();
+    let cover = item.map(|item| app.saved.covers.of(item));
+    let tint = cover
+        .and_then(|cover| app.art.get(ui.ctx(), cover, BAR_ART))
+        .map(|picture| picture.tint);
+    wash(ui.painter(), bar, PANEL, mood(ui, "bar-glow", tint, PANEL, 0.16));
     let backdrop = ui.interact(bar, Id::new("bar-backdrop"), Sense::click());
     if backdrop.clicked() && item.is_some() {
         out.push(Action::Expand(!app.expanded));
