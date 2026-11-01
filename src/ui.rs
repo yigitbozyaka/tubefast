@@ -1157,16 +1157,17 @@ fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: b
         at.x = slot.right() + 10.0;
     }
     let share = Rect::from_min_size(at, Vec2::splat(42.0));
-    if icon_button(
-        ui,
-        share,
-        ui.id().with("hero-share"),
-        icon::SHARE_NETWORK,
-        glyph(19.0),
-        MUTED,
-        "Copy link",
-    )
-    .clicked()
+    if symbol.is_none()
+        && icon_button(
+            ui,
+            share,
+            ui.id().with("hero-share"),
+            icon::SHARE_NETWORK,
+            glyph(19.0),
+            MUTED,
+            "Copy link",
+        )
+        .clicked()
     {
         cx.out.push(Action::Share(item.clone()));
     }
@@ -2379,7 +2380,7 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
             let art = Rect::from_min_size(pos2(bar.left() + 18.0, mid - BAR_ART / 2.0), Vec2::splat(BAR_ART));
             artwork(ui, &app.art, app.saved.covers.of(item), art, 6.0);
             let left = art.right() + 14.0;
-            let width = (bar.center().x - 170.0 - left - 44.0).max(60.0);
+            let width = (bar.center().x - 170.0 - left - 78.0).max(60.0);
             let title = label(
                 ui,
                 pos2(left, mid - 10.0),
@@ -2413,7 +2414,7 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
             if icon_button(ui, slot, Id::new("bar-like"), icon::HEART, font, color, hint).clicked() {
                 out.push(Action::Like(item.clone()));
             }
-            let share = Rect::from_center_size(pos2(slot.right() + 12.0, mid), Vec2::splat(34.0));
+            let share = Rect::from_center_size(pos2(slot.center().x + 34.0, mid), Vec2::splat(34.0));
             if icon_button(
                 ui,
                 share,
