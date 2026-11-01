@@ -235,6 +235,7 @@ pub struct App {
     discord: Option<Discord>,
     replaced: Option<(Vec<Item>, Option<usize>, u64)>,
     curated: bool,
+    growing: Option<(Route, usize, usize)>,
     resume_at: Option<u64>,
     pub sign_in: Option<SignIn>,
     pub library: Vec<Item>,
@@ -304,6 +305,7 @@ impl App {
             discord,
             replaced: None,
             curated: !saved.queue.is_empty(),
+            growing: None,
             resume_at: saved.current.map(|_| saved.position_ms),
             sign_in: None,
             library: Vec::new(),
@@ -491,7 +493,10 @@ impl App {
             let result = match &route {
                 Route::Home => yt.home(&seeds, &emit).map(|()| Page::default()),
                 Route::Search(query) => yt.search(query),
-                Route::Browse(id) => yt.browse(id),
+                Route::Browse(id) => yt.browse(id, &|page| {
+                    let _ = sender.send(Event::Page(route.clone(), Ok(Box::new(page.clone()))));
+                    ctx.request_repaint();
+                }),
                 Route::Liked | Route::Recent => return,
             };
             let _ = sender.send(Event::Page(route, result.map(Box::new)));
@@ -522,9 +527,40 @@ impl App {
         self.ensure(&route);
     }
 
+    fn growing_list(&self, items: &[Item]) -> Option<(Route, usize, usize)> {
+        let Some(Load::Ready(page)) = self.pages.get(self.route()) else {
+            return None;
+        };
+        let first = items.first().map(|item| &item.video_id);
+        let at = page
+            .sections
+            .iter()
+            .position(|section| section.items.first().map(|item| &item.video_id) == first)?;
+        page.partial.then(|| (self.route().clone(), at, page.sections[at].items.len()))
+    }
+
+    fn grow_queue(&mut self, route: &Route, page: &Page) {
+        let Some((from, at, offered)) = &mut self.growing else { return };
+        if from != route {
+            return;
+        }
+        let Some(section) = page.sections.get(*at) else { return };
+        let fresh = section.items.iter().skip(*offered).filter(|item| item.is_song()).cloned();
+        *offered = section.items.len();
+        self.saved.queue.extend(fresh);
+        if self.saved.shuffle {
+            let upcoming = self.saved.current.map_or(0, |current| current + 1).min(self.saved.queue.len());
+            shuffle(&mut self.saved.queue[upcoming..]);
+        }
+        if !page.partial {
+            self.growing = None;
+        }
+    }
+
     fn play(&mut self, items: Vec<Item>, index: usize) {
         let chosen = items.get(index).map(|item| item.video_id.clone()).unwrap_or_default();
         let songs: Vec<Item> = items.into_iter().filter(Item::is_song).collect();
+        self.growing = None;
         let before = std::mem::replace(&mut self.saved.queue, songs);
         let upcoming = self.saved.current.map_or(0, |current| current + 1);
         let same_list = before.len() == self.saved.queue.len()
@@ -620,6 +656,7 @@ impl App {
                 Event::Page(route, Ok(page)) => {
                     let wanted = matches!(&route, Route::Search(query) if self.autoplay.as_ref() == Some(query));
                     let first = page.songs().into_iter().next().filter(|_| wanted);
+                    self.grow_queue(&route, &page);
                     self.pages.insert(route, Load::Ready(page));
                     if let Some(song) = first {
                         self.autoplay = None;
@@ -794,7 +831,11 @@ impl App {
                 self.pages.remove(&route);
                 self.ensure(&route);
             }
-            Action::Play(items, index) => self.play(items, index),
+            Action::Play(items, index) => {
+                let growing = self.growing_list(&items);
+                self.play(items, index);
+                self.growing = growing;
+            }
             Action::Jump(index) => self.play_index(index),
             Action::PlayNext(item) => {
                 let at = self.saved.current.map_or(0, |current| current + 1).min(self.saved.queue.len());
