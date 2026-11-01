@@ -790,6 +790,9 @@ fn song_actions(ui: &mut Ui, cx: &mut Cx, item: &Item) {
     if menu_row(ui, icon::HEART, font, tint, text).clicked() {
         choice = Some(Action::Like(item.clone()));
     }
+    if menu_row(ui, icon::SHARE_NETWORK, glyph(17.0), MUTED, "Share").clicked() {
+        choice = Some(Action::Share(item.clone()));
+    }
     if !item.artist_id.is_empty() || !item.album_id.is_empty() {
         menu_divider(ui);
     }
@@ -1151,6 +1154,22 @@ fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: b
         if icon_button(ui, slot, ui.id().with("hero-pin"), icon::BOOKMARK_SIMPLE, font, color, hint).clicked() {
             cx.out.push(Action::Pin(item.clone()));
         }
+        at.x = slot.right() + 10.0;
+    }
+    let share = Rect::from_min_size(at, Vec2::splat(42.0));
+    if symbol.is_none()
+        && icon_button(
+            ui,
+            share,
+            ui.id().with("hero-share"),
+            icon::SHARE_NETWORK,
+            glyph(19.0),
+            MUTED,
+            "Copy link",
+        )
+        .clicked()
+    {
+        cx.out.push(Action::Share(item.clone()));
     }
     bottom -= 60.0;
 
@@ -2361,7 +2380,7 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
             let art = Rect::from_min_size(pos2(bar.left() + 18.0, mid - BAR_ART / 2.0), Vec2::splat(BAR_ART));
             artwork(ui, &app.art, app.saved.covers.of(item), art, 6.0);
             let left = art.right() + 14.0;
-            let width = (bar.center().x - 170.0 - left - 44.0).max(60.0);
+            let width = (bar.center().x - 170.0 - left - 78.0).max(60.0);
             let title = label(
                 ui,
                 pos2(left, mid - 10.0),
@@ -2394,6 +2413,20 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
             };
             if icon_button(ui, slot, Id::new("bar-like"), icon::HEART, font, color, hint).clicked() {
                 out.push(Action::Like(item.clone()));
+            }
+            let share = Rect::from_center_size(pos2(slot.center().x + 34.0, mid), Vec2::splat(34.0));
+            if icon_button(
+                ui,
+                share,
+                Id::new("bar-share"),
+                icon::SHARE_NETWORK,
+                glyph(16.0),
+                MUTED,
+                "Copy playback URL",
+            )
+            .clicked()
+            {
+                out.push(Action::Share(item.clone()));
             }
         }
         None => {
