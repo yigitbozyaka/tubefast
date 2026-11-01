@@ -45,7 +45,8 @@ Numbers are from the release build on Windows 11. Memory is the working set a fe
 | **Discord status** | Turn on **Show on Discord** under the gear at the bottom of the sidebar and your Discord profile shows the song you are listening to, with its artist, cover and progress. The same menu picks what the short status next to your name says: Tubefast, the artist, the song or a text of your own. It is off until you turn it on. |
 | **A home feed that knows you** | Signed out, the feed is built from what you played here. Signed in, you get your own YouTube Music feed and playlists. |
 | **Your library, kept locally** | Liked songs, listening history and saved albums, playlists and artists live on your computer. |
-| **Real covers** | Music videos show the album cover of the song instead of a video frame whenever YouTube knows which song it is. |
+| **Real covers, clean titles** | Music videos show the album cover of the song instead of a video frame whenever YouTube knows which song it is. Titles drop "(Official Audio)", "[Lyrics]" and the like, and a featured artist moves to the artist line. |
+| **Share** | The share button copies a music.youtube.com link to the song, album, playlist or artist, from the player bar, a page's banner or a track's menu. |
 | **Keyboard first** | Shortcuts for everything that matters, plus accessible names on every control for screen readers. |
 | **Profiles** | Run separate libraries and accounts side by side with `--profile`. |
 
@@ -107,6 +108,8 @@ Everything except your personal feed and your playlists works without an account
 
 - **Continue in browser** opens a separate Edge or Chrome window. Sign in to Google there and the window closes by itself.
 - **Paste your cookie** if the browser window is refused by Google. The dialog lists the three steps.
+
+If your Google account has more than one channel, such as a brand channel, the account row at the bottom of the sidebar reads **Switch channel** and picks which one Tubefast uses. The choice is kept for next time.
 
 Your session never leaves your computer. It is stored in your user profile, encrypted with your Windows account (DPAPI) or, on macOS and Linux, in a file only your user can read, and is sent only to YouTube. Sign out removes it.
 
