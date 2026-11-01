@@ -1812,8 +1812,28 @@ fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
     let (left, mid) = (avatar.right() + 12.0, row.center().y);
     match &app.saved.account {
         Some(account) => {
-            artwork(ui, &app.art, &account.photo, avatar, 16.0);
             let width = row.right() - left - 44.0;
+            let switchable = app.accounts.len() > 1;
+            if switchable {
+                let area = Rect::from_min_max(row.min, pos2(row.right() - 40.0, row.bottom()));
+                let response = ui.interact(area, Id::new("switch-account"), Sense::click());
+                let hover = hover_of(ui, &response);
+                ui.painter().rect_filled(area, ROW_RADIUS, veil(0.05 * hover));
+                describe(&response, "Switch channel");
+                egui::Popup::menu(&response).gap(4.0).align(egui::RectAlign::TOP_START).show(|ui| {
+                    ui.set_width(MENU_WIDTH);
+                    for channel in &app.accounts {
+                        let chosen = channel.page == account.page;
+                        let symbol = if chosen { icon::CHECK } else { "" };
+                        let row = menu_row(ui, symbol, glyph(15.0), ACCENT, &channel.name);
+                        row.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, chosen, &channel.name));
+                        if row.clicked() && !chosen {
+                            out.push(Action::SwitchAccount(channel.clone()));
+                        }
+                    }
+                });
+            }
+            artwork(ui, &app.art, &account.photo, avatar, 16.0);
             label(
                 ui,
                 pos2(left, mid - 9.0),
@@ -1827,7 +1847,7 @@ fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
                 ui,
                 pos2(left, mid + 9.0),
                 Align2::LEFT_CENTER,
-                "Signed in",
+                if switchable { "Switch channel" } else { "Signed in" },
                 sans(12.0),
                 MUTED,
                 width,
