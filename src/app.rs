@@ -203,6 +203,7 @@ pub enum Action {
     BrowserSignIn,
     CookieSignIn,
     SignOut,
+    SwitchAccount(Account),
     Undo,
     GetUpdate,
     OpenRelease,
@@ -224,6 +225,7 @@ enum Event {
     Radio(String, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     Library(Vec<Item>),
+    Accounts(Vec<Account>),
     Liked(Vec<Item>),
     LikeRejected(Item, String),
     Cover(String, Option<String>),
@@ -255,6 +257,7 @@ pub struct App {
     resume_at: Option<u64>,
     pub sign_in: Option<SignIn>,
     pub library: Vec<Item>,
+    pub accounts: Vec<Account>,
     pub player: Player,
     pub art: Art,
     pub history: Vec<Route>,
@@ -286,6 +289,7 @@ impl App {
         if !yt.signed_in() {
             saved.leave_account();
         }
+        yt.act_as(saved.account.as_ref().map_or("", |account| &account.page));
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
         let ctx = cc.egui_ctx.clone();
         let mut player = Player::new(yt.clone(), {
@@ -324,6 +328,7 @@ impl App {
             resume_at: saved.current.map(|_| saved.position_ms),
             sign_in: None,
             library: Vec::new(),
+            accounts: Vec::new(),
             player,
             history: vec![Route::Home],
             at: 0,
@@ -426,6 +431,7 @@ impl App {
         if self.yt.signed_in() {
             self.background(|yt| yt.library().ok().map(Event::Library));
             self.background(|yt| yt.liked().ok().map(Event::Liked));
+            self.background(|yt| yt.accounts().ok().map(Event::Accounts));
         }
     }
 
@@ -449,6 +455,8 @@ impl App {
 
     fn sign_out(&mut self) {
         self.yt.set_session(None);
+        self.yt.act_as("");
+        self.accounts.clear();
         auth::forget();
         self.saved.leave_account();
         self.refresh();
@@ -658,6 +666,8 @@ impl App {
                 }
                 Event::Radio(..) => {}
                 Event::Library(items) => self.library = items,
+                Event::Accounts(accounts) if self.yt.signed_in() => self.accounts = accounts,
+                Event::Accounts(_) => {}
                 Event::Liked(items) if self.yt.signed_in() => {
                     let shown = std::mem::replace(&mut self.saved.liked, items);
                     self.saved.signed_out_liked.get_or_insert(shown);
@@ -903,6 +913,11 @@ impl App {
                 self.start_sign_in("Checking with YouTube.", move || auth::clean_cookie(&pasted));
             }
             Action::SignOut => self.sign_out(),
+            Action::SwitchAccount(account) => {
+                self.yt.act_as(&account.page);
+                self.saved.account = Some(account);
+                self.refresh();
+            }
             Action::Undo => {
                 if let Some((queue, current, position)) = self.replaced.take() {
                     self.saved.queue = queue;

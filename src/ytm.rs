@@ -19,6 +19,7 @@ const LATEST_CLIENTS: &str = "https://raw.githubusercontent.com/yigitbozyaka/tub
 const CLIENTS_BYTES: u64 = 16 * 1024;
 const CLIENTS_RETRY: Duration = Duration::from_secs(10 * 60);
 const WATCH_API: &str = "https://www.youtube.com/youtubei/v1/next?prettyPrint=false";
+const WEB_VERSION: &str = "2.20260707.00.00";
 const MWEB_VERSION: &str = "2.20260708.05.00";
 const MWEB_CLIENT_ID: &str = "2";
 const MWEB_UA: &str = "Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)";
@@ -141,6 +142,8 @@ pub struct Lyrics {
 pub struct Account {
     pub name: String,
     pub photo: String,
+    #[serde(default)]
+    pub page: String,
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -172,6 +175,7 @@ pub struct Client {
     pub agent: ureq::Agent,
     visitor: Mutex<String>,
     session: Mutex<Option<String>>,
+    page: Mutex<String>,
     expired: AtomicBool,
     clients: Mutex<Clients>,
     clients_checked: Mutex<Option<Instant>>,
@@ -188,6 +192,7 @@ impl Client {
             agent,
             visitor: Mutex::new(visitor),
             session: Mutex::new(None),
+            page: Mutex::default(),
             expired: AtomicBool::new(false),
             clients: Mutex::new(Clients::parse(BUNDLED_CLIENTS).expect("the bundled clients.json should be complete")),
             clients_checked: Mutex::new(None),
@@ -227,6 +232,10 @@ impl Client {
         *self.session.lock().unwrap() = cookie;
     }
 
+    pub fn act_as(&self, page: &str) {
+        *self.page.lock().unwrap() = page.to_owned();
+    }
+
     pub fn signed_in(&self) -> bool {
         self.session.lock().unwrap().is_some()
     }
@@ -237,6 +246,7 @@ impl Client {
 
     pub fn sign_in(&self, cookie: String) -> Result<Account, String> {
         self.set_session(Some(cookie));
+        self.act_as("");
         let account = self.account();
         if account.is_err() {
             self.set_session(None);
@@ -255,7 +265,17 @@ impl Client {
         Ok(Account {
             name: text(&header["accountName"]),
             photo: thumb(&header["accountPhoto"]),
+            page: self.page.lock().unwrap().clone(),
         })
+    }
+
+    pub fn accounts(&self) -> Result<Vec<Account>, String> {
+        let body = json!({
+            "context": { "client": { "clientName": "WEB", "clientVersion": WEB_VERSION, "hl": LANGUAGE } },
+            "requestType": "ACCOUNTS_LIST_REQUEST_TYPE_CHANNEL_SWITCHER",
+            "callCircumstance": "SWITCHING_USERS_FULL",
+        });
+        Ok(channels(&self.music("account/accounts_list", body, &[])?))
     }
 
     fn end_session(&self, rejected: &str) {
@@ -540,7 +560,7 @@ impl Client {
         if !known.is_empty() {
             return Ok(known);
         }
-        let body = json!({ "context": { "client": { "clientName": "WEB", "clientVersion": "2.20260707.00.00", "hl": LANGUAGE } } });
+        let body = json!({ "context": { "client": { "clientName": "WEB", "clientVersion": WEB_VERSION, "hl": LANGUAGE } } });
         let response = send(self.agent.post(VISITOR_API), body)?;
         let visitor = response["responseContext"]["visitorData"]
             .as_str()
@@ -552,7 +572,15 @@ impl Client {
 
     fn music(&self, endpoint: &str, mut body: Value, params: &[(&str, &str)]) -> Result<Value, String> {
         let version = self.clients.lock().unwrap().remix_version.clone();
-        body["context"] = json!({ "client": { "clientName": "WEB_REMIX", "clientVersion": version, "hl": LANGUAGE } });
+        let client = match body["context"]["client"].take() {
+            Value::Null => json!({ "clientName": "WEB_REMIX", "clientVersion": version, "hl": LANGUAGE }),
+            chosen => chosen,
+        };
+        body["context"] = json!({ "client": client });
+        let page = self.page.lock().unwrap().clone();
+        if !page.is_empty() {
+            body["context"]["user"] = json!({ "onBehalfOfUser": page });
+        }
         let mut request = self
             .agent
             .post(&format!("{MUSIC_API}{endpoint}?prettyPrint=false"))
@@ -606,6 +634,32 @@ fn find<'a>(node: &'a Value, key: &str) -> Option<&'a Value> {
         Value::Object(map) => map.get(key).or_else(|| map.values().find_map(|child| find(child, key))),
         _ => None,
     }
+}
+
+fn channels(response: &Value) -> Vec<Account> {
+    let mut found = Vec::new();
+    let mut pending = vec![response];
+    while let Some(node) = pending.pop() {
+        match node {
+            Value::Array(list) => pending.extend(list.iter().rev()),
+            Value::Object(map) if map.contains_key("accountName") => {
+                let datasync = find(node, "datasyncIdToken").and_then(|token| token["datasyncIdToken"].as_str());
+                let Some((first, owner)) = datasync.and_then(|token| token.split_once("||")) else {
+                    continue;
+                };
+                found.push(Account {
+                    name: node["accountName"]["simpleText"]
+                        .as_str()
+                        .map_or_else(|| text(&node["accountName"]), str::to_owned),
+                    photo: thumb(&node["accountPhoto"]),
+                    page: if owner.is_empty() { String::new() } else { first.to_owned() },
+                });
+            }
+            Value::Object(map) => pending.extend(map.values().rev()),
+            _ => {}
+        }
+    }
+    found
 }
 
 fn timed_lyrics(response: &Value) -> Option<Lyrics> {
@@ -1130,6 +1184,31 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_the_own_channel_and_brand_channels_from_the_switcher() {
+        let channel = |name: &str, datasync: &str| {
+            json!({ "accountItemRenderer": {
+                "accountName": { "simpleText": name },
+                "accountPhoto": { "thumbnails": [{ "url": format!("https://yt3.ggpht.com/{name}"), "width": 40 }] },
+                "serviceEndpoint": { "selectActiveIdentityEndpoint": { "supportedTokens": [
+                    { "accountStateToken": { "hasChannel": true } },
+                    { "datasyncIdToken": { "datasyncIdToken": datasync } },
+                ] } },
+            } })
+        };
+        let response = json!({ "actions": [{ "updateChannelSwitcherPageAction": { "page": { "channelSwitcherPageRenderer": {
+            "contents": [
+                { "buttonRenderer": { "text": { "runs": [{ "text": "Create a channel" }] } } },
+                channel("Own", "1036||"),
+                channel("Music", "1172||1036"),
+            ],
+        } } } }] });
+        let accounts = channels(&response);
+        let summary: Vec<(&str, &str)> = accounts.iter().map(|a| (a.name.as_str(), a.page.as_str())).collect();
+        assert_eq!(summary, [("Own", ""), ("Music", "1172")]);
+        assert_eq!(accounts[1].photo, "https://yt3.ggpht.com/Music");
+    }
 
     #[test]
     fn ends_only_the_session_that_youtube_rejected() {
