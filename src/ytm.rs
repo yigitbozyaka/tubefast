@@ -47,7 +47,7 @@ const EXPLORE_ORDER: usize = 100;
 const HOME_ORDER: usize = 200;
 const PERSONAL_PAGES: usize = 3;
 const LIKED_SONGS: &str = "VLLM";
-const LIKED_PAGES: usize = 50;
+const TRACK_PAGES: usize = 50;
 const SESSION_REJECTED: &str = "YouTube did not accept this sign-in. Sign in again.";
 const UNUSED_KEYS: [&str; 14] = [
     "counterpart",
@@ -306,7 +306,7 @@ impl Client {
     }
 
     pub fn library(&self) -> Result<Vec<Item>, String> {
-        let page = self.browse("FEmusic_liked_playlists")?;
+        let page = self.browse("FEmusic_liked_playlists", &|_| {})?;
         let saved: Vec<Item> = page
             .sections
             .into_iter()
@@ -343,7 +343,7 @@ impl Client {
         let mut response = self.music("browse", json!({ "browseId": LIKED_SONGS }), &[])?;
         let mut token = tracks_continuation(&response);
         let mut songs = parse_page(&response).songs();
-        for _ in 1..LIKED_PAGES {
+        for _ in 1..TRACK_PAGES {
             let Some(next) = token else { break };
             response = self.more(&next)?;
             songs.extend(parse_page(&response).songs());
@@ -389,7 +389,10 @@ impl Client {
                     })
                 })
                 .collect();
-            let explore = scope.spawn(move || self.browse("FEmusic_explore").map(|page| emit(explore_order, page.sections)));
+            let explore = scope.spawn(move || {
+                self.browse("FEmusic_explore", &|_| {})
+                    .map(|page| emit(explore_order, page.sections))
+            });
             let home = self.feed(home_order, pages, emit);
             let finished = related.into_iter().chain([explore]).map(|task| task.join().unwrap()).chain([home]);
             let mut outcome = Err(String::new());
@@ -402,22 +405,26 @@ impl Client {
         })
     }
 
-    pub fn browse(&self, browse_id: &str) -> Result<Page, String> {
+    pub fn browse(&self, browse_id: &str, progress: &dyn Fn(&Page)) -> Result<Page, String> {
         let response = self.music("browse", json!({ "browseId": browse_id }), &[])?;
+        let mut token = tracks_continuation(&response);
         let mut page = parse_page(&response);
         if let Some(header) = &mut page.header {
             header.browse_id = browse_id.to_owned();
             header.is_artist = browse_id.starts_with("UC");
-            let (thumb, artist) = (header.thumb.clone(), header.extra.clone());
-            for item in page.sections.iter_mut().flat_map(|s| &mut s.items) {
-                if item.thumb.is_empty() {
-                    item.thumb = thumb.clone();
-                }
-                if item.subtitle.is_empty() {
-                    item.subtitle = artist.clone();
-                }
-            }
         }
+        let tracks = page.sections.iter().position(|section| section.layout == Layout::Tracks);
+        for _ in 1..TRACK_PAGES {
+            let (Some(next), Some(at)) = (token.take(), tracks) else { break };
+            page.partial = true;
+            inherit_header(&mut page);
+            progress(&page);
+            let Ok(response) = self.more(&next) else { break };
+            page.sections[at].items.extend(parse_page(&response).songs());
+            token = continuation(&response);
+        }
+        page.partial = false;
+        inherit_header(&mut page);
         Ok(page)
     }
 
@@ -738,6 +745,19 @@ fn continuation(response: &Value) -> Option<String> {
 
 fn tracks_continuation(playlist: &Value) -> Option<String> {
     find(playlist, "musicPlaylistShelfRenderer").and_then(continuation)
+}
+
+fn inherit_header(page: &mut Page) {
+    let Some(header) = &page.header else { return };
+    let (thumb, artist) = (header.thumb.clone(), header.extra.clone());
+    for item in page.sections.iter_mut().flat_map(|s| &mut s.items) {
+        if item.thumb.is_empty() {
+            item.thumb = thumb.clone();
+        }
+        if item.subtitle.is_empty() {
+            item.subtitle = artist.clone();
+        }
+    }
 }
 
 struct Lean;
