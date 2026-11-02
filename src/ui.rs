@@ -701,7 +701,7 @@ fn bars(ui: &Ui, center: Pos2, moving: bool) {
             .rect_filled(Rect::from_min_max(pos2(x - 1.5, top), pos2(x + 1.5, center.y + 7.0)), 1.0, ACCENT);
     }
     if moving && ui.input(|input| input.focused) {
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(Duration::from_millis(66));
     }
 }
 

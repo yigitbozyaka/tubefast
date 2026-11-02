@@ -1,3 +1,4 @@
+use crate::opus::OpusStream;
 use crate::ytm;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
@@ -18,9 +19,12 @@ const RANGE_BYTES: u64 = 1024 * 1024;
 const WINDOW_BYTES: u64 = 8 * 1024 * 1024;
 const KEPT_BEHIND: u64 = 1024 * 1024;
 const BUFFERED_AHEAD: u64 = WINDOW_BYTES - KEPT_BEHIND - RANGE_BYTES;
+const FULL_POLL: Duration = Duration::from_millis(10);
+const PAUSED_POLL: Duration = Duration::from_millis(250);
 const WINDOW_POLL: Duration = Duration::from_millis(200);
 const MAX_STALLS: u32 = 5;
 const QUEUED_CHUNKS: usize = 24;
+const PRE_ROLL_MS: u64 = 80;
 const SILENCE_SAMPLES: usize = 512;
 const URL_LIFETIME: Duration = Duration::from_secs(3 * 60 * 60);
 const URL_CACHE_ENTRIES: usize = 64;
@@ -30,7 +34,7 @@ const NO_OUTPUT: &str = "No audio output device was found";
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 type Chunks = Arc<Mutex<Receiver<Chunk>>>;
-type Urls = Arc<Mutex<HashMap<String, (Instant, String, u64, u64)>>>;
+type Urls = Arc<Mutex<HashMap<String, (Instant, ytm::Stream)>>>;
 
 #[derive(Default)]
 struct Shared {
@@ -40,6 +44,7 @@ struct Shared {
     duration_ms: AtomicU64,
     buffered: AtomicU32,
     loading: AtomicBool,
+    paused: AtomicBool,
     ended: AtomicBool,
     error: Mutex<Option<String>>,
 }
@@ -78,6 +83,7 @@ struct Fetch {
     changed: Condvar,
     len: u64,
     failed: AtomicBool,
+    cancelled: AtomicBool,
     generation: u64,
     shared: Arc<Shared>,
 }
@@ -94,6 +100,7 @@ impl Fetch {
             changed: Condvar::new(),
             len,
             failed: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
             generation,
             shared,
         });
@@ -107,7 +114,7 @@ impl Fetch {
     }
 
     fn current(&self) -> bool {
-        self.shared.generation.load(Relaxed) == self.generation
+        self.shared.generation.load(Relaxed) == self.generation && !self.cancelled.load(Relaxed)
     }
 
     fn next_range(&self) -> Option<u64> {
@@ -177,6 +184,13 @@ struct Reader {
     seekable: Arc<AtomicBool>,
 }
 
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.fetch.cancelled.store(true, Relaxed);
+        self.fetch.changed.notify_all();
+    }
+}
+
 impl Read for Reader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let mut window = self.fetch.window.lock().unwrap();
@@ -239,12 +253,29 @@ struct Track {
     decoder: Box<dyn Decoder>,
     id: u32,
     time_base: Option<TimeBase>,
+    buffer: Option<SampleBuffer<f32>>,
+    trim_ms: Option<u64>,
     finished: bool,
 }
 
 impl Track {
     fn open(yt: &ytm::Client, urls: &Urls, video_id: &str, generation: u64, shared: &Arc<Shared>) -> Result<Track, String> {
-        let (url, len, duration_ms) = resolve(yt, urls, video_id)?;
+        let mut stream = resolve(yt, urls, video_id)?;
+        let fallback = stream.fallback.take();
+        Self::open_stream(yt, stream, video_id, generation, shared).or_else(|message| match fallback {
+            Some(aac) => Self::open_stream(yt, *aac, video_id, generation, shared),
+            None => Err(message),
+        })
+    }
+
+    fn open_stream(yt: &ytm::Client, stream: ytm::Stream, video_id: &str, generation: u64, shared: &Arc<Shared>) -> Result<Track, String> {
+        let ytm::Stream {
+            url,
+            len,
+            duration_ms,
+            opus,
+            ..
+        } = stream;
         if shared.generation.load(Relaxed) == generation {
             shared.duration_ms.store(duration_ms, Relaxed);
         }
@@ -257,7 +288,7 @@ impl Track {
         };
         let source = MediaSourceStream::new(Box::new(reader), Default::default());
         let mut hint = Hint::new();
-        hint.with_extension("m4a");
+        hint.with_extension(if opus { "webm" } else { "m4a" });
         let format = symphonia::default::get_probe()
             .format(&hint, source, &FormatOptions::default(), &MetadataOptions::default())
             .map_err(|e| e.to_string())?
@@ -265,9 +296,14 @@ impl Track {
         seekable.store(true, Relaxed);
         let track = format.default_track().ok_or("This stream has no audio track")?;
         let (id, time_base) = (track.id, track.codec_params.time_base);
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| e.to_string())?;
+        let options = DecoderOptions::default();
+        let decoder: Box<dyn Decoder> = if opus {
+            Box::new(OpusStream::try_new(&track.codec_params, &options).map_err(|e| e.to_string())?)
+        } else {
+            symphonia::default::get_codecs()
+                .make(&track.codec_params, &options)
+                .map_err(|e| e.to_string())?
+        };
         Ok(Track {
             video_id: video_id.to_owned(),
             generation,
@@ -275,6 +311,8 @@ impl Track {
             decoder,
             id,
             time_base,
+            buffer: None,
+            trim_ms: None,
             finished: false,
         })
     }
@@ -295,12 +333,29 @@ impl Track {
                 Err(e) => return Err(e.to_string()),
             };
             let spec = *decoded.spec();
-            let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+            let channels = spec.channels.count();
+            let buffer = match &mut self.buffer {
+                Some(buffer) if buffer.capacity() >= decoded.frames() * channels => buffer,
+                slot => slot.insert(SampleBuffer::new(decoded.frames() as u64, spec)),
+            };
             buffer.copy_interleaved_ref(decoded);
             let time = self.time_base.map(|base| base.calc_time(packet.ts()));
-            let start_ms = time.map_or(0, |t| t.seconds * 1000 + (t.frac * 1000.0) as u64);
+            let mut start_ms = time.map_or(0, |t| t.seconds * 1000 + (t.frac * 1000.0) as u64);
+            let samples = buffer.samples();
+            let mut from = 0;
+            if let Some(target) = self.trim_ms {
+                let end_ms = start_ms + (samples.len() / channels) as u64 * 1000 / spec.rate as u64;
+                if end_ms <= target {
+                    continue;
+                }
+                self.trim_ms = None;
+                if start_ms < target {
+                    from = ((target - start_ms) * spec.rate as u64 / 1000) as usize * channels;
+                    start_ms = target;
+                }
+            }
             return Ok(Some(Chunk {
-                samples: buffer.samples().to_vec(),
+                samples: samples[from.min(samples.len())..].to_vec(),
                 start_ms,
                 epoch,
                 rate: spec.rate,
@@ -311,7 +366,8 @@ impl Track {
     }
 
     fn seek(&mut self, ms: u64) {
-        let time = Time::new(ms / 1000, (ms % 1000) as f64 / 1000.0);
+        let from = ms.saturating_sub(PRE_ROLL_MS);
+        let time = Time::new(from / 1000, (from % 1000) as f64 / 1000.0);
         if self
             .format
             .seek(
@@ -324,27 +380,25 @@ impl Track {
             .is_ok()
         {
             self.decoder.reset();
+            self.trim_ms = self.time_base.map(|_| ms);
             self.finished = false;
         }
     }
 }
 
-fn resolve(yt: &ytm::Client, urls: &Urls, video_id: &str) -> Result<(String, u64, u64), String> {
-    if let Some((at, url, len, duration_ms)) = urls.lock().unwrap().get(video_id)
+fn resolve(yt: &ytm::Client, urls: &Urls, video_id: &str) -> Result<ytm::Stream, String> {
+    if let Some((at, stream)) = urls.lock().unwrap().get(video_id)
         && at.elapsed() < URL_LIFETIME
     {
-        return Ok((url.clone(), *len, *duration_ms));
+        return Ok(stream.clone());
     }
     let stream = yt.stream(video_id)?;
     let mut urls = urls.lock().unwrap();
     if urls.len() >= URL_CACHE_ENTRIES {
         urls.clear();
     }
-    urls.insert(
-        video_id.to_owned(),
-        (Instant::now(), stream.url.clone(), stream.len, stream.duration_ms),
-    );
-    Ok((stream.url, stream.len, stream.duration_ms))
+    urls.insert(video_id.to_owned(), (Instant::now(), stream.clone()));
+    Ok(stream)
 }
 
 struct PcmSource {
@@ -449,7 +503,8 @@ fn decode_loop(
         }
         let decoding = track.as_ref().is_some_and(|t| !t.finished);
         let command = if pending.is_some() {
-            match commands.recv_timeout(Duration::from_millis(10)) {
+            let wait = if shared.paused.load(Relaxed) { PAUSED_POLL } else { FULL_POLL };
+            match commands.recv_timeout(wait) {
                 Ok(command) => Some(command),
                 Err(RecvTimeoutError::Timeout) => None,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -608,6 +663,7 @@ impl Player {
             stream.log_on_drop(false);
             let sink = rodio::Sink::connect_new(stream.mixer());
             sink.pause();
+            self.shared.paused.store(true, Relaxed);
             sink.set_volume(self.volume * self.volume);
             sink.append(PcmSource::new(self.chunks.clone(), self.shared.clone(), self.wake.clone()));
             (stream, sink)
@@ -662,6 +718,7 @@ impl Player {
     }
 
     pub fn set_paused(&self, paused: bool) {
+        self.shared.paused.store(paused, Relaxed);
         if let Some((_, sink)) = &self.output {
             if paused { sink.pause() } else { sink.play() }
         }

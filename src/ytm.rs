@@ -42,6 +42,7 @@ const LRCLIB_WAIT: Duration = Duration::from_secs(6);
 const LRCLIB_SOURCE: &str = "Source: lrclib.net";
 const LYRICS_PAUSE: &str = "♪";
 const AAC_ITAG: u64 = 140;
+const OPUS_ITAG: u64 = 251;
 const RELATED_ITEMS: usize = 18;
 const EXPLORE_ORDER: usize = 100;
 const HOME_ORDER: usize = 200;
@@ -125,10 +126,13 @@ impl Page {
     }
 }
 
+#[derive(Clone)]
 pub struct Stream {
     pub url: String,
     pub len: u64,
     pub duration_ms: u64,
+    pub opus: bool,
+    pub fallback: Option<Box<Stream>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -830,13 +834,25 @@ fn audio(response: &Value) -> Option<Stream> {
     let formats = response["streamingData"]["adaptiveFormats"]
         .as_array()
         .filter(|_| playable(response))?;
-    let format = formats.iter().find(|f| f["itag"].as_u64() == Some(AAC_ITAG))?;
-    let number = |key: &str| format[key].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-    Some(Stream {
-        url: format["url"].as_str()?.to_owned(),
-        len: number("contentLength"),
-        duration_ms: number("approxDurationMs"),
-    })
+    let find = |itag| {
+        let format = formats.iter().find(|f| f["itag"].as_u64() == Some(itag))?;
+        let number = |key: &str| format[key].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        Some(Stream {
+            url: format["url"].as_str()?.to_owned(),
+            len: number("contentLength"),
+            duration_ms: number("approxDurationMs"),
+            opus: itag == OPUS_ITAG,
+            fallback: None,
+        })
+    };
+    let aac = find(AAC_ITAG);
+    match find(OPUS_ITAG) {
+        Some(opus) => Some(Stream {
+            fallback: aac.map(Box::new),
+            ..opus
+        }),
+        None => aac,
+    }
 }
 
 fn describe(error: ureq::Error) -> String {
@@ -1204,6 +1220,25 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefers_opus_and_falls_back_to_aac() {
+        let format = |itag: u64| json!({ "itag": itag, "url": format!("https://x/{itag}"), "contentLength": "10" });
+        let response = |itags: &[u64]| {
+            json!({ "playabilityStatus": { "status": "OK" },
+                "streamingData": { "adaptiveFormats": itags.iter().map(|i| format(*i)).collect::<Vec<_>>() } })
+        };
+        let both = audio(&response(&[140, 251])).unwrap();
+        assert!(both.opus && both.url.ends_with("/251"));
+        assert!(both.fallback.is_some_and(|aac| !aac.opus && aac.url.ends_with("/140")));
+        let aac = audio(&response(&[140])).unwrap();
+        assert!(!aac.opus && aac.url.ends_with("/140") && aac.fallback.is_none());
+        assert!(audio(&response(&[18])).is_none());
+        let ciphered = json!({ "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [{ "itag": 251, "signatureCipher": "s=1" }, format(140)] } });
+        let ciphered = audio(&ciphered).unwrap();
+        assert!(!ciphered.opus && ciphered.fallback.is_none());
+    }
 
     #[test]
     fn lists_the_own_channel_and_brand_channels_from_the_switcher() {
