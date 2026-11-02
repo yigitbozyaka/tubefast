@@ -28,7 +28,7 @@ Tubefast is a YouTube Music client written in Rust with [egui](https://github.co
 | Window on screen | 0.1 to 0.3 seconds |
 | Memory | about 100 MB while playing, about 60 MB of it private |
 | CPU while playing | under 1 % |
-| Download | one `.exe`, about 9 MB |
+| Download | one `.exe`, about 10 MB |
 
 Numbers are from the release build on Windows 11. Memory is the working set a few seconds into playback, and it grows with window size and with how much artwork you have scrolled past. The first launch from a new folder used about 60 MB more on the test machine (NVIDIA driver), once.
 
@@ -165,11 +165,11 @@ On Linux, install the ALSA headers first (`sudo apt install libasound2-dev` on D
 - **If your Discord status does not show,** open the gear menu: the line under the switch says whether Tubefast found Discord. It needs the Discord desktop app, not Discord in a browser, running on the same computer, and a song that is playing rather than paused. If both are fine, look in Discord's own settings under **Activity Privacy**: sharing your activity with others has to be on there. How soon other people see a change is up to Discord.
 - **If it crashes,** the reason is written to `crash.log` next to your data (`%APPDATA%\tubefast\data` on Windows, `~/.local/share/tubefast` on Linux). Attach it to your bug report.
 - **Use it at your own risk.** YouTube's Terms of Service do not provide for third-party clients. Nobody can promise how YouTube treats accounts that use one. If that worries you, stay signed out.
-- **Audio quality** is 128 kbps AAC for now.
+- **Audio quality** is Opus at about 160 kbps (variable bitrate) when YouTube offers it, otherwise 128 kbps AAC.
 
 ## Not there yet
 
-A tray icon, syncing likes back to your account, higher audio quality, a light theme, an installer, a notarized macOS build, and Flathub and AUR packages. Pull requests for any of these are welcome.
+A tray icon, syncing likes back to your account, a light theme, an installer, a notarized macOS build, and Flathub and AUR packages. Pull requests for any of these are welcome.
 
 ## Acknowledgements
 
