@@ -176,8 +176,17 @@ impl OpusDecoder {
             .map_err(OpusError::from)?;
         self.sync_state_from_decoder();
         let written = samples_per_channel * self.decoder.channels() as usize;
-        for (dst, src) in pcm.iter_mut().zip(self.float_scratch[..written].iter()) {
-            *dst = f32::from(*src) / 32768.0;
+        match self.decoder.float_output() {
+            Some(float) => {
+                for (dst, src) in pcm.iter_mut().zip(float[..written].iter()) {
+                    *dst = *src / 32768.0;
+                }
+            }
+            None => {
+                for (dst, src) in pcm.iter_mut().zip(self.float_scratch[..written].iter()) {
+                    *dst = f32::from(*src) / 32768.0;
+                }
+            }
         }
 
         Ok(samples_per_channel)
@@ -273,6 +282,8 @@ pub(crate) struct Decoder {
     loss_count: u32,
     last_packet_duration: usize,
     last_output: Vec<i16>,
+    float_out: Vec<f32>,
+    float_valid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,7 +317,13 @@ impl Decoder {
             loss_count: 0,
             last_packet_duration: 0,
             last_output: Vec::new(),
+            float_out: Vec::new(),
+            float_valid: false,
         })
+    }
+
+    pub(crate) fn float_output(&self) -> Option<&[f32]> {
+        self.float_valid.then_some(self.float_out.as_slice())
     }
 
     pub(crate) fn fs_hz(&self) -> u32 {
@@ -476,6 +493,7 @@ impl Decoder {
         out: &mut [i16],
     ) -> Result<usize, Error> {
         let packet_idx = TRACE_DECODE_PACKET_IDX.fetch_add(1, Ordering::SeqCst);
+        self.float_valid = false;
         let (toc, samples_per_channel_needed) = match packet {
             Some(packet) => {
                 let pp = packet::parse_packet(packet)?;
@@ -497,6 +515,10 @@ impl Decoder {
         };
 
         self.celt.reset_loss_count();
+        self.float_valid = true;
+        if self.float_out.len() < out.len() {
+            self.float_out.resize(out.len(), 0.0);
+        }
         let config = (toc >> 3) & 0x1f;
         let mode = match config {
             0..=11 => OpusMode::SilkOnly,
@@ -548,7 +570,12 @@ impl Decoder {
                         out_frame,
                         false,
                     )?;
+                    let frame_start = written_per_channel * channels;
+                    let frame_len = celt_frame.samples_per_channel * channels;
+                    self.float_out[frame_start..frame_start + frame_len]
+                        .copy_from_slice(&self.celt.float_out()[..frame_len]);
                     if apply_celt_transition {
+                        self.float_valid = false;
                         apply_transition_fade_i16(
                             &celt_transition,
                             &mut out_frame[..celt_frame.samples_per_channel * channels],
@@ -564,6 +591,7 @@ impl Decoder {
                     written_per_channel += celt_frame.samples_per_channel;
                 }
                 OpusMode::SilkOnly => {
+                    self.float_valid = false;
                     if reset_silk {
                         self.silk.reset();
                         reset_silk = false;
@@ -639,6 +667,7 @@ impl Decoder {
                     written_per_channel += silk_frame.samples_per_channel;
                 }
                 OpusMode::Hybrid => {
+                    self.float_valid = false;
                     let mut ec = EcDec::new(frame);
                     let silk_frame = self.silk.decode_frame_with_ec(
                         frame,
