@@ -86,6 +86,7 @@ pub(crate) struct CeltDecoder {
     rng_seed: u32,
     last_split_count: usize,
     loss_count: u32,
+    float_out: Vec<f32>,
 }
 
 impl CeltDecoder {
@@ -123,6 +124,7 @@ impl CeltDecoder {
             rng_seed: 0,
             last_split_count: 0,
             loss_count: 0,
+            float_out: Vec::new(),
         }
     }
 
@@ -156,6 +158,10 @@ impl CeltDecoder {
     ///
     /// Params: none.
     /// Returns: nothing.
+    pub(crate) fn float_out(&self) -> &[f32] {
+        &self.float_out
+    }
+
     pub fn reset_loss_count(&mut self) {
         self.loss_count = 0;
     }
@@ -194,7 +200,7 @@ impl CeltDecoder {
     /// Returns: `Ok(())` on success or `Error::NotImplemented` for unsupported
     /// output rates.
     fn write_output_channel_i16(
-        &self,
+        &mut self,
         out: &mut [i16],
         ch_synth: &[f32],
         ch: usize,
@@ -202,9 +208,15 @@ impl CeltDecoder {
     ) -> Result<(), Error> {
         let downsample = self.downsample_factor()?;
         let output_samples = self.output_frame_size(ch_synth.len())?;
+        if self.float_out.len() < out.len() {
+            self.float_out.resize(out.len(), 0.0);
+        }
         for i in 0..output_samples {
             let sample = Self::float_to_i16(ch_synth[i * downsample]);
             let out_idx = i * self.channels as usize + ch;
+            if !accum {
+                self.float_out[out_idx] = ch_synth[i * downsample];
+            }
             out[out_idx] = if accum {
                 out[out_idx].saturating_add(sample)
             } else {
