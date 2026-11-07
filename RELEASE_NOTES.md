@@ -1,0 +1,1 @@
+- After an update, a small card at the bottom left shows what is new

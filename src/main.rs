@@ -83,7 +83,8 @@ fn main() -> eframe::Result {
     let mut arguments: Vec<String> = std::env::args().skip(1).collect();
     take_profile(&mut arguments);
     log_crashes();
-    if take_updated(&mut arguments) {
+    let updated = take_updated(&mut arguments);
+    if updated {
         std::thread::sleep(PREVIOUS_VERSION_EXIT);
     }
     update::clear_leftovers();
@@ -118,6 +119,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, query, autoplay)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, query, autoplay, updated)))),
     )
 }
