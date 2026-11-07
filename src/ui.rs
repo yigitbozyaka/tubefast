@@ -2,6 +2,7 @@ use crate::APP_NAME;
 use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
 use crate::art::Art;
 use crate::discord::Headline;
+use crate::hotkeys::{self, Command};
 use crate::ytm::{Item, Layout};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
@@ -54,6 +55,13 @@ const STAGE_ART: f32 = 512.0;
 const STAGE_LUMINANCE: f32 = 0.14;
 const STAGE_BLUR: u8 = 84;
 const PAGE_FADE: f64 = 0.12;
+const SETTINGS_WIDTH: f32 = 640.0;
+const SETTING_ROW: f32 = 48.0;
+const HOTKEY_ROW: f32 = 56.0;
+const STATUS_ROW: f32 = 26.0;
+const SECTION_GAP: f32 = 32.0;
+const CARD_PAD: f32 = 6.0;
+const CARD_RADIUS: f32 = 12.0;
 
 const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
@@ -710,7 +718,11 @@ fn clock(ms: u64) -> String {
 }
 
 fn menu_row(ui: &mut Ui, symbol: &str, font: FontId, tint: Color32, text: &str) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(MENU_WIDTH, 38.0), Sense::click());
+    wide_row(ui, vec2(MENU_WIDTH, 38.0), symbol, font, tint, text)
+}
+
+fn wide_row(ui: &mut Ui, size: Vec2, symbol: &str, font: FontId, tint: Color32, text: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let hover = hover_of(ui, &response);
     ui.painter().rect_filled(rect, 7.0, veil(0.08 * hover));
     let tone = if tint == ACCENT { tint } else { tint.lerp_to_gamma(TEXT, hover) };
@@ -729,8 +741,8 @@ fn menu_row(ui: &mut Ui, symbol: &str, font: FontId, tint: Color32, text: &str) 
     response
 }
 
-fn switch_row(ui: &mut Ui, symbol: &str, text: &str, on: bool) -> bool {
-    let response = menu_row(ui, symbol, glyph(17.0), MUTED, text);
+fn switch_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, on: bool) -> bool {
+    let response = wide_row(ui, size, symbol, glyph(17.0), MUTED, text);
     let lit = ui.ctx().animate_bool_with_time(response.id.with("switch"), on, HOVER_TIME);
     let track = Rect::from_center_size(pos2(response.rect.right() - 27.0, response.rect.center().y), vec2(30.0, 18.0));
     ui.painter().rect_filled(track, 9.0, veil(0.16).lerp_to_gamma(ACCENT, lit));
@@ -1564,6 +1576,7 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
                         true,
                     );
                 }
+                Route::Settings => settings(ui, app, cx.out),
                 Route::Search(query) => page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, Some(query)),
                 Route::Home | Route::Browse(_) => page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, None),
             }
@@ -1596,6 +1609,204 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         };
         out.push(Action::Play(songs, 0));
     }
+}
+
+fn section(ui: &mut Ui, title: &str, height: f32, body: impl FnOnce(&mut Ui)) -> Rect {
+    let full = ui.available_width();
+    let width = full.min(SETTINGS_WIDTH);
+    eyebrow(ui, title, (full - width) / 2.0 + 4.0);
+    let (slot, _) = ui.allocate_exact_size(vec2(full, height), Sense::hover());
+    let card = Rect::from_center_size(slot.center(), vec2(width, height));
+    ui.painter().rect_filled(card, CARD_RADIUS, veil(0.05));
+    let mut inner = ui.new_child(UiBuilder::new().id_salt(title).max_rect(card.shrink(CARD_PAD)));
+    inner.set_clip_rect(card.intersect(ui.clip_rect()));
+    body(&mut inner);
+    ui.add_space(SECTION_GAP);
+    card
+}
+
+fn keycaps(ui: &Ui, right_center: Pos2, parts: &[String], tint: Color32) -> f32 {
+    let mut right = right_center.x;
+    for part in parts.iter().rev() {
+        let galley = ui.painter().layout_no_wrap(part.clone(), bold(12.0), tint);
+        let size = vec2((galley.size().x + 18.0).max(30.0), 28.0);
+        let cap = Rect::from_min_size(pos2(right - size.x, right_center.y - size.y / 2.0), size);
+        let (fill, edge) = if tint == ACCENT {
+            (ACCENT.gamma_multiply(0.14), ACCENT.gamma_multiply(0.6))
+        } else {
+            (veil(0.09), veil(0.13))
+        };
+        ui.painter().rect(cap, 7.0, fill, Stroke::new(1.0, edge), StrokeKind::Inside);
+        ui.painter().galley(cap.center() - galley.size() / 2.0, galley, tint);
+        right = cap.left() - 6.0;
+    }
+    right + 6.0
+}
+
+fn hotkey_row(ui: &mut Ui, app: &App, command: Command, enabled: bool, out: &mut Vec<Action>) {
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), HOTKEY_ROW), sense);
+    let recording = app.recording == Some(command);
+    let taken = app.hotkey_taken.contains(&command);
+    let hover = if enabled { hover_of(ui, &response) } else { 0.0 };
+    let lit = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("recording"), recording, HOVER_TIME);
+    ui.painter().rect_filled(rect, ROW_RADIUS, veil(0.06 * hover.max(lit)));
+    let middle = rect.center().y;
+    let symbol = match command {
+        Command::PlayPause => icon::PLAY_PAUSE,
+        Command::Next => icon::SKIP_FORWARD,
+        Command::Previous => icon::SKIP_BACK,
+        Command::VolumeUp => icon::SPEAKER_HIGH,
+        Command::VolumeDown => icon::SPEAKER_LOW,
+    };
+    let tone = MUTED.lerp_to_gamma(TEXT, hover);
+    ui.painter()
+        .text(pos2(rect.left() + 22.0, middle), Align2::CENTER_CENTER, symbol, glyph(17.0), tone);
+    let edge = pos2(rect.right() - 14.0, middle);
+    let caps_left = match (recording, app.saved.hotkey_combos[command as usize]) {
+        (true, _) => keycaps(ui, edge, &["Press keys\u{2026}".to_owned()], ACCENT),
+        (false, Some(combo)) => keycaps(ui, edge, &combo.parts(), TEXT),
+        (false, None) => label(ui, edge, Align2::RIGHT_CENTER, "Not set", sans(13.0), FAINT, 120.0).left(),
+    };
+    let note = match (recording, taken) {
+        (true, _) => "Hold Ctrl, Alt or Shift with a key. Esc cancels, Backspace clears.",
+        (false, true) => "In use by another app",
+        (false, false) => "",
+    };
+    let shown = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("note"), !note.is_empty(), HOVER_TIME);
+    let (left, width) = (rect.left() + 46.0, caps_left - rect.left() - 58.0);
+    let name = pos2(left, middle - 9.0 * shown);
+    label(ui, name, Align2::LEFT_CENTER, command.name(), medium(13.5), TEXT, width);
+    if shown > 0.0 {
+        let color = if taken && !recording { ACCENT } else { MUTED };
+        let at = pos2(left, middle + 11.0);
+        label(ui, at, Align2::LEFT_CENTER, note, sans(12.0), color.gamma_multiply(shown), width);
+    }
+    if enabled {
+        describe(&response, command.name());
+        if response.clicked() {
+            out.push(Action::Record((!recording).then_some(command)));
+        }
+    }
+}
+
+fn discord_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    let open = ui.ctx().animate_bool_with_time(Id::new("discord-open"), app.saved.discord, 0.16);
+    let extra = STATUS_ROW + 4.0 * SETTING_ROW;
+    let height = 2.0 * CARD_PAD + SETTING_ROW + extra * open;
+    section(ui, "Discord", height, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(ui, size, icon::DISCORD_LOGO, "Show on Discord", app.saved.discord) {
+            out.push(Action::ShowOnDiscord(!app.saved.discord));
+        }
+        if open == 0.0 {
+            return;
+        }
+        ui.multiply_opacity(open);
+        let status = match app.discord_linked {
+            Some(true) if app.playing() => "Connected to Discord",
+            Some(true) => "Shows while a song is playing",
+            Some(false) => "Discord is not running",
+            None => "",
+        };
+        let (line, response) = ui.allocate_exact_size(vec2(size.x, STATUS_ROW), Sense::hover());
+        let at = pos2(line.left() + 46.0, line.center().y);
+        label(ui, at, Align2::LEFT_CENTER, status, sans(12.0), MUTED, size.x - 58.0);
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, status));
+        for (headline, text) in [
+            (Headline::App, "Listening to Tubefast"),
+            (Headline::Artist, "Listening to the artist"),
+            (Headline::Song, "Listening to the song"),
+        ] {
+            let chosen = app.saved.discord_headline == headline;
+            let symbol = if chosen { icon::CHECK } else { "" };
+            let row = wide_row(ui, size, symbol, glyph(15.0), ACCENT, text);
+            row.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, chosen, text));
+            if row.clicked() {
+                out.push(Action::DiscordHeadline(headline));
+            }
+        }
+        let (row, _) = ui.allocate_exact_size(size, Sense::hover());
+        if app.saved.discord_headline == Headline::Custom {
+            let at = pos2(row.left() + 22.0, row.center().y);
+            ui.painter().text(at, Align2::CENTER_CENTER, icon::CHECK, glyph(15.0), ACCENT);
+        }
+        let field = Rect::from_min_max(
+            pos2(row.left() + 38.0, row.top() + 5.0),
+            pos2(row.right() - 8.0, row.bottom() - 5.0),
+        );
+        ui.painter().rect_filled(field, 7.0, veil(0.07));
+        let mut name = app.saved.discord_name.clone();
+        let edit = egui::TextEdit::singleline(&mut name)
+            .id(Id::new("discord-name"))
+            .frame(false)
+            .margin(Margin::ZERO)
+            .font(medium(13.5))
+            .text_color(TEXT)
+            .vertical_align(Align::Center)
+            .hint_text(RichText::new("Your own text").color(FAINT));
+        let typed = ui.put(field.shrink2(vec2(10.0, 0.0)), edit);
+        typed.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Your own text"));
+        if typed.changed() || typed.gained_focus() {
+            out.push(Action::DiscordName(name));
+        }
+    });
+}
+
+fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    let rows = if hotkeys::SUPPORTED {
+        Command::ALL.len() as f32 * HOTKEY_ROW
+    } else {
+        0.0
+    };
+    let height = 2.0 * CARD_PAD + SETTING_ROW + rows;
+    let card = section(ui, "Global hotkeys", height, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if !hotkeys::SUPPORTED {
+            let (row, _) = ui.allocate_exact_size(size, Sense::hover());
+            let at = pos2(row.left() + 22.0, row.center().y);
+            ui.painter().text(at, Align2::CENTER_CENTER, icon::KEYBOARD, glyph(17.0), MUTED);
+            let text = "Global hotkeys are only available on Windows for now";
+            let at = pos2(row.left() + 46.0, row.center().y);
+            label(ui, at, Align2::LEFT_CENTER, text, medium(13.5), MUTED, size.x - 58.0);
+            return;
+        }
+        if switch_row(ui, size, icon::KEYBOARD, "Enable global hotkeys", app.saved.hotkeys) {
+            out.push(Action::GlobalHotkeys(!app.saved.hotkeys));
+        }
+        let on = ui.ctx().animate_bool_with_time(Id::new("hotkeys-on"), app.saved.hotkeys, 0.16);
+        ui.multiply_opacity(egui::lerp(0.4..=1.0, on));
+        for command in Command::ALL {
+            hotkey_row(ui, app, command, app.saved.hotkeys, out);
+        }
+    });
+    if !hotkeys::SUPPORTED {
+        return;
+    }
+    let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
+    if app.saved.hotkey_combos != hotkeys::standard_combos()
+        && text_button(ui, reset_at, Id::new("hotkeys-reset"), "Reset to defaults").clicked()
+    {
+        out.push(Action::ResetHotkeys);
+    }
+    let text = "Hotkeys keep working while Tubefast is minimized. Each one needs Ctrl, Alt or Shift.";
+    let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
+    label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
+}
+
+fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    let full = ui.available_width();
+    let width = full.min(SETTINGS_WIDTH);
+    ui.add_space(8.0);
+    let (title, _) = ui.allocate_exact_size(vec2(full, 76.0), Sense::hover());
+    let at = pos2(title.left() + (full - width) / 2.0, title.bottom() - 12.0);
+    label(ui, at, Align2::LEFT_BOTTOM, "Settings", display(40.0), TEXT, width);
+    discord_section(ui, app, out);
+    hotkey_section(ui, app, out);
 }
 
 fn nav_item(ui: &mut Ui, symbol: &str, text: &str, active: bool, trailing: &str) -> Response {
@@ -1765,67 +1976,10 @@ fn account(app: &App, ui: &Ui, foot: Rect, out: &mut Vec<Action>) {
     ui.painter().hline(foot.x_range(), foot.top(), Stroke::new(1.0, veil(0.06)));
     let mut row = foot.shrink2(vec2(12.0, 10.0));
     let slot = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), Vec2::splat(34.0));
-    let settings = icon_button(ui, slot, Id::new("settings"), icon::GEAR_SIX, glyph(17.0), MUTED, "Settings");
-    egui::Popup::menu(&settings)
-        .gap(4.0)
-        .align(egui::RectAlign::TOP_START)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| {
-            ui.set_width(MENU_WIDTH);
-            if switch_row(ui, icon::DISCORD_LOGO, "Show on Discord", app.saved.discord) {
-                out.push(Action::ShowOnDiscord(!app.saved.discord));
-            }
-            if app.saved.discord {
-                let status = match app.discord_linked {
-                    Some(true) if app.playing() => "Connected to Discord",
-                    Some(true) => "Shows while a song is playing",
-                    Some(false) => "Discord is not running",
-                    None => "",
-                };
-                let (line, response) = ui.allocate_exact_size(vec2(MENU_WIDTH, 22.0), Sense::hover());
-                let at = pos2(line.left() + 46.0, line.center().y - 4.0);
-                label(ui, at, Align2::LEFT_CENTER, status, sans(12.0), MUTED, line.width() - 58.0);
-                response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, status));
-                menu_divider(ui);
-                for (headline, text) in [
-                    (Headline::App, "Listening to Tubefast"),
-                    (Headline::Artist, "Listening to the artist"),
-                    (Headline::Song, "Listening to the song"),
-                ] {
-                    let chosen = app.saved.discord_headline == headline;
-                    let symbol = if chosen { icon::CHECK } else { "" };
-                    let row = menu_row(ui, symbol, glyph(15.0), ACCENT, text);
-                    row.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, chosen, text));
-                    if row.clicked() {
-                        out.push(Action::DiscordHeadline(headline));
-                    }
-                }
-                let (row, _) = ui.allocate_exact_size(vec2(MENU_WIDTH, 38.0), Sense::hover());
-                if app.saved.discord_headline == Headline::Custom {
-                    let at = pos2(row.left() + 22.0, row.center().y);
-                    ui.painter().text(at, Align2::CENTER_CENTER, icon::CHECK, glyph(15.0), ACCENT);
-                }
-                let field = Rect::from_min_max(
-                    pos2(row.left() + 38.0, row.top() + 4.0),
-                    pos2(row.right() - 8.0, row.bottom() - 4.0),
-                );
-                ui.painter().rect_filled(field, 7.0, veil(0.07));
-                let mut name = app.saved.discord_name.clone();
-                let edit = egui::TextEdit::singleline(&mut name)
-                    .id(Id::new("discord-name"))
-                    .frame(false)
-                    .margin(Margin::ZERO)
-                    .font(medium(13.5))
-                    .text_color(TEXT)
-                    .vertical_align(Align::Center)
-                    .hint_text(RichText::new("Your own text").color(FAINT));
-                let typed = ui.put(field.shrink2(vec2(8.0, 0.0)), edit);
-                typed.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Your own text"));
-                if typed.changed() || typed.gained_focus() {
-                    out.push(Action::DiscordName(name));
-                }
-            }
-        });
+    let tone = if *app.route() == Route::Settings { ACCENT } else { MUTED };
+    if icon_button(ui, slot, Id::new("settings"), icon::GEAR_SIX, glyph(17.0), tone, "Settings").clicked() {
+        out.push(Action::Go(Route::Settings));
+    }
     row.max.x -= 36.0;
     let avatar = Rect::from_center_size(pos2(row.left() + 24.0, row.center().y), Vec2::splat(32.0));
     let (left, mid) = (avatar.right() + 12.0, row.center().y);
