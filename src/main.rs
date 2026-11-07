@@ -4,6 +4,7 @@ mod app;
 mod art;
 mod auth;
 mod discord;
+mod hotkeys;
 mod media;
 mod opus;
 mod player;
