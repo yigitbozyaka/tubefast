@@ -1,9 +1,9 @@
-use crate::APP_NAME;
 use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
 use crate::ytm::{Item, Layout};
+use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
 use eframe::egui::style::ScrollStyle;
@@ -33,6 +33,7 @@ const QUEUE_MIN_WINDOW: f32 = 1140.0;
 const BAR_HEIGHT: f32 = 84.0;
 const ACCOUNT_HEIGHT: f32 = 68.0;
 const UPDATE_HEIGHT: f32 = 50.0;
+const NOTES_WIDTH: f32 = 268.0;
 const TOPBAR_HEIGHT: f32 = 68.0;
 const AMBIENT_HEIGHT: f32 = 380.0;
 const HERO_ART: f32 = 216.0;
@@ -519,6 +520,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     paint_scrubber(ctx, &scrub);
     sign_in_dialog(app, ctx, &mut out);
     notice(app, ctx, &mut out);
+    release_notes(app, ctx, &mut out);
     out
 }
 
@@ -2839,6 +2841,45 @@ fn notice(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
             if response.clicked() {
                 out.push(action.clone());
             }
+        });
+}
+
+fn release_notes(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
+    if app.notes.is_empty() || app.expanded {
+        return;
+    }
+    egui::Area::new(Id::new("release-notes"))
+        .order(egui::Order::Foreground)
+        .anchor(Align2::LEFT_BOTTOM, vec2(12.0, -(BAR_HEIGHT + ACCOUNT_HEIGHT + 8.0)))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(FLOATING)
+                .stroke(Stroke::new(1.0, veil(0.1)))
+                .corner_radius(12)
+                .inner_margin(Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_width(NOTES_WIDTH);
+                    let (head, _) = ui.allocate_exact_size(vec2(NOTES_WIDTH, 24.0), Sense::hover());
+                    let title = format!("What's new in {VERSION}");
+                    label(
+                        ui,
+                        head.left_center(),
+                        Align2::LEFT_CENTER,
+                        &title,
+                        bold(14.0),
+                        TEXT,
+                        NOTES_WIDTH - 32.0,
+                    );
+                    let slot = Rect::from_center_size(pos2(head.right() - 10.0, head.center().y), Vec2::splat(28.0));
+                    if icon_button(ui, slot, Id::new("release-notes-close"), icon::X, glyph(14.0), MUTED, "Close").clicked() {
+                        out.push(Action::CloseNotes);
+                    }
+                    ui.add_space(6.0);
+                    for note in &app.notes {
+                        paragraph(ui, &format!("•  {note}"), sans(13.0), MUTED, 3);
+                        ui.add_space(4.0);
+                    }
+                });
         });
 }
 

@@ -25,6 +25,7 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const RESTART_AFTER_MS: u64 = 3000;
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
+const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
 const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PLAYED_KEPT: usize = 50;
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
@@ -84,6 +85,7 @@ pub struct Saved {
     pub discord_name: String,
     pub hotkeys: bool,
     pub hotkey_combos: [Option<Combo>; 5],
+    pub notes_seen: String,
 }
 
 pub enum Words {
@@ -153,6 +155,7 @@ impl Default for Saved {
             discord_name: String::new(),
             hotkeys: false,
             hotkey_combos: hotkeys::standard_combos(),
+            notes_seen: String::new(),
         }
     }
 }
@@ -213,6 +216,7 @@ pub enum Action {
     Undo,
     GetUpdate,
     OpenRelease,
+    CloseNotes,
     #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
     Pause(bool),
     Move(usize, usize),
@@ -288,11 +292,12 @@ pub struct App {
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
+    pub notes: Vec<String>,
     restart: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool, updated: bool) -> Self {
         ui::install(&cc.egui_ctx);
         let mut saved: Saved = cc
             .storage
@@ -305,6 +310,8 @@ impl App {
         }
         yt.act_as(saved.account.as_ref().map_or("", |account| &account.page));
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
+        let fresh_version = saved.notes_seen != VERSION && (updated || !saved.notes_seen.is_empty());
+        saved.notes_seen = VERSION.to_owned();
         let ctx = cc.egui_ctx.clone();
         let mut player = Player::new(yt.clone(), {
             let ctx = ctx.clone();
@@ -362,6 +369,7 @@ impl App {
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
+            notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
         };
         match query {
@@ -1104,6 +1112,7 @@ impl App {
                 self.notice = None;
                 self.ctx.open_url(egui::OpenUrl::new_tab(LATEST_RELEASE));
             }
+            Action::CloseNotes => self.notes.clear(),
             Action::Pause(paused) => {
                 if paused == self.playing() {
                     self.apply(Action::Toggle);
@@ -1241,9 +1250,23 @@ fn shuffle(items: &mut [Item]) {
     }
 }
 
+fn release_notes(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim().trim_start_matches(['-', '*']).trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_release_notes_as_plain_lines() {
+        let notes = release_notes("# 0.7.2\n\n- Faster search\n* Lyrics stay in sync\n   \n");
+        assert_eq!(notes, ["Faster search", "Lyrics stay in sync"]);
+    }
 
     #[test]
     fn offers_only_releases_newer_than_this_build() {
