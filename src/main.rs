@@ -7,6 +7,7 @@ mod discord;
 mod hotkeys;
 mod media;
 mod opus;
+mod playback;
 mod player;
 mod ui;
 mod update;

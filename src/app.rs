@@ -3,7 +3,8 @@ use crate::auth;
 use crate::discord::{Discord, Headline};
 use crate::hotkeys::{self, Combo, Command, Hotkeys};
 use crate::media::Media;
-use crate::player::Player;
+use crate::playback::{self, Playback, Replaced, Signal};
+use crate::player::{Player, Speaker, Status};
 use crate::ui;
 use crate::update::{self, Plan};
 use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, VIDEO_FRAME_HOST};
@@ -13,23 +14,20 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const RECENT_LIMIT: usize = 100;
 const CACHED_PAGES: usize = 24;
 const PAGES_KEPT_ON_TRIM: usize = 8;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
-const RESTART_AFTER_MS: u64 = 3000;
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
 const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
 const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
-const PLAYED_KEPT: usize = 50;
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
-const RADIO_MARGIN: usize = 2;
 const HOME_SEEDS: usize = 3;
 const COVER_LOOKUPS: usize = 2;
 const QUEUED_COVERS: usize = 30;
@@ -236,7 +234,6 @@ pub enum Action {
 enum Event {
     Page(Route, Result<Box<Page>, String>),
     Part(u64, usize, Vec<Section>),
-    Radio(String, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     Library(Vec<Item>),
     Accounts(Vec<Account>),
@@ -245,9 +242,9 @@ enum Event {
     Cover(String, Option<String>),
     Release(String),
     Updated(Result<PathBuf, String>),
-    Pressed(Action),
     Lyrics(String, Result<Option<Lyrics>, String>),
     Discord(bool),
+    Pressed(Action),
 }
 
 pub struct App {
@@ -255,7 +252,6 @@ pub struct App {
     yt: Arc<Client>,
     events: Receiver<Event>,
     sender: Sender<Event>,
-    radio_seed: String,
     autoplay: Option<String>,
     home_parts: Vec<(usize, Vec<Section>)>,
     home_load: u64,
@@ -267,14 +263,15 @@ pub struct App {
     media: Option<Media>,
     discord: Option<Discord>,
     hotkeys: Option<Hotkeys>,
-    replaced: Option<(Vec<Item>, Option<usize>, u64)>,
-    curated: bool,
+    replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
-    resume_at: Option<u64>,
+    playback: Arc<Mutex<Playback>>,
+    speaker: Speaker,
+    synced: u64,
     pub sign_in: Option<SignIn>,
     pub library: Vec<Item>,
     pub accounts: Vec<Account>,
-    pub player: Player,
+    pub player: Status,
     pub art: Art,
     pub history: Vec<Route>,
     pub at: usize,
@@ -313,18 +310,21 @@ impl App {
         let fresh_version = saved.notes_seen != VERSION && (updated || !saved.notes_seen.is_empty());
         saved.notes_seen = VERSION.to_owned();
         let ctx = cc.egui_ctx.clone();
+        let (signals, signaled) = mpsc::channel();
         let mut player = Player::new(yt.clone(), {
-            let ctx = ctx.clone();
-            move || ctx.request_repaint()
+            let signals = signals.clone();
+            move || {
+                let _ = signals.send(Signal::Changed);
+            }
         });
         player.set_volume(saved.volume);
+        let speaker = Speaker::new(&mut player);
+        let status = player.status();
+        let playback = Playback::new(player, yt.clone(), signals.clone(), &saved);
+        let playback = playback::run(playback, signaled, ctx.clone());
         let (sender, events) = mpsc::channel();
-        let media = Media::new(cc, {
-            let (sender, ctx) = (sender.clone(), ctx.clone());
-            move |action| {
-                let _ = sender.send(Event::Pressed(action));
-                ctx.request_repaint();
-            }
+        let media = Media::new(cc, move |action| {
+            let _ = signals.send(Signal::Pressed(Box::new(action)));
         });
         let discord = saved.discord.then(|| link_discord(&sender, &ctx));
         let mut app = Self {
@@ -333,7 +333,6 @@ impl App {
             yt,
             events,
             sender,
-            radio_seed: String::new(),
             autoplay: query.clone().filter(|_| autoplay),
             home_parts: Vec::new(),
             home_load: 0,
@@ -346,13 +345,14 @@ impl App {
             discord,
             hotkeys: None,
             replaced: None,
-            curated: !saved.queue.is_empty(),
             growing: None,
-            resume_at: saved.current.map(|_| saved.position_ms),
+            playback,
+            speaker,
+            synced: 0,
             sign_in: None,
             library: Vec::new(),
             accounts: Vec::new(),
-            player,
+            player: status,
             history: vec![Route::Home],
             at: 0,
             pages: HashMap::new(),
@@ -589,7 +589,7 @@ impl App {
         page.partial.then(|| (self.route().clone(), at, page.sections[at].items.len()))
     }
 
-    fn grow_queue(&mut self, route: &Route, page: &Page) {
+    fn grow_queue(&mut self, route: &Route, page: &Page, playback: &mut Playback) {
         let Some((from, at, offered)) = &mut self.growing else { return };
         if from != route {
             return;
@@ -597,96 +597,39 @@ impl App {
         let Some(section) = page.sections.get(*at) else { return };
         let fresh = section.items.iter().skip(*offered).filter(|item| item.is_song()).cloned();
         *offered = section.items.len();
-        self.saved.queue.extend(fresh);
-        if self.saved.shuffle {
-            let upcoming = self.saved.current.map_or(0, |current| current + 1).min(self.saved.queue.len());
-            shuffle(&mut self.saved.queue[upcoming..]);
-        }
+        playback.extend(fresh);
         if !page.partial {
             self.growing = None;
         }
     }
 
-    fn play(&mut self, items: Vec<Item>, index: usize) {
-        let chosen = items.get(index).map(|item| item.video_id.clone()).unwrap_or_default();
-        let songs: Vec<Item> = items.into_iter().filter(Item::is_song).collect();
+    fn play(&mut self, playback: &mut Playback, items: Vec<Item>, index: usize) {
         self.growing = None;
-        let before = std::mem::replace(&mut self.saved.queue, songs);
-        let upcoming = self.saved.current.map_or(0, |current| current + 1);
-        let same_list = before.len() == self.saved.queue.len()
-            && before
-                .iter()
-                .all(|old| self.saved.queue.iter().any(|new| new.video_id == old.video_id));
-        if self.curated && upcoming < before.len() && !same_list {
-            let position = self.resume_at.unwrap_or_else(|| self.player.position_ms());
+        if let Some(replaced) = playback.play(items, index) {
             self.offer("Queue replaced", Some(("Undo", Action::Undo)), NOTICE_TIME);
-            self.replaced = Some((before, self.saved.current, position));
+            self.replaced = Some(replaced);
         }
-        self.curated = self.saved.queue.len() > 1;
-        let mut at = self.saved.queue.iter().position(|item| item.video_id == chosen).unwrap_or(0);
-        if self.saved.shuffle && !self.saved.queue.is_empty() {
-            self.saved.queue.swap(0, at);
-            at = 0;
-            shuffle(&mut self.saved.queue[1..]);
-        }
-        self.radio_seed.clear();
-        self.play_index(at);
     }
 
-    fn play_index(&mut self, index: usize) {
-        if index >= self.saved.queue.len() {
-            return;
+    fn sync(&mut self, playback: &mut Playback) {
+        for item in playback.take_started() {
+            self.saved.recent.retain(|recent| recent.video_id != item.video_id);
+            self.saved.recent.insert(0, item);
         }
-        let played = if self.saved.repeat == Repeat::All {
-            0
-        } else {
-            index.saturating_sub(PLAYED_KEPT)
-        };
-        self.saved.queue.drain(..played);
-        let index = index - played;
-        let item = self.saved.queue[index].clone();
-        self.resume_at = None;
-        self.saved.current = Some(index);
-        self.player.load(&item.video_id);
-        if let Some(next) = self.saved.queue.get(index + 1) {
-            self.player.preload(&next.video_id);
-        }
-        if index + RADIO_MARGIN >= self.saved.queue.len() && self.radio_seed != item.video_id {
-            self.radio_seed = item.video_id.clone();
-            let (yt, sender, ctx, seed) = (self.yt.clone(), self.sender.clone(), self.ctx.clone(), item.video_id.clone());
-            std::thread::spawn(move || {
-                if let Ok(items) = yt.radio(&seed) {
-                    let _ = sender.send(Event::Radio(seed, items));
-                    ctx.request_repaint();
-                }
-            });
-        }
-        self.saved.recent.retain(|recent| recent.video_id != item.video_id);
-        self.saved.recent.insert(0, item);
         self.saved.recent.truncate(RECENT_LIMIT);
-    }
-
-    fn next(&mut self, automatic: bool) {
-        let Some(current) = self.saved.current else { return };
-        if current + 1 < self.saved.queue.len() {
-            self.play_index(current + 1);
-        } else if self.saved.repeat == Repeat::All {
-            self.play_index(0);
-        } else if automatic {
-            self.player.seek(0);
-            self.player.set_paused(true);
+        if let Some(message) = playback.take_problem() {
+            self.notify(message);
+        }
+        if playback.version() != self.synced {
+            self.synced = playback.version();
+            self.saved.queue = playback.queue().to_vec();
+            self.saved.current = playback.current();
+            self.saved.repeat = playback.repeat();
+            self.saved.shuffle = playback.shuffle();
         }
     }
 
-    fn previous(&mut self) {
-        match self.saved.current {
-            Some(current) if current > 0 && self.player.position_ms() < RESTART_AFTER_MS => self.play_index(current - 1),
-            Some(_) => self.player.seek(0),
-            None => {}
-        }
-    }
-
-    fn drain(&mut self, ctx: &egui::Context) {
+    fn drain(&mut self, ctx: &egui::Context, playback: &mut Playback) {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Part(load, order, sections) if load == self.home_load => {
@@ -706,27 +649,14 @@ impl App {
                 Event::Page(route, Ok(page)) => {
                     let wanted = matches!(&route, Route::Search(query) if self.autoplay.as_ref() == Some(query));
                     let first = page.songs().into_iter().next().filter(|_| wanted);
-                    self.grow_queue(&route, &page);
+                    self.grow_queue(&route, &page, playback);
                     self.pages.insert(route, Load::Ready(page));
                     if let Some(song) = first {
                         self.autoplay = None;
-                        self.play(vec![song], 0);
+                        self.play(playback, vec![song], 0);
                     }
                 }
                 Event::Page(route, Err(message)) => drop(self.pages.insert(route, Load::Failed(message))),
-                Event::Radio(seed, items) if seed == self.radio_seed => {
-                    let upcoming = self.saved.current.map_or(0, |current| current + 1);
-                    let had_next = upcoming < self.saved.queue.len();
-                    for item in items {
-                        if !self.saved.queue.iter().any(|queued| queued.video_id == item.video_id) {
-                            self.saved.queue.push(item);
-                        }
-                    }
-                    if let (false, Some(next)) = (had_next, self.saved.queue.get(upcoming)) {
-                        self.player.preload(&next.video_id);
-                    }
-                }
-                Event::Radio(..) => {}
                 Event::Library(items) => self.library = items,
                 Event::Accounts(accounts) if self.yt.signed_in() => self.accounts = accounts,
                 Event::Accounts(_) => {}
@@ -765,8 +695,8 @@ impl App {
                         sign_in.status = message;
                     }
                 }
-                Event::Pressed(action) => self.apply(action),
                 Event::Discord(linked) => self.discord_linked = Some(linked),
+                Event::Pressed(action) => self.apply(action, playback),
                 Event::Lyrics(video_id, found) => {
                     if let Some((_, words)) = self.lyrics.as_mut().filter(|(wanted, _)| *wanted == video_id) {
                         *words = match found {
@@ -798,18 +728,6 @@ impl App {
         if self.yt.take_expired() {
             self.sign_out();
             self.notify("Your YouTube session ended. Sign in again.");
-        }
-        self.player.follow_default_device();
-        if let Some(message) = self.player.take_error() {
-            self.player.set_paused(true);
-            self.notify(message);
-        }
-        if self.player.take_ended() {
-            if self.saved.repeat == Repeat::One {
-                self.player.seek(0);
-            } else {
-                self.next(true);
-            }
         }
         if let Some(typed) = self.typed {
             if typed.elapsed() >= SEARCH_DEBOUNCE {
@@ -945,7 +863,7 @@ impl App {
         out
     }
 
-    fn apply(&mut self, action: Action) {
+    fn apply(&mut self, action: Action, playback: &mut Playback) {
         match action {
             Action::Go(route) => {
                 self.expanded = false;
@@ -962,49 +880,19 @@ impl App {
             }
             Action::Play(items, index) => {
                 let growing = self.growing_list(&items);
-                self.play(items, index);
+                self.play(playback, items, index);
                 self.growing = growing;
             }
-            Action::Jump(index) => self.play_index(index),
-            Action::PlayNext(item) => {
-                let at = self.saved.current.map_or(0, |current| current + 1).min(self.saved.queue.len());
-                self.curated = true;
-                self.saved.queue.insert(at, item);
-                if self.saved.current.is_none() {
-                    self.play_index(0);
-                }
-            }
-            Action::Enqueue(item) => {
-                self.curated = true;
-                self.saved.queue.push(item);
-                if self.saved.current.is_none() {
-                    self.play_index(0);
-                }
-            }
-            Action::Remove(index) => {
-                if index < self.saved.queue.len() && self.saved.current != Some(index) {
-                    self.saved.queue.remove(index);
-                    if let Some(current) = self.saved.current.as_mut().filter(|current| index < **current) {
-                        *current -= 1;
-                    }
-                }
-            }
-            Action::Toggle => match (self.saved.current, self.resume_at) {
-                (Some(current), Some(position)) => {
-                    self.play_index(current);
-                    self.player.seek(position);
-                }
-                (Some(_), None) => self.player.set_paused(!self.player.paused()),
-                (None, _) => {}
-            },
-            Action::Next => self.next(false),
-            Action::Previous => self.previous(),
-            Action::Seek(ms) => self.player.seek(ms),
+            Action::Jump(index) => playback.play_index(index),
+            Action::PlayNext(item) => playback.play_next(item),
+            Action::Enqueue(item) => playback.enqueue(item),
+            Action::Remove(index) => playback.remove(index),
+            Action::Toggle | Action::Next | Action::Previous | Action::Seek(_) | Action::Pause(_) => playback.press(action),
             Action::Volume(volume) => {
                 self.saved.volume = volume.clamp(0.0, 1.0);
-                self.player.set_volume(self.saved.volume);
+                playback.player.set_volume(self.saved.volume);
             }
-            Action::VolumeBy(step) => self.apply(Action::Volume(self.saved.volume + step)),
+            Action::VolumeBy(step) => self.apply(Action::Volume(self.saved.volume + step), playback),
             Action::GlobalHotkeys(enabled) => {
                 self.saved.hotkeys = enabled;
                 self.recording = None;
@@ -1036,20 +924,8 @@ impl App {
             }
             Action::Pin(item) => toggle(&mut self.saved.pinned, item),
             Action::ToggleQueue => self.saved.queue_open ^= true,
-            Action::ToggleShuffle => {
-                self.saved.shuffle ^= true;
-                let upcoming = self.saved.current.map_or(0, |current| current + 1).min(self.saved.queue.len());
-                if self.saved.shuffle {
-                    shuffle(&mut self.saved.queue[upcoming..]);
-                }
-            }
-            Action::CycleRepeat => {
-                self.saved.repeat = match self.saved.repeat {
-                    Repeat::Off => Repeat::All,
-                    Repeat::All => Repeat::One,
-                    Repeat::One => Repeat::Off,
-                }
-            }
+            Action::ToggleShuffle => playback.toggle_shuffle(),
+            Action::CycleRepeat => playback.cycle_repeat(),
             Action::OpenSignIn => self.sign_in = Some(SignIn::default()),
             Action::CloseSignIn => {
                 self.cancel_sign_in.store(true, Relaxed);
@@ -1074,14 +950,9 @@ impl App {
                 self.refresh();
             }
             Action::Undo => {
-                if let Some((queue, current, position)) = self.replaced.take() {
-                    self.saved.queue = queue;
-                    self.curated = true;
+                if let Some(replaced) = self.replaced.take() {
                     self.notice = None;
-                    if let Some(current) = current {
-                        self.play_index(current);
-                        self.player.seek(position);
-                    }
+                    playback.restore(replaced);
                 }
             }
             Action::GetUpdate => {
@@ -1105,7 +976,7 @@ impl App {
                             UPDATE_NOTICE_TIME,
                         );
                     }
-                    Plan::DownloadPage => self.apply(Action::OpenRelease),
+                    Plan::DownloadPage => self.apply(Action::OpenRelease, playback),
                 }
             }
             Action::OpenRelease => {
@@ -1113,20 +984,7 @@ impl App {
                 self.ctx.open_url(egui::OpenUrl::new_tab(LATEST_RELEASE));
             }
             Action::CloseNotes => self.notes.clear(),
-            Action::Pause(paused) => {
-                if paused == self.playing() {
-                    self.apply(Action::Toggle);
-                }
-            }
-            Action::Move(from, gap) => {
-                let upcoming = self.saved.current.map_or(0, |current| current + 1);
-                if reorder(&mut self.saved.queue, upcoming, from, gap) {
-                    self.curated = true;
-                    if from == upcoming || gap == upcoming {
-                        self.player.preload(&self.saved.queue[upcoming].video_id);
-                    }
-                }
-            }
+            Action::Move(from, gap) => playback.reorder(from, gap),
             Action::Expand(open) => self.expanded = open && self.saved.current.is_some(),
             Action::ShowLyrics(open) => {
                 self.saved.lyrics_open = open;
@@ -1163,12 +1021,18 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(WINDOW_SIZE.into()));
         }
         self.art.begin_frame(ctx);
-        self.drain(ctx);
+        let playback = self.playback.clone();
+        let mut playback = playback.lock().unwrap();
+        self.speaker.follow_default_device(&mut playback.player);
+        self.sync(&mut playback);
+        self.drain(ctx, &mut playback);
         let mut actions = if self.record(ctx) { Vec::new() } else { self.shortcuts(ctx) };
         actions.extend(ui::draw(self, ctx));
         for action in actions {
-            self.apply(action);
+            self.apply(action, &mut playback);
         }
+        self.sync(&mut playback);
+        drop(playback);
         self.look_up_covers();
         self.look_up_lyrics();
         if self.playing() || self.player.loading() {
@@ -1201,7 +1065,10 @@ impl eframe::App for App {
             (_, false) => self.geometry = storage.get_string(WINDOW_KEY),
         }
         self.saved.visitor = self.yt.visitor();
-        self.saved.position_ms = self.resume_at.unwrap_or_else(|| self.player.position_ms());
+        let playback = self.playback.clone();
+        let mut playback = playback.lock().unwrap();
+        self.sync(&mut playback);
+        self.saved.position_ms = playback.position_ms();
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 }
@@ -1220,33 +1087,10 @@ fn newer_version(release_url: &str, current: &str) -> Option<String> {
     (numbers(latest)? > numbers(current)?).then(|| latest.to_owned())
 }
 
-fn reorder(queue: &mut Vec<Item>, upcoming: usize, from: usize, gap: usize) -> bool {
-    let to = if gap > from { gap - 1 } else { gap };
-    if from == to || from.min(to) < upcoming || from.max(to) >= queue.len() {
-        return false;
-    }
-    let item = queue.remove(from);
-    queue.insert(to, item);
-    true
-}
-
 fn toggle(list: &mut Vec<Item>, item: Item) {
     match list.iter().position(|existing| existing.key() == item.key()) {
         Some(at) => drop(list.remove(at)),
         None => list.insert(0, item),
-    }
-}
-
-fn shuffle(items: &mut [Item]) {
-    let mut state = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(1, |elapsed| elapsed.as_nanos() as u64)
-        | 1;
-    for index in (1..items.len()).rev() {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        items.swap(index, (state % (index as u64 + 1)) as usize);
     }
 }
 
@@ -1277,27 +1121,5 @@ mod tests {
         assert_eq!(newer_version(&release("v0.1.0"), "0.2.0"), None);
         assert_eq!(newer_version(&release("nightly"), "0.1.0"), None);
         assert_eq!(newer_version("https://github.com/yigitbozyaka/tubefast/releases", "0.1.0"), None);
-    }
-
-    #[test]
-    fn reorders_only_the_upcoming_part_of_the_queue() {
-        let order = |queue: &[Item]| queue.iter().map(|item| item.video_id.as_str()).collect::<String>();
-        let mut queue: Vec<Item> = "abcde"
-            .chars()
-            .map(|id| Item {
-                video_id: id.to_string(),
-                ..Item::default()
-            })
-            .collect();
-        assert!(reorder(&mut queue, 1, 1, 4));
-        assert_eq!(order(&queue), "acdbe");
-        assert!(reorder(&mut queue, 1, 4, 1));
-        assert_eq!(order(&queue), "aecdb");
-        assert!(reorder(&mut queue, 1, 1, 5));
-        assert_eq!(order(&queue), "acdbe");
-        for (from, gap) in [(2, 2), (2, 3), (0, 3), (3, 0), (9, 2), (2, 9)] {
-            assert!(!reorder(&mut queue, 1, from, gap));
-        }
-        assert_eq!(order(&queue), "acdbe");
     }
 }

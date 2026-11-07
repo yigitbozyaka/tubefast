@@ -43,6 +43,7 @@ cargo test
 | `src/ytm.rs` | The YouTube client: requests, response parsing, stream lookup. Also the lyrics lookup on lrclib.net. |
 | `clients.json` | The client name, version and user agent YouTube expects. The values that change when YouTube breaks something. |
 | `src/player.rs` | Progressive download, decoding thread and audio output. |
+| `src/playback.rs` | The queue, repeat and shuffle. Its own thread moves to the next song and answers media keys, so playback goes on while the window draws nothing, as it does minimized on Wayland. |
 | `src/media.rs` | Media keys, the Windows media overlay, macOS Now Playing and Linux MPRIS. |
 | `src/discord.rs` | Discord Rich Presence: the playing song, sent to the local Discord app over its IPC socket. |
 | `src/update.rs` | The in-app updater: download, checksum, replacing the running program, restart. |
