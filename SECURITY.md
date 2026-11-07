@@ -1,6 +1,6 @@
 # Security
 
-Tubefast stores a signed-in YouTube session on your computer, encrypted with your Windows account. Problems in how that session is obtained, stored or sent are treated as security issues, as is anything that lets a remote party run code or read files.
+Tubefast stores a signed-in YouTube session on your computer, encrypted with your Windows account on Windows and readable only by your user on macOS and Linux. Problems in how that session is obtained, stored or sent are treated as security issues, as is anything that lets a remote party run code or read files.
 
 ## Reporting
 
