@@ -22,14 +22,15 @@ body:
     id: version
     attributes:
       label: Tubefast version
-      placeholder: v0.1.0
+      placeholder: v0.7.1
     validations:
       required: true
   - type: input
-    id: windows
+    id: os
     attributes:
-      label: Windows version
-      placeholder: Windows 11 24H2
+      label: Operating system
+      description: On Linux, also say whether it is Wayland or X11.
+      placeholder: Windows 11 24H2, macOS 15, Ubuntu 26.04 on Wayland
   - type: dropdown
     id: signed-in
     attributes:
@@ -45,5 +46,5 @@ body:
     id: crash
     attributes:
       label: Contents of `crash.log`
-      description: Only if Tubefast closed by itself. The file is in `%APPDATA%\tubefast\data`.
+      description: Only if Tubefast closed by itself. The file is in `%APPDATA%\tubefast\data` on Windows, `~/Library/Application Support/tubefast` on macOS and `~/.local/share/tubefast` on Linux.
       render: text
