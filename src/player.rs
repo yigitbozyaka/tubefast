@@ -607,13 +607,93 @@ fn default_device() -> Option<String> {
     rodio::cpal::default_host().default_output_device()?.name().ok()
 }
 
-pub struct Player {
-    commands: Sender<Cmd>,
-    shared: Arc<Shared>,
-    output: Option<(rodio::OutputStream, rodio::Sink)>,
+pub struct Speaker {
+    stream: Option<rodio::OutputStream>,
     device: Option<String>,
     device_lost: Arc<AtomicBool>,
     device_polled: Instant,
+}
+
+impl Speaker {
+    pub fn new(player: &mut Player) -> Self {
+        let mut speaker = Self {
+            stream: None,
+            device: None,
+            device_lost: Arc::default(),
+            device_polled: Instant::now(),
+        };
+        speaker.open(player);
+        if speaker.stream.is_none() {
+            player.fail(NO_OUTPUT);
+        }
+        speaker
+    }
+
+    fn open(&mut self, player: &mut Player) {
+        self.device_lost.store(false, Relaxed);
+        let lost = self.device_lost.clone();
+        let notice_loss = move |error| {
+            lost.fetch_or(matches!(error, rodio::cpal::StreamError::DeviceNotAvailable), Relaxed);
+        };
+        let stream = rodio::OutputStreamBuilder::from_default_device()
+            .and_then(|device| device.with_error_callback(notice_loss).open_stream_or_fallback())
+            .or_else(|_| rodio::OutputStreamBuilder::open_default_stream());
+        self.stream = stream.ok().map(|mut stream| {
+            stream.log_on_drop(false);
+            player.connect(stream.mixer());
+            stream
+        });
+        self.device = default_device().filter(|_| self.stream.is_some());
+    }
+
+    pub fn follow_default_device(&mut self, player: &mut Player) {
+        if self.device_polled.elapsed() < DEVICE_POLL {
+            return;
+        }
+        self.device_polled = Instant::now();
+        if default_device() == self.device && !self.device_lost.load(Relaxed) {
+            return;
+        }
+        let paused = player.paused();
+        player.disconnect();
+        let played = self.stream.take().is_some();
+        self.open(player);
+        player.set_paused(paused);
+        if played && self.stream.is_none() {
+            player.fail(NO_OUTPUT);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Status(Arc<Shared>);
+
+impl Status {
+    pub fn paused(&self) -> bool {
+        self.0.paused.load(Relaxed)
+    }
+
+    pub fn position_ms(&self) -> u64 {
+        self.0.position_ms.load(Relaxed)
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.0.duration_ms.load(Relaxed)
+    }
+
+    pub fn buffered(&self) -> f32 {
+        self.0.buffered.load(Relaxed) as f32 / 1000.0
+    }
+
+    pub fn loading(&self) -> bool {
+        self.0.loading.load(Relaxed)
+    }
+}
+
+pub struct Player {
+    commands: Sender<Cmd>,
+    shared: Arc<Shared>,
+    sink: Option<rodio::Sink>,
     chunks: Chunks,
     wake: Wake,
     volume: f32,
@@ -625,67 +705,45 @@ impl Player {
     pub fn new(yt: Arc<ytm::Client>, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let wake: Wake = Arc::new(wake);
         let shared = Arc::new(Shared::default());
+        shared.paused.store(true, Relaxed);
         let urls = Urls::default();
         let (commands, inbox) = mpsc::channel();
         let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
         let worker = (commands.clone(), shared.clone(), yt.clone(), urls.clone(), wake.clone());
         std::thread::spawn(move || decode_loop(inbox, worker.0, pcm, worker.1, worker.2, worker.3, worker.4));
-        let mut player = Self {
+        Self {
             commands,
             shared,
-            output: None,
-            device: None,
-            device_lost: Arc::default(),
-            device_polled: Instant::now(),
+            sink: None,
             chunks: Arc::new(Mutex::new(chunks)),
             wake,
             volume: 1.0,
             yt,
             urls,
-        };
-        player.open_output();
-        if player.output.is_none() {
-            *player.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
         }
-        player
     }
 
-    fn open_output(&mut self) {
-        self.device_lost.store(false, Relaxed);
-        let lost = self.device_lost.clone();
-        let notice_loss = move |error| {
-            lost.fetch_or(matches!(error, rodio::cpal::StreamError::DeviceNotAvailable), Relaxed);
-        };
-        let stream = rodio::OutputStreamBuilder::from_default_device()
-            .and_then(|device| device.with_error_callback(notice_loss).open_stream_or_fallback())
-            .or_else(|_| rodio::OutputStreamBuilder::open_default_stream());
-        self.output = stream.ok().map(|mut stream| {
-            stream.log_on_drop(false);
-            let sink = rodio::Sink::connect_new(stream.mixer());
-            sink.pause();
-            self.shared.paused.store(true, Relaxed);
-            sink.set_volume(self.volume * self.volume);
-            sink.append(PcmSource::new(self.chunks.clone(), self.shared.clone(), self.wake.clone()));
-            (stream, sink)
-        });
-        self.device = default_device().filter(|_| self.output.is_some());
+    pub fn status(&self) -> Status {
+        Status(self.shared.clone())
     }
 
-    pub fn follow_default_device(&mut self) {
-        if self.device_polled.elapsed() < DEVICE_POLL {
-            return;
-        }
-        self.device_polled = Instant::now();
-        if default_device() == self.device && !self.device_lost.load(Relaxed) {
-            return;
-        }
-        let paused = self.paused();
-        let played = self.output.take().is_some();
-        self.open_output();
-        self.set_paused(paused);
-        if played && self.output.is_none() {
-            *self.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
-        }
+    fn connect(&mut self, mixer: &rodio::mixer::Mixer) {
+        let sink = rodio::Sink::connect_new(mixer);
+        sink.pause();
+        self.shared.paused.store(true, Relaxed);
+        sink.set_volume(self.volume * self.volume);
+        sink.append(PcmSource::new(self.chunks.clone(), self.shared.clone(), self.wake.clone()));
+        self.sink = Some(sink);
+    }
+
+    fn disconnect(&mut self) {
+        self.sink = None;
+        self.shared.paused.store(true, Relaxed);
+    }
+
+    fn fail(&self, message: &str) {
+        *self.shared.error.lock().unwrap() = Some(message.to_owned());
+        (self.wake)();
     }
 
     pub fn load(&self, video_id: &str) {
@@ -718,19 +776,19 @@ impl Player {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.shared.paused.store(paused, Relaxed);
-        if let Some((_, sink)) = &self.output {
+        self.shared.paused.store(paused || self.sink.is_none(), Relaxed);
+        if let Some(sink) = &self.sink {
             if paused { sink.pause() } else { sink.play() }
         }
     }
 
     pub fn paused(&self) -> bool {
-        self.output.as_ref().is_none_or(|(_, sink)| sink.is_paused())
+        self.shared.paused.load(Relaxed)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume;
-        if let Some((_, sink)) = &self.output {
+        if let Some(sink) = &self.sink {
             sink.set_volume(volume * volume);
         }
     }
@@ -739,16 +797,11 @@ impl Player {
         self.shared.position_ms.load(Relaxed)
     }
 
-    pub fn duration_ms(&self) -> u64 {
-        self.shared.duration_ms.load(Relaxed)
-    }
-
-    pub fn buffered(&self) -> f32 {
-        self.shared.buffered.load(Relaxed) as f32 / 1000.0
-    }
-
-    pub fn loading(&self) -> bool {
-        self.shared.loading.load(Relaxed)
+    #[cfg(test)]
+    pub fn end_at(&self, position_ms: u64) {
+        self.shared.position_ms.store(position_ms, Relaxed);
+        self.shared.ended.store(true, Relaxed);
+        (self.wake)();
     }
 
     pub fn take_ended(&self) -> bool {
