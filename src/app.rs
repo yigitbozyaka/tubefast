@@ -725,6 +725,7 @@ impl App {
                 }
                 Event::Updated(Ok(program)) => {
                     self.restart = Some(program);
+                    tray::begin_quit();
                     self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Event::Updated(Err(reason)) => {
