@@ -5,6 +5,7 @@ use crate::hotkeys::{self, Combo, Command, Hotkeys};
 use crate::media::Media;
 use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
+use crate::tray::{self, Tray};
 use crate::ui;
 use crate::update::{self, Plan};
 use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
@@ -83,6 +84,7 @@ pub struct Saved {
     pub discord_headline: Headline,
     pub discord_name: String,
     pub hotkeys: bool,
+    pub hide_on_close: bool,
     pub hotkey_combos: [Option<Combo>; 5],
     pub notes_seen: String,
 }
@@ -154,6 +156,7 @@ impl Default for Saved {
             discord_headline: Headline::App,
             discord_name: String::new(),
             hotkeys: false,
+            hide_on_close: false,
             hotkey_combos: hotkeys::standard_combos(),
             notes_seen: String::new(),
         }
@@ -231,6 +234,7 @@ pub enum Action {
     DiscordName(String),
     VolumeBy(f32),
     GlobalHotkeys(bool),
+    HideOnClose(bool),
     Record(Option<Command>),
     ResetHotkeys,
 }
@@ -269,6 +273,8 @@ pub struct App {
     media: Option<Media>,
     discord: Option<Discord>,
     hotkeys: Option<Hotkeys>,
+    tray: Option<Tray>,
+    window: isize,
     replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
     playback: Arc<Mutex<Playback>>,
@@ -351,6 +357,8 @@ impl App {
             media,
             discord,
             hotkeys: None,
+            tray: None,
+            window: tray::window_of(cc),
             replaced: None,
             growing: None,
             playback,
@@ -387,6 +395,7 @@ impl App {
             None => app.ensure(&Route::Home),
         }
         app.restart_hotkeys();
+        app.restart_tray();
         app.load_library();
         app.background(|yt| {
             yt.refresh_clients();
@@ -733,6 +742,7 @@ impl App {
                 }
                 Event::Updated(Ok(program)) => {
                     self.restart = Some(program);
+                    tray::begin_quit();
                     self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Event::Updated(Err(reason)) => {
@@ -788,6 +798,15 @@ impl App {
             self.hotkeys = Some(hotkeys);
             self.hotkey_taken = taken;
         }
+    }
+
+    fn restart_tray(&mut self) {
+        self.tray = None;
+        if !self.saved.hide_on_close {
+            return;
+        }
+        let ctx = self.ctx.clone();
+        self.tray = Tray::start(self.window, move || ctx.request_repaint());
     }
 
     fn set_recording(&mut self, command: Option<Command>) {
@@ -931,6 +950,10 @@ impl App {
                 self.recording = None;
                 self.restart_hotkeys();
             }
+            Action::HideOnClose(enabled) => {
+                self.saved.hide_on_close = enabled;
+                self.restart_tray();
+            }
             Action::Record(command) => self.set_recording(command),
             Action::ResetHotkeys => {
                 self.saved.hotkey_combos = hotkeys::standard_combos();
@@ -1050,6 +1073,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested()) && tray::hides_on_close(self.tray.is_some(), tray::quitting()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if let Some(tray) = &self.tray {
+                tray.hide();
+            }
+        }
         let (size, minimized) = ctx.input(|input| (input.content_rect().size(), input.viewport().minimized == Some(true)));
         if !minimized && (size.x < WINDOW_MIN[0] - 1.0 || size.y < WINDOW_MIN[1] - 1.0) {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(WINDOW_SIZE.into()));

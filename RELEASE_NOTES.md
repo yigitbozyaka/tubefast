@@ -3,3 +3,4 @@
 - On an artist page, "Show all" now opens every song, album, and single, not only the first few
 - A single failed YouTube request no longer signs you out, and a second Tubefast window can no longer erase your sign-in
 - Korean and Russian lyrics can show an approximate romanized line under each line, turned on with the switch in the lyrics panel. It follows standard sound rules without a dictionary, so some words, such as compounds, may be off
+- Settings can send Tubefast to the system tray when you close the window (Windows)
