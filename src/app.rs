@@ -189,6 +189,7 @@ pub enum Action {
     Back,
     Forward,
     Reload,
+    ShowAll(usize),
     Play(Vec<Item>, usize),
     Jump(usize),
     PlayNext(Item),
@@ -234,6 +235,7 @@ pub enum Action {
 enum Event {
     Page(Route, Result<Box<Page>, String>),
     Part(u64, usize, Vec<Section>),
+    FullSection(Route, usize, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     Library(Vec<Item>),
     Accounts(Vec<Account>),
@@ -638,6 +640,14 @@ impl App {
                     self.pages.insert(Route::Home, Load::Ready(Box::new(self.home_page(true))));
                 }
                 Event::Part(..) => {}
+                Event::FullSection(route, at, items) => {
+                    if let Some(Load::Ready(page)) = self.pages.get_mut(&route)
+                        && let Some(section) = page.sections.get_mut(at)
+                    {
+                        section.all = None;
+                        section.items = items;
+                    }
+                }
                 Event::Page(Route::Home, result) => {
                     let page = self.home_page(false);
                     let load = match result {
@@ -873,6 +883,19 @@ impl App {
             Action::Back if self.at > 0 => self.step(self.at - 1),
             Action::Forward if self.at + 1 < self.history.len() => self.step(self.at + 1),
             Action::Back | Action::Forward => {}
+            Action::ShowAll(at) => {
+                let route = self.route().clone();
+                let target = match self.pages.get(&route) {
+                    Some(Load::Ready(page)) => page.sections.get(at).and_then(|section| section.all.clone()),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    self.background(move |yt| match yt.full_section(&target) {
+                        Ok(items) if !items.is_empty() => Some(Event::FullSection(route, at, items)),
+                        _ => None,
+                    });
+                }
+            }
             Action::Reload => {
                 let route = self.route().clone();
                 self.pages.remove(&route);
