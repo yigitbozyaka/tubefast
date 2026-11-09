@@ -49,6 +49,7 @@ const PERSONAL_PAGES: usize = 3;
 const LIKED_SONGS: &str = "VLLM";
 const TRACK_PAGES: usize = 50;
 const REJECTION_RECHECK_DELAY: Duration = Duration::from_secs(2);
+const REJECTION_CONFIRM_AFTER: Duration = Duration::from_secs(30);
 const SESSION_REJECTED: &str = "YouTube did not accept this sign-in. Sign in again.";
 const UNUSED_KEYS: [&str; 14] = [
     "counterpart",
@@ -181,6 +182,7 @@ pub struct Client {
     session: Mutex<Option<String>>,
     page: Mutex<String>,
     expired: Mutex<Option<String>>,
+    rejections: Mutex<Rejections>,
     clients: Mutex<Clients>,
     clients_checked: Mutex<Option<Instant>>,
 }
@@ -198,6 +200,7 @@ impl Client {
             session: Mutex::new(None),
             page: Mutex::default(),
             expired: Mutex::new(None),
+            rejections: Mutex::default(),
             clients: Mutex::new(Clients::parse(BUNDLED_CLIENTS).expect("the bundled clients.json should be complete")),
             clients_checked: Mutex::new(None),
         }
@@ -233,6 +236,8 @@ impl Client {
     }
 
     pub fn set_session(&self, cookie: Option<String>) {
+        self.expired.lock().unwrap().take();
+        *self.rejections.lock().unwrap() = Rejections::default();
         *self.session.lock().unwrap() = cookie;
     }
 
@@ -260,10 +265,13 @@ impl Client {
     }
 
     fn account(&self) -> Result<Account, String> {
+        let used = self.session.lock().unwrap().clone().unwrap_or_default();
         let response = self.music("account/account_menu", json!({}), &[])?;
         let Some(header) = find(&response, "activeAccountHeaderRenderer") else {
+            self.judge(|rejections| &mut rejections.anonymous_since, &used, Signal::Rejected);
             return Err(SESSION_REJECTED.to_owned());
         };
+        *self.rejections.lock().unwrap() = Rejections::default();
         Ok(Account {
             name: text(&header["accountName"]),
             photo: thumb(&header["accountPhoto"]),
@@ -278,6 +286,23 @@ impl Client {
             "callCircumstance": "SWITCHING_USERS_FULL",
         });
         Ok(channels(&self.music("account/accounts_list", body, &[])?))
+    }
+
+    fn judge(&self, slot: fn(&mut Rejections) -> &mut Option<Instant>, cookie: &str, signal: Signal) {
+        let mut rejections = self.rejections.lock().unwrap();
+        let since = slot(&mut rejections);
+        let now = Instant::now();
+        match judge(*since, now, signal) {
+            Verdict::Reset => *since = None,
+            Verdict::Wait => {
+                since.get_or_insert(now);
+            }
+            Verdict::End => {
+                *since = None;
+                drop(rejections);
+                self.end_session(cookie);
+            }
+        }
     }
 
     fn end_session(&self, rejected: &str) {
@@ -617,11 +642,18 @@ impl Client {
         let response = match outcome {
             Ok(response) => read(response)?,
             Err(ureq::Error::Status(401, _)) if cookie.is_some() => {
-                self.end_session(&cookie.unwrap_or_default());
+                self.judge(
+                    |rejections| &mut rejections.unauthorized_since,
+                    &cookie.unwrap_or_default(),
+                    Signal::Rejected,
+                );
                 return Err(SESSION_REJECTED.to_owned());
             }
             Err(error) => return Err(describe(error)),
         };
+        if cookie.is_some() {
+            self.judge(|rejections| &mut rejections.unauthorized_since, "", Signal::Accepted);
+        }
         if let Some(visitor) = response["responseContext"]["visitorData"].as_str() {
             let mut known = self.visitor.lock().unwrap();
             if known.is_empty() {
@@ -629,6 +661,33 @@ impl Client {
             }
         }
         Ok(response)
+    }
+}
+
+#[derive(Default)]
+struct Rejections {
+    unauthorized_since: Option<Instant>,
+    anonymous_since: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    Rejected,
+    Accepted,
+}
+
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Wait,
+    End,
+    Reset,
+}
+
+fn judge(first_rejection: Option<Instant>, now: Instant, signal: Signal) -> Verdict {
+    match (signal, first_rejection) {
+        (Signal::Accepted, _) => Verdict::Reset,
+        (Signal::Rejected, Some(first)) if now.saturating_duration_since(first) >= REJECTION_CONFIRM_AFTER => Verdict::End,
+        (Signal::Rejected, _) => Verdict::Wait,
     }
 }
 
@@ -1282,6 +1341,29 @@ mod tests {
         assert!(!yt.signed_in() && yt.take_expired().as_deref() == Some("newer"));
         yt.end_session("");
         assert!(yt.take_expired().is_none());
+    }
+
+    #[test]
+    fn ends_the_session_only_on_a_rejection_after_the_window() {
+        let first = Instant::now();
+        let inside = first + REJECTION_CONFIRM_AFTER / 2;
+        let after = first + REJECTION_CONFIRM_AFTER;
+        assert_eq!(judge(None, first, Signal::Rejected), Verdict::Wait);
+        assert_eq!(judge(Some(first), inside, Signal::Rejected), Verdict::Wait);
+        assert_eq!(judge(Some(first), after, Signal::Rejected), Verdict::End);
+        assert_eq!(judge(Some(first), after, Signal::Accepted), Verdict::Reset);
+        assert_eq!(judge(None, after, Signal::Accepted), Verdict::Reset);
+    }
+
+    #[test]
+    fn a_new_session_forgets_earlier_rejections() {
+        let yt = Client::new(String::new());
+        yt.set_session(Some("old".to_owned()));
+        yt.end_session("old");
+        yt.judge(|rejections| &mut rejections.unauthorized_since, "new", Signal::Rejected);
+        yt.set_session(Some("new".to_owned()));
+        assert!(yt.take_expired().is_none());
+        assert!(yt.rejections.lock().unwrap().unauthorized_since.is_none());
     }
 
     #[test]
