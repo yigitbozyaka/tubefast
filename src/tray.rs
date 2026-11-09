@@ -33,6 +33,7 @@ pub fn window_of(_: &eframe::CreationContext<'_>) -> isize {
 pub struct Tray {
     window: isize,
     thread: u32,
+    finished: std::sync::mpsc::Receiver<()>,
 }
 
 #[cfg(windows)]
@@ -45,9 +46,10 @@ mod native {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos, LoadIconW, MF_STRING,
-        PostMessageW, RegisterClassW, RegisterWindowMessageW, SW_RESTORE, SetForegroundWindow, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-        TrackPopupMenu, WM_APP, WM_CLOSE, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+        AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, FindWindowW, GWL_EXSTYLE, GetCursorPos,
+        GetForegroundWindow, GetWindowLongPtrW, IsIconic, LoadIconW, MF_STRING, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+        SW_HIDE, SW_RESTORE, SW_SHOWNA, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+        WM_APP, WM_CLOSE, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     };
 
     pub const ICON_RESOURCE: usize = 1;
@@ -72,9 +74,38 @@ mod native {
         static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
     }
 
-    pub fn cloak(window: HWND, hidden: bool) {
+    fn set_cloak(window: HWND, hidden: bool) {
         let hidden = hidden as i32;
         unsafe { DwmSetWindowAttribute(window, DWMWA_CLOAK as u32, (&raw const hidden).cast(), size_of::<i32>() as u32) };
+    }
+
+    fn set_taskbar_button(window: HWND, shown: bool) {
+        unsafe {
+            let style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+            let style = if shown {
+                (style | WS_EX_APPWINDOW) & !WS_EX_TOOLWINDOW
+            } else {
+                (style | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW
+            };
+            SetWindowLongPtrW(window, GWL_EXSTYLE, style as isize);
+            ShowWindow(window, SW_HIDE);
+            ShowWindow(window, SW_SHOWNA);
+        }
+    }
+
+    pub fn hide(window: HWND) {
+        set_cloak(window, true);
+        set_taskbar_button(window, false);
+        unsafe {
+            if GetForegroundWindow() == window {
+                SetForegroundWindow(FindWindowW(wide("Shell_TrayWnd").as_ptr(), null()));
+            }
+        }
+    }
+
+    pub fn reveal(window: HWND) {
+        set_taskbar_button(window, true);
+        set_cloak(window, false);
     }
 
     fn apply(handler: &Handler, choice: Choice) {
@@ -82,8 +113,10 @@ mod native {
         unsafe {
             match choice {
                 Choice::Show => {
-                    cloak(window, false);
-                    ShowWindow(window, SW_RESTORE);
+                    reveal(window);
+                    if IsIconic(window) != 0 {
+                        ShowWindow(window, SW_RESTORE);
+                    }
                     SetForegroundWindow(window);
                 }
                 Choice::Quit => {
@@ -102,6 +135,9 @@ mod native {
     unsafe fn pick_from_menu(window: HWND) -> Option<Choice> {
         unsafe {
             let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return None;
+            }
             AppendMenuW(menu, MF_STRING, SHOW_ID, wide("Show Tubefast").as_ptr());
             AppendMenuW(menu, MF_STRING, QUIT_ID, wide("Quit").as_ptr());
             let mut cursor = POINT { x: 0, y: 0 };
@@ -205,6 +241,7 @@ impl Tray {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG};
 
         let (ready, started) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("tray".into())
             .spawn(move || unsafe {
@@ -225,17 +262,18 @@ impl Tray {
                     windows_sys::Win32::UI::WindowsAndMessaging::DispatchMessageW(&message);
                 }
                 native::remove_icon(tray_window);
+                let _ = done.send(());
             })
             .ok()?;
         let thread = started.recv().ok()??;
-        Some(Self { window, thread })
+        Some(Self { window, thread, finished })
     }
 }
 
 #[cfg(windows)]
 impl Tray {
     pub fn hide(&self) {
-        native::cloak(self.window as _, true);
+        native::hide(self.window as _);
     }
 }
 
@@ -244,6 +282,7 @@ impl Drop for Tray {
     fn drop(&mut self) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
         unsafe { PostThreadMessageW(self.thread, WM_QUIT, 0, 0) };
+        let _ = self.finished.recv_timeout(std::time::Duration::from_millis(300));
     }
 }
 
