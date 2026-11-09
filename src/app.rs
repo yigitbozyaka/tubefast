@@ -7,7 +7,7 @@ use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
 use crate::ui;
 use crate::update::{self, Plan};
-use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, VIDEO_FRAME_HOST};
+use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
 use serde::{Deserialize, Serialize};
@@ -235,7 +235,7 @@ pub enum Action {
 enum Event {
     Page(Route, Result<Box<Page>, String>),
     Part(u64, usize, Vec<Section>),
-    FullSection(Route, usize, Vec<Item>),
+    FullSection(Route, usize, Target, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     Library(Vec<Item>),
     Accounts(Vec<Account>),
@@ -642,9 +642,9 @@ impl App {
                     self.pages.insert(Route::Home, Load::Ready(Box::new(self.home_page(true))));
                 }
                 Event::Part(..) => {}
-                Event::FullSection(route, at, items) => {
+                Event::FullSection(route, at, target, items) => {
                     if let Some(Load::Ready(page)) = self.pages.get_mut(&route) {
-                        settle_section(page, at, items);
+                        settle_section(page, at, &target, items);
                     }
                     self.fetching_all.remove(&(route, at));
                 }
@@ -892,7 +892,10 @@ impl App {
                 if let Some(target) = target
                     && self.fetching_all.insert((route.clone(), at))
                 {
-                    self.background(move |yt| Some(Event::FullSection(route, at, yt.full_section(&target).unwrap_or_default())));
+                    self.background(move |yt| {
+                        let items = yt.full_section(&target).unwrap_or_default();
+                        Some(Event::FullSection(route, at, target, items))
+                    });
                 }
             }
             Action::Reload => {
@@ -1124,8 +1127,8 @@ fn release_notes(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn settle_section(page: &mut Page, at: usize, items: Vec<Item>) {
-    if let Some(section) = page.sections.get_mut(at) {
+fn settle_section(page: &mut Page, at: usize, target: &Target, items: Vec<Item>) {
+    if let Some(section) = page.sections.get_mut(at).filter(|section| section.all.as_ref() == Some(target)) {
         section.all = None;
         if !items.is_empty() {
             section.items = items;
@@ -1136,7 +1139,7 @@ fn settle_section(page: &mut Page, at: usize, items: Vec<Item>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ytm::{Layout, Target};
+    use crate::ytm::Layout;
 
     #[test]
     fn full_list_replaces_only_its_own_section_and_failure_keeps_items() {
@@ -1158,12 +1161,19 @@ mod tests {
             sections: vec![section("Songs"), section("Albums")],
             ..Page::default()
         };
-        settle_section(&mut page, 1, vec![song("a"), song("b")]);
+        let moved = Target {
+            browse_id: "MPAD".into(),
+            params: "x".into(),
+        };
+        settle_section(&mut page, 1, &moved, vec![song("a")]);
+        assert_eq!(page.sections[1].items.len(), 1);
+        assert!(page.sections[1].all.is_some());
+        settle_section(&mut page, 1, &target, vec![song("a"), song("b")]);
         assert_eq!(page.sections[1].items.len(), 2);
         assert!(page.sections[1].all.is_none());
         assert_eq!(page.sections[0].items.len(), 1);
         assert!(page.sections[0].all.is_some());
-        settle_section(&mut page, 0, Vec::new());
+        settle_section(&mut page, 0, &target, Vec::new());
         assert_eq!(page.sections[0].items.len(), 1);
         assert!(page.sections[0].all.is_none());
     }
