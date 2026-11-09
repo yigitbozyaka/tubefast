@@ -50,6 +50,7 @@ const LIKED_SONGS: &str = "VLLM";
 const TRACK_PAGES: usize = 50;
 const REJECTION_RECHECK_DELAY: Duration = Duration::from_secs(2);
 const REJECTION_CONFIRM_AFTER: Duration = Duration::from_secs(30);
+const REJECTION_STALE_AFTER: Duration = Duration::from_secs(600);
 const SESSION_REJECTED: &str = "YouTube did not accept this sign-in. Sign in again.";
 const UNUSED_KEYS: [&str; 14] = [
     "counterpart",
@@ -182,7 +183,7 @@ pub struct Client {
     session: Mutex<Option<String>>,
     page: Mutex<String>,
     expired: Mutex<Option<String>>,
-    rejections: Mutex<Rejections>,
+    first_unauthorized: Mutex<Option<Instant>>,
     clients: Mutex<Clients>,
     clients_checked: Mutex<Option<Instant>>,
 }
@@ -200,7 +201,7 @@ impl Client {
             session: Mutex::new(None),
             page: Mutex::default(),
             expired: Mutex::new(None),
-            rejections: Mutex::default(),
+            first_unauthorized: Mutex::default(),
             clients: Mutex::new(Clients::parse(BUNDLED_CLIENTS).expect("the bundled clients.json should be complete")),
             clients_checked: Mutex::new(None),
         }
@@ -237,7 +238,7 @@ impl Client {
 
     pub fn set_session(&self, cookie: Option<String>) {
         self.expired.lock().unwrap().take();
-        *self.rejections.lock().unwrap() = Rejections::default();
+        *self.first_unauthorized.lock().unwrap() = None;
         *self.session.lock().unwrap() = cookie;
     }
 
@@ -266,12 +267,15 @@ impl Client {
 
     fn account(&self) -> Result<Account, String> {
         let used = self.session.lock().unwrap().clone().unwrap_or_default();
-        let response = self.music("account/account_menu", json!({}), &[])?;
+        let mut response = self.music("account/account_menu", json!({}), &[])?;
+        if find(&response, "activeAccountHeaderRenderer").is_none() {
+            std::thread::sleep(REJECTION_RECHECK_DELAY);
+            response = self.music("account/account_menu", json!({}), &[])?;
+        }
         let Some(header) = find(&response, "activeAccountHeaderRenderer") else {
-            self.judge(|rejections| &mut rejections.anonymous_since, &used, Signal::Rejected);
+            self.end_session(&used);
             return Err(SESSION_REJECTED.to_owned());
         };
-        *self.rejections.lock().unwrap() = Rejections::default();
         Ok(Account {
             name: text(&header["accountName"]),
             photo: thumb(&header["accountPhoto"]),
@@ -288,18 +292,16 @@ impl Client {
         Ok(channels(&self.music("account/accounts_list", body, &[])?))
     }
 
-    fn judge(&self, slot: fn(&mut Rejections) -> &mut Option<Instant>, cookie: &str, signal: Signal) {
-        let mut rejections = self.rejections.lock().unwrap();
-        let since = slot(&mut rejections);
+    fn judge_unauthorized(&self, cookie: &str, signal: Signal) {
+        let mut since = self.first_unauthorized.lock().unwrap();
         let now = Instant::now();
         match judge(*since, now, signal) {
             Verdict::Reset => *since = None,
-            Verdict::Wait => {
-                since.get_or_insert(now);
-            }
+            Verdict::Wait => {}
+            Verdict::Start => *since = Some(now),
             Verdict::End => {
                 *since = None;
-                drop(rejections);
+                drop(since);
                 self.end_session(cookie);
             }
         }
@@ -642,17 +644,13 @@ impl Client {
         let response = match outcome {
             Ok(response) => read(response)?,
             Err(ureq::Error::Status(401, _)) if cookie.is_some() => {
-                self.judge(
-                    |rejections| &mut rejections.unauthorized_since,
-                    &cookie.unwrap_or_default(),
-                    Signal::Rejected,
-                );
+                self.judge_unauthorized(&cookie.unwrap_or_default(), Signal::Rejected);
                 return Err(SESSION_REJECTED.to_owned());
             }
             Err(error) => return Err(describe(error)),
         };
         if cookie.is_some() {
-            self.judge(|rejections| &mut rejections.unauthorized_since, "", Signal::Accepted);
+            self.judge_unauthorized("", Signal::Accepted);
         }
         if let Some(visitor) = response["responseContext"]["visitorData"].as_str() {
             let mut known = self.visitor.lock().unwrap();
@@ -664,12 +662,6 @@ impl Client {
     }
 }
 
-#[derive(Default)]
-struct Rejections {
-    unauthorized_since: Option<Instant>,
-    anonymous_since: Option<Instant>,
-}
-
 #[derive(Clone, Copy)]
 enum Signal {
     Rejected,
@@ -679,15 +671,18 @@ enum Signal {
 #[derive(Debug, PartialEq)]
 enum Verdict {
     Wait,
+    Start,
     End,
     Reset,
 }
 
 fn judge(first_rejection: Option<Instant>, now: Instant, signal: Signal) -> Verdict {
-    match (signal, first_rejection) {
+    match (signal, first_rejection.map(|first| now.saturating_duration_since(first))) {
         (Signal::Accepted, _) => Verdict::Reset,
-        (Signal::Rejected, Some(first)) if now.saturating_duration_since(first) >= REJECTION_CONFIRM_AFTER => Verdict::End,
-        (Signal::Rejected, _) => Verdict::Wait,
+        (Signal::Rejected, Some(age)) if age >= REJECTION_STALE_AFTER => Verdict::Start,
+        (Signal::Rejected, Some(age)) if age >= REJECTION_CONFIRM_AFTER => Verdict::End,
+        (Signal::Rejected, Some(_)) => Verdict::Wait,
+        (Signal::Rejected, None) => Verdict::Start,
     }
 }
 
@@ -1348,7 +1343,8 @@ mod tests {
         let first = Instant::now();
         let inside = first + REJECTION_CONFIRM_AFTER / 2;
         let after = first + REJECTION_CONFIRM_AFTER;
-        assert_eq!(judge(None, first, Signal::Rejected), Verdict::Wait);
+        assert_eq!(judge(None, first, Signal::Rejected), Verdict::Start);
+        assert_eq!(judge(Some(first), first + REJECTION_STALE_AFTER, Signal::Rejected), Verdict::Start);
         assert_eq!(judge(Some(first), inside, Signal::Rejected), Verdict::Wait);
         assert_eq!(judge(Some(first), after, Signal::Rejected), Verdict::End);
         assert_eq!(judge(Some(first), after, Signal::Accepted), Verdict::Reset);
@@ -1360,10 +1356,10 @@ mod tests {
         let yt = Client::new(String::new());
         yt.set_session(Some("old".to_owned()));
         yt.end_session("old");
-        yt.judge(|rejections| &mut rejections.unauthorized_since, "new", Signal::Rejected);
+        yt.judge_unauthorized("new", Signal::Rejected);
         yt.set_session(Some("new".to_owned()));
         assert!(yt.take_expired().is_none());
-        assert!(yt.rejections.lock().unwrap().unauthorized_since.is_none());
+        assert!(yt.first_unauthorized.lock().unwrap().is_none());
     }
 
     #[test]
