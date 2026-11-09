@@ -485,10 +485,14 @@ impl App {
     }
 
     fn sign_out(&mut self) {
+        auth::forget();
+        self.leave_session();
+    }
+
+    fn leave_session(&mut self) {
         self.yt.set_session(None);
         self.yt.act_as("");
         self.accounts.clear();
-        auth::forget();
         self.saved.leave_account();
         self.refresh();
     }
@@ -735,8 +739,9 @@ impl App {
                 }
             }
         }
-        if self.yt.take_expired() {
-            self.sign_out();
+        if let Some(rejected) = self.yt.take_expired() {
+            auth::forget_if_stored(&rejected);
+            self.leave_session();
             self.notify("Your YouTube session ended. Sign in again.");
         }
         if let Some(typed) = self.typed {

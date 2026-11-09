@@ -1,3 +1,4 @@
 - Repeat and the next song keep working while the window is minimized, also on Linux with Wayland
 - After an update, a small card at the bottom left shows what is new
 - On an artist page, "Show all" now opens every song, album, and single, not only the first few
+- A single failed YouTube request no longer signs you out, and a second Tubefast window can no longer erase your sign-in

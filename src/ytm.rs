@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::io::{BufReader, Read};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MUSIC_API: &str = "https://music.youtube.com/youtubei/v1/";
@@ -49,6 +48,9 @@ const HOME_ORDER: usize = 200;
 const PERSONAL_PAGES: usize = 3;
 const LIKED_SONGS: &str = "VLLM";
 const TRACK_PAGES: usize = 50;
+const REJECTION_RECHECK_DELAY: Duration = Duration::from_secs(2);
+const REJECTION_CONFIRM_AFTER: Duration = Duration::from_secs(30);
+const REJECTION_STALE_AFTER: Duration = Duration::from_secs(600);
 const SESSION_REJECTED: &str = "YouTube did not accept this sign-in. Sign in again.";
 const UNUSED_KEYS: [&str; 14] = [
     "counterpart",
@@ -187,7 +189,8 @@ pub struct Client {
     visitor: Mutex<String>,
     session: Mutex<Option<String>>,
     page: Mutex<String>,
-    expired: AtomicBool,
+    expired: Mutex<Option<String>>,
+    first_unauthorized: Mutex<Option<Instant>>,
     clients: Mutex<Clients>,
     clients_checked: Mutex<Option<Instant>>,
 }
@@ -204,7 +207,8 @@ impl Client {
             visitor: Mutex::new(visitor),
             session: Mutex::new(None),
             page: Mutex::default(),
-            expired: AtomicBool::new(false),
+            expired: Mutex::new(None),
+            first_unauthorized: Mutex::default(),
             clients: Mutex::new(Clients::parse(BUNDLED_CLIENTS).expect("the bundled clients.json should be complete")),
             clients_checked: Mutex::new(None),
         }
@@ -240,6 +244,8 @@ impl Client {
     }
 
     pub fn set_session(&self, cookie: Option<String>) {
+        self.expired.lock().unwrap().take();
+        *self.first_unauthorized.lock().unwrap() = None;
         *self.session.lock().unwrap() = cookie;
     }
 
@@ -251,8 +257,8 @@ impl Client {
         self.session.lock().unwrap().is_some()
     }
 
-    pub fn take_expired(&self) -> bool {
-        self.expired.swap(false, Relaxed)
+    pub fn take_expired(&self) -> Option<String> {
+        self.expired.lock().unwrap().take()
     }
 
     pub fn sign_in(&self, cookie: String) -> Result<Account, String> {
@@ -261,14 +267,18 @@ impl Client {
         let account = self.account();
         if account.is_err() {
             self.set_session(None);
-            self.expired.store(false, Relaxed);
+            self.expired.lock().unwrap().take();
         }
         account
     }
 
     fn account(&self) -> Result<Account, String> {
         let used = self.session.lock().unwrap().clone().unwrap_or_default();
-        let response = self.music("account/account_menu", json!({}), &[])?;
+        let mut response = self.music("account/account_menu", json!({}), &[])?;
+        if find(&response, "activeAccountHeaderRenderer").is_none() {
+            std::thread::sleep(REJECTION_RECHECK_DELAY);
+            response = self.music("account/account_menu", json!({}), &[])?;
+        }
         let Some(header) = find(&response, "activeAccountHeaderRenderer") else {
             self.end_session(&used);
             return Err(SESSION_REJECTED.to_owned());
@@ -289,11 +299,26 @@ impl Client {
         Ok(channels(&self.music("account/accounts_list", body, &[])?))
     }
 
+    fn judge_unauthorized(&self, cookie: &str, signal: Signal) {
+        let mut since = self.first_unauthorized.lock().unwrap();
+        let now = Instant::now();
+        match judge(*since, now, signal) {
+            Verdict::Reset => *since = None,
+            Verdict::Wait => {}
+            Verdict::Start => *since = Some(now),
+            Verdict::End => {
+                *since = None;
+                drop(since);
+                self.end_session(cookie);
+            }
+        }
+    }
+
     fn end_session(&self, rejected: &str) {
         let mut session = self.session.lock().unwrap();
         if session.as_deref() == Some(rejected) {
             *session = None;
-            self.expired.store(true, Relaxed);
+            *self.expired.lock().unwrap() = Some(rejected.to_owned());
         }
     }
 
@@ -641,14 +666,22 @@ impl Client {
                 .set("X-Origin", auth::ORIGIN)
                 .set("X-Goog-AuthUser", "0");
         }
-        let response = match request.send_json(body) {
+        let mut outcome = request.clone().send_json(body.clone());
+        if cookie.is_some() && is_unauthorized(&outcome) {
+            std::thread::sleep(REJECTION_RECHECK_DELAY);
+            outcome = request.send_json(body);
+        }
+        let response = match outcome {
             Ok(response) => read(response)?,
             Err(ureq::Error::Status(401, _)) if cookie.is_some() => {
-                self.end_session(&cookie.unwrap_or_default());
+                self.judge_unauthorized(&cookie.unwrap_or_default(), Signal::Rejected);
                 return Err(SESSION_REJECTED.to_owned());
             }
             Err(error) => return Err(describe(error)),
         };
+        if cookie.is_some() {
+            self.judge_unauthorized("", Signal::Accepted);
+        }
         if let Some(visitor) = response["responseContext"]["visitorData"].as_str() {
             let mut known = self.visitor.lock().unwrap();
             if known.is_empty() {
@@ -657,6 +690,34 @@ impl Client {
         }
         Ok(response)
     }
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    Rejected,
+    Accepted,
+}
+
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Wait,
+    Start,
+    End,
+    Reset,
+}
+
+fn judge(first_rejection: Option<Instant>, now: Instant, signal: Signal) -> Verdict {
+    match (signal, first_rejection.map(|first| now.saturating_duration_since(first))) {
+        (Signal::Accepted, _) => Verdict::Reset,
+        (Signal::Rejected, Some(age)) if age >= REJECTION_STALE_AFTER => Verdict::Start,
+        (Signal::Rejected, Some(age)) if age >= REJECTION_CONFIRM_AFTER => Verdict::End,
+        (Signal::Rejected, Some(_)) => Verdict::Wait,
+        (Signal::Rejected, None) => Verdict::Start,
+    }
+}
+
+fn is_unauthorized(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
+    matches!(outcome, Err(ureq::Error::Status(401, _)))
 }
 
 fn send(request: ureq::Request, body: Value) -> Result<Value, String> {
@@ -1353,11 +1414,45 @@ mod tests {
         let yt = Client::new(String::new());
         yt.set_session(Some("newer".to_owned()));
         yt.end_session("older");
-        assert!(yt.signed_in() && !yt.take_expired());
+        assert!(yt.signed_in() && yt.take_expired().is_none());
         yt.end_session("newer");
-        assert!(!yt.signed_in() && yt.take_expired());
+        assert!(!yt.signed_in() && yt.take_expired().as_deref() == Some("newer"));
         yt.end_session("");
-        assert!(!yt.take_expired());
+        assert!(yt.take_expired().is_none());
+    }
+
+    #[test]
+    fn ends_the_session_only_on_a_rejection_after_the_window() {
+        let first = Instant::now();
+        let inside = first + REJECTION_CONFIRM_AFTER / 2;
+        let after = first + REJECTION_CONFIRM_AFTER;
+        assert_eq!(judge(None, first, Signal::Rejected), Verdict::Start);
+        assert_eq!(judge(Some(first), first + REJECTION_STALE_AFTER, Signal::Rejected), Verdict::Start);
+        assert_eq!(judge(Some(first), inside, Signal::Rejected), Verdict::Wait);
+        assert_eq!(judge(Some(first), after, Signal::Rejected), Verdict::End);
+        assert_eq!(judge(Some(first), after, Signal::Accepted), Verdict::Reset);
+        assert_eq!(judge(None, after, Signal::Accepted), Verdict::Reset);
+    }
+
+    #[test]
+    fn a_new_session_forgets_earlier_rejections() {
+        let yt = Client::new(String::new());
+        yt.set_session(Some("old".to_owned()));
+        yt.end_session("old");
+        yt.judge_unauthorized("new", Signal::Rejected);
+        yt.set_session(Some("new".to_owned()));
+        assert!(yt.take_expired().is_none());
+        assert!(yt.first_unauthorized.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn only_a_401_counts_as_a_rejected_session() {
+        let status = |code| Err(ureq::Error::Status(code, ureq::Response::new(code, "status", "").unwrap()));
+        assert!(is_unauthorized(&status(401)));
+        assert!(!is_unauthorized(&status(403)));
+        assert!(!is_unauthorized(&status(500)));
+        assert!(!is_unauthorized(&status(503)));
+        assert!(!is_unauthorized(&Ok(ureq::Response::new(200, "OK", "").unwrap())));
     }
 
     #[test]
