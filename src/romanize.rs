@@ -30,7 +30,7 @@ const ENDINGS: [Ending; 28] = [
     ending("l", "l", Some(9)),
     ending("l", "l", Some(16)),
     ending("p", "l", Some(17)),
-    ending("l", "l", None),
+    ending("l", "", Some(5)),
     ending("m", "", Some(6)),
     ending("p", "", Some(7)),
     ending("p", "p", Some(9)),
@@ -56,10 +56,35 @@ const ENDING_DIGEUT: usize = 7;
 const ENDING_TIEUT: usize = 25;
 const ENDING_HIEUH: usize = 27;
 const ASPIRATING_ENDINGS: [usize; 3] = [6, 15, 27];
+const HIEUH_INITIAL: usize = 18;
+const VOWEL_YEO: usize = 6;
+const ENDING_SSANGSIOS: usize = 20;
+const ENDING_NIEUN_JIEUJ: usize = 5;
+const ENDING_JIEUJ: usize = 22;
+const ENDING_CHIEUCH: usize = 23;
+const BALP: (usize, usize, usize) = (7, 0, 11);
+
+fn closing_sound(syllable: (usize, usize, usize)) -> &'static str {
+    if syllable == BALP { "p" } else { ENDINGS[syllable.2].closing }
+}
+
+fn before_hieuh(last: usize, next: (usize, usize, usize)) -> Option<(&'static str, &'static str)> {
+    let ending = &ENDINGS[last];
+    let softens = next.1 == VOWEL_I || (next.1 == VOWEL_YEO && matches!(next.2, 0 | ENDING_SSANGSIOS));
+    match (last, ending.closing) {
+        (ENDING_NIEUN_JIEUJ, _) => Some(("n", "ch")),
+        (ENDING_DIGEUT | ENDING_TIEUT, _) => Some(("", if softens { "ch" } else { "t" })),
+        (ENDING_JIEUJ | ENDING_CHIEUCH, _) => Some(("", "ch")),
+        (_, "k") => Some((ending.stay, "k")),
+        (_, "p") => Some((ending.stay, "p")),
+        (_, "t") => Some(("", "t")),
+        _ => None,
+    }
+}
 
 fn hangul_word(syllables: &[(usize, usize, usize)]) -> String {
     let mut onsets: Vec<&str> = syllables.iter().map(|&(initial, _, _)| INITIALS[initial]).collect();
-    let mut codas: Vec<&str> = syllables.iter().map(|&(_, _, last)| ENDINGS[last].closing).collect();
+    let mut codas: Vec<&str> = syllables.iter().map(|&syllable| closing_sound(syllable)).collect();
     for index in 0..syllables.len().saturating_sub(1) {
         let (_, _, last) = syllables[index];
         let (next_initial, next_vowel, _) = syllables[index + 1];
@@ -67,6 +92,7 @@ fn hangul_word(syllables: &[(usize, usize, usize)]) -> String {
             continue;
         }
         let ending = &ENDINGS[last];
+        let closing = closing_sound(syllables[index]);
         if next_initial == SILENT_INITIAL {
             codas[index] = ending.stay;
             onsets[index + 1] = match (last, next_vowel) {
@@ -76,6 +102,13 @@ fn hangul_word(syllables: &[(usize, usize, usize)]) -> String {
             };
             continue;
         }
+        if next_initial == HIEUH_INITIAL
+            && let Some((coda, onset)) = before_hieuh(last, syllables[index + 1])
+        {
+            codas[index] = coda;
+            onsets[index + 1] = onset;
+            continue;
+        }
         let aspirated = match next_initial {
             0 => Some("k"),
             3 => Some("t"),
@@ -83,21 +116,21 @@ fn hangul_word(syllables: &[(usize, usize, usize)]) -> String {
             _ => None,
         };
         if let (true, Some(sound)) = (ASPIRATING_ENDINGS.contains(&last), aspirated) {
-            codas[index] = if last == ENDING_HIEUH { "" } else { ending.closing };
+            codas[index] = if last == ENDING_HIEUH { "" } else { closing };
             onsets[index + 1] = sound;
             continue;
         }
         let nasal_next = next_initial == NIEUN_INITIAL || next_initial == MIEUM_INITIAL;
-        let (coda, onset) = match (ending.closing, next_initial) {
+        let (coda, onset) = match (closing, next_initial) {
             ("k", _) if nasal_next => ("ng", onsets[index + 1]),
             ("t", _) if nasal_next => ("n", onsets[index + 1]),
             ("p", _) if nasal_next => ("m", onsets[index + 1]),
             ("k", RIEUL_INITIAL) => ("ng", "n"),
             ("t", RIEUL_INITIAL) => ("n", "n"),
             ("p", RIEUL_INITIAL) => ("m", "n"),
-            ("m" | "ng", RIEUL_INITIAL) => (ending.closing, "n"),
+            ("m" | "ng", RIEUL_INITIAL) => (closing, "n"),
             ("n", RIEUL_INITIAL) | ("l", RIEUL_INITIAL) | ("l", NIEUN_INITIAL) => ("l", "l"),
-            _ => (ending.closing, onsets[index + 1]),
+            _ => (closing, onsets[index + 1]),
         };
         codas[index] = coda;
         onsets[index + 1] = onset;
@@ -167,7 +200,8 @@ fn is_russian_letter(letter: char) -> bool {
 fn russian_line(line: &str) -> String {
     let mut result = String::new();
     let mut before = ' ';
-    for letter in line.chars() {
+    let letters: Vec<char> = line.chars().collect();
+    for (index, &letter) in letters.iter().enumerate() {
         let lower = letter.to_lowercase().next().unwrap_or(letter);
         let Some(mut sound) = cyrillic_sound(lower) else {
             result.push(letter);
@@ -178,7 +212,13 @@ fn russian_line(line: &str) -> String {
         if lower == 'е' && opens_syllable {
             sound = "ye";
         }
-        if letter.is_uppercase() {
+        let shouted = |neighbor: Option<&char>| neighbor.is_some_and(|other| other.is_uppercase());
+        if letter.is_uppercase()
+            && sound.len() > 1
+            && (shouted(letters.get(index + 1)) || shouted(index.checked_sub(1).and_then(|at| letters.get(at))))
+        {
+            result.push_str(&sound.to_uppercase());
+        } else if letter.is_uppercase() {
             let mut chars = sound.chars();
             result.extend(chars.next().map(|first| first.to_ascii_uppercase()));
             result.push_str(chars.as_str());
@@ -236,6 +276,41 @@ mod tests {
             ("닭", "dak"),
             ("앞이", "api"),
             ("Dynamite 사랑", "Dynamite sarang"),
+            ("먹히다", "meokida"),
+            ("입학", "ipak"),
+            ("각하", "gaka"),
+            ("축하", "chuka"),
+            ("맏형", "matyeong"),
+            ("잡혀", "japyeo"),
+            ("닫혀", "dachyeo"),
+            ("백화점", "baekwajeom"),
+            ("읽히다", "ilkida"),
+            ("앉히다", "anchida"),
+            ("굳히다", "guchida"),
+            ("국한", "gukan"),
+            ("못해", "motae"),
+            ("싫어", "sireo"),
+            ("끓이다", "kkeurida"),
+            ("않아", "ana"),
+            ("많이", "mani"),
+            ("밟다", "bapda"),
+            ("밟는", "bamneun"),
+            ("밟아", "balba"),
+            ("값이", "gapsi"),
+            ("닭이", "dalgi"),
+            ("앉아", "anja"),
+            ("젊은", "jeolmeun"),
+            ("흙이", "heulgi"),
+            ("독립", "dongnip"),
+            ("설날", "seollal"),
+            ("합니다", "hamnida"),
+            ("종로", "jongno"),
+            ("법률", "beomnyul"),
+            ("놓고", "noko"),
+            ("굳이", "guji"),
+            ("학교", "hakgyo"),
+            ("서울", "seoul"),
+            ("있어", "isseo"),
         ];
         for (hangul, expected) in cases {
             assert_eq!(romanize_line(hangul).as_deref(), Some(expected), "{hangul}");
@@ -250,6 +325,7 @@ mod tests {
             Some("Teploye mesto, no ulitsy zhdut")
         );
         assert_eq!(romanize_line("Щука ёж").as_deref(), Some("Shchuka yozh"));
+        assert_eq!(romanize_line("ЩИТ ЕЖ ЕЛЬ").as_deref(), Some("SHCHIT YEZH YEL"));
     }
 
     #[test]

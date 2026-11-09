@@ -1,3 +1,3 @@
 - Repeat and the next song keep working while the window is minimized, also on Linux with Wayland
 - After an update, a small card at the bottom left shows what is new
-- Lyrics can show a romanized line under Korean and Russian lyrics, turn it on with the new switch in the lyrics panel
+- Korean and Russian lyrics can show an approximate romanized line under each line, turned on with the switch in the lyrics panel. It follows standard sound rules without a dictionary, so some words, such as compounds, may be off
