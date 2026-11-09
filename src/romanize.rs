@@ -57,6 +57,8 @@ const ENDING_TIEUT: usize = 25;
 const ENDING_HIEUH: usize = 27;
 const ASPIRATING_ENDINGS: [usize; 3] = [6, 15, 27];
 const HIEUH_INITIAL: usize = 18;
+const SIOS_INITIAL: usize = 9;
+const SSANGSIOS_INITIAL: usize = 10;
 const VOWEL_YEO: usize = 6;
 const ENDING_SSANGSIOS: usize = 20;
 const ENDING_NIEUN_JIEUJ: usize = 5;
@@ -70,13 +72,13 @@ fn closing_sound(syllable: (usize, usize, usize)) -> &'static str {
 
 fn before_hieuh(last: usize, next: (usize, usize, usize)) -> Option<(&'static str, &'static str)> {
     let ending = &ENDINGS[last];
+    let kept = if ending.stay == ending.closing { "" } else { ending.stay };
     let softens = next.1 == VOWEL_I || (next.1 == VOWEL_YEO && matches!(next.2, 0 | ENDING_SSANGSIOS));
     match (last, ending.closing) {
         (ENDING_NIEUN_JIEUJ, _) => Some(("n", "ch")),
-        (ENDING_DIGEUT | ENDING_TIEUT, _) => Some(("", if softens { "ch" } else { "t" })),
-        (ENDING_JIEUJ | ENDING_CHIEUCH, _) => Some(("", "ch")),
-        (_, "k") => Some((ending.stay, "k")),
-        (_, "p") => Some((ending.stay, "p")),
+        (ENDING_DIGEUT | ENDING_TIEUT | ENDING_JIEUJ | ENDING_CHIEUCH, _) => Some(("", if softens { "ch" } else { "t" })),
+        (_, "k") => Some((kept, "k")),
+        (_, "p") => Some((kept, "p")),
         (_, "t") => Some(("", "t")),
         _ => None,
     }
@@ -122,6 +124,7 @@ fn hangul_word(syllables: &[(usize, usize, usize)]) -> String {
         }
         let nasal_next = next_initial == NIEUN_INITIAL || next_initial == MIEUM_INITIAL;
         let (coda, onset) = match (closing, next_initial) {
+            ("t", SIOS_INITIAL | SSANGSIOS_INITIAL) if last == ENDING_HIEUH => ("", onsets[index + 1]),
             ("k", _) if nasal_next => ("ng", onsets[index + 1]),
             ("t", _) if nasal_next => ("n", onsets[index + 1]),
             ("p", _) if nasal_next => ("m", onsets[index + 1]),
@@ -277,6 +280,20 @@ mod tests {
             ("앞이", "api"),
             ("Dynamite 사랑", "Dynamite sarang"),
             ("먹히다", "meokida"),
+            ("좋습니다", "joseumnida"),
+            ("좋소", "joso"),
+            ("좋사", "josa"),
+            ("놓습니다", "noseumnida"),
+            ("낳습니다", "naseumnida"),
+            ("괜찮습니다", "gwaenchanseumnida"),
+            ("않습니다", "anseumnida"),
+            ("싫습니다", "silseumnida"),
+            ("많습니다", "manseumnida"),
+            ("몫하고", "mokago"),
+            ("값하다", "gapada"),
+            ("꽃향기", "kkotyanggi"),
+            ("맞히다", "machida"),
+            ("젖히다", "jeochida"),
             ("입학", "ipak"),
             ("각하", "gaka"),
             ("축하", "chuka"),
