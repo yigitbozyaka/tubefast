@@ -1,4 +1,4 @@
-use crate::auth;
+use crate::{auth, romanize};
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -147,8 +147,21 @@ pub struct Stream {
 #[derive(Debug, PartialEq)]
 pub struct Lyrics {
     pub lines: Vec<(u64, String)>,
+    pub romanized: Vec<Option<String>>,
     pub synced: bool,
     pub source: String,
+}
+
+impl Lyrics {
+    fn new(lines: Vec<(u64, String)>, synced: bool, source: String) -> Self {
+        let romanized = lines.iter().map(|(_, line)| romanize::romanize_line(line)).collect();
+        Self {
+            lines,
+            romanized,
+            synced,
+            source,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -774,11 +787,7 @@ fn timed_lyrics(response: &Value) -> Option<Lyrics> {
         })
         .collect();
     let source = find(response, "sourceMessage").and_then(Value::as_str).unwrap_or_default();
-    (!lines.is_empty()).then(|| Lyrics {
-        lines,
-        synced: true,
-        source: source.to_owned(),
-    })
+    (!lines.is_empty()).then(|| Lyrics::new(lines, true, source.to_owned()))
 }
 
 fn lrclib_lyrics(found: &Value) -> Option<Lyrics> {
@@ -795,22 +804,14 @@ fn lrclib_lyrics(found: &Value) -> Option<Lyrics> {
         let plain = found["plainLyrics"].as_str().unwrap_or_default();
         lines = plain.lines().map(|line| (0, line.trim().to_owned())).collect();
     }
-    (!lines.is_empty()).then(|| Lyrics {
-        lines,
-        synced,
-        source: LRCLIB_SOURCE.to_owned(),
-    })
+    (!lines.is_empty()).then(|| Lyrics::new(lines, synced, LRCLIB_SOURCE.to_owned()))
 }
 
 fn plain_lyrics(response: &Value) -> Option<Lyrics> {
     let shelf = find(response, "musicDescriptionShelfRenderer")?;
     let words = text(&shelf["description"]);
     let lines: Vec<(u64, String)> = words.lines().map(|line| (0, line.trim().to_owned())).collect();
-    (!lines.is_empty()).then(|| Lyrics {
-        lines,
-        synced: false,
-        source: text(&shelf["footer"]),
-    })
+    (!lines.is_empty()).then(|| Lyrics::new(lines, false, text(&shelf["footer"])))
 }
 
 fn single_song_cover(watch_page: &str) -> String {
