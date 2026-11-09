@@ -2,7 +2,7 @@ use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
-use crate::ytm::{Item, Layout};
+use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
@@ -1045,7 +1045,8 @@ fn grid(ui: &mut Ui, count: usize, columns: usize, cell: Vec2, gap: Vec2, mut pa
     }
 }
 
-fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[Item], id: Id, numbered: bool) {
+fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: bool, fetchable: bool) -> bool {
+    let (title, layout, items) = (section.title.as_str(), section.layout, section.items.as_slice());
     let width = ui.available_width();
     let (cards, card_width) = columns(width, CARD_MIN, CARD_GAP);
     let (cells, cell_width) = columns(width, COMPACT_MIN, 12.0);
@@ -1054,7 +1055,8 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[
         Layout::Compact => cells * COMPACT_ROWS,
         Layout::Tracks | Layout::Top => usize::MAX,
     };
-    let foldable = items.len() > visible;
+    let remote = fetchable && section.all.is_some();
+    let foldable = remote || items.len() > visible;
     let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
     if !title.is_empty() || foldable {
         let (row, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
@@ -1094,6 +1096,7 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[
             }
         }
     }
+    remote && open
 }
 
 fn top_result(ui: &mut Ui, cx: &mut Cx, items: &[Item], id: Id) {
@@ -1319,7 +1322,16 @@ fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: O
                         .as_ref()
                         .is_some_and(|header| !header.is_artist && section.items.iter().all(|item| item.thumb == header.thumb));
                 let id = ui.id().with(index);
-                section_view(ui, cx, &section.title, section.layout, &section.items, id, numbered);
+                if section_view(
+                    ui,
+                    cx,
+                    section,
+                    id,
+                    numbered,
+                    page.header.as_ref().is_some_and(|header| header.is_artist),
+                ) {
+                    cx.out.push(Action::ShowAll(index));
+                }
             }
             if page.partial {
                 ui.add_space(30.0);

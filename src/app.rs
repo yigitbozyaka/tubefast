@@ -7,7 +7,7 @@ use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
 use crate::ui;
 use crate::update::{self, Plan};
-use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, VIDEO_FRAME_HOST};
+use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
 use serde::{Deserialize, Serialize};
@@ -189,6 +189,7 @@ pub enum Action {
     Back,
     Forward,
     Reload,
+    ShowAll(usize),
     Play(Vec<Item>, usize),
     Jump(usize),
     PlayNext(Item),
@@ -234,6 +235,7 @@ pub enum Action {
 enum Event {
     Page(Route, Result<Box<Page>, String>),
     Part(u64, usize, Vec<Section>),
+    FullSection(Route, usize, Target, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     Library(Vec<Item>),
     Accounts(Vec<Account>),
@@ -259,6 +261,7 @@ pub struct App {
     cancel_sign_in: Arc<AtomicBool>,
     cover_queue: Vec<String>,
     cover_tried: HashSet<String>,
+    fetching_all: HashSet<(Route, usize)>,
     cover_lookups: usize,
     media: Option<Media>,
     discord: Option<Discord>,
@@ -340,6 +343,7 @@ impl App {
             cancel_sign_in: Arc::default(),
             cover_queue: Vec::new(),
             cover_tried: HashSet::new(),
+            fetching_all: HashSet::new(),
             cover_lookups: 0,
             media,
             discord,
@@ -638,6 +642,12 @@ impl App {
                     self.pages.insert(Route::Home, Load::Ready(Box::new(self.home_page(true))));
                 }
                 Event::Part(..) => {}
+                Event::FullSection(route, at, target, items) => {
+                    if let Some(Load::Ready(page)) = self.pages.get_mut(&route) {
+                        settle_section(page, at, &target, items);
+                    }
+                    self.fetching_all.remove(&(route, at));
+                }
                 Event::Page(Route::Home, result) => {
                     let page = self.home_page(false);
                     let load = match result {
@@ -873,6 +883,21 @@ impl App {
             Action::Back if self.at > 0 => self.step(self.at - 1),
             Action::Forward if self.at + 1 < self.history.len() => self.step(self.at + 1),
             Action::Back | Action::Forward => {}
+            Action::ShowAll(at) => {
+                let route = self.route().clone();
+                let target = match self.pages.get(&route) {
+                    Some(Load::Ready(page)) => page.sections.get(at).and_then(|section| section.all.clone()),
+                    _ => None,
+                };
+                if let Some(target) = target
+                    && self.fetching_all.insert((route.clone(), at))
+                {
+                    self.background(move |yt| {
+                        let items = yt.full_section(&target).unwrap_or_default();
+                        Some(Event::FullSection(route, at, target, items))
+                    });
+                }
+            }
             Action::Reload => {
                 let route = self.route().clone();
                 self.pages.remove(&route);
@@ -1102,9 +1127,56 @@ fn release_notes(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn settle_section(page: &mut Page, at: usize, target: &Target, items: Vec<Item>) {
+    if let Some(section) = page.sections.get_mut(at).filter(|section| section.all.as_ref() == Some(target)) {
+        section.all = None;
+        if !items.is_empty() {
+            section.items = items;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ytm::Layout;
+
+    #[test]
+    fn full_list_replaces_only_its_own_section_and_failure_keeps_items() {
+        let song = |title: &str| Item {
+            title: title.into(),
+            ..Item::default()
+        };
+        let target = Target {
+            browse_id: "VLOLAK".into(),
+            params: String::new(),
+        };
+        let section = |title: &str| Section {
+            title: title.into(),
+            layout: Layout::Tracks,
+            items: vec![song("shown")],
+            all: Some(target.clone()),
+        };
+        let mut page = Page {
+            sections: vec![section("Songs"), section("Albums")],
+            ..Page::default()
+        };
+        let moved = Target {
+            browse_id: "MPAD".into(),
+            params: "x".into(),
+        };
+        settle_section(&mut page, 1, &moved, vec![song("a")]);
+        assert_eq!(page.sections[1].items.len(), 1);
+        assert!(page.sections[1].all.is_some());
+        settle_section(&mut page, 1, &target, vec![song("a"), song("b")]);
+        assert_eq!(page.sections[1].items.len(), 2);
+        assert!(page.sections[1].all.is_none());
+        assert_eq!(page.sections[0].items.len(), 1);
+        assert!(page.sections[0].all.is_some());
+        settle_section(&mut page, 0, &target, Vec::new());
+        assert_eq!(page.sections[0].items.len(), 1);
+        assert!(page.sections[0].all.is_none());
+    }
 
     #[test]
     fn reads_release_notes_as_plain_lines() {

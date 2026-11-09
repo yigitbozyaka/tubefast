@@ -101,11 +101,18 @@ pub enum Layout {
     Top,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Target {
+    pub browse_id: String,
+    pub params: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Section {
     pub title: String,
     pub layout: Layout,
     pub items: Vec<Item>,
+    pub all: Option<Target>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -386,6 +393,7 @@ impl Client {
                                     title: format!("More like {}", seed.title),
                                     layout: Layout::Compact,
                                     items,
+                                    all: None,
                                 }],
                             );
                         }
@@ -430,6 +438,28 @@ impl Client {
         page.partial = false;
         inherit_header(&mut page);
         Ok(page)
+    }
+
+    pub fn full_section(&self, target: &Target) -> Result<Vec<Item>, String> {
+        let mut body = json!({ "browseId": target.browse_id });
+        if !target.params.is_empty() {
+            body["params"] = json!(target.params);
+        }
+        let response = self.music("browse", body, &[])?;
+        let mut token = tracks_continuation(&response);
+        let mut items = parse_page(&response)
+            .sections
+            .into_iter()
+            .next()
+            .map(|s| s.items)
+            .unwrap_or_default();
+        for _ in 1..TRACK_PAGES {
+            let Some(next) = token.take() else { break };
+            let Ok(response) = self.more(&next) else { break };
+            items.extend(parse_page(&response).songs());
+            token = continuation(&response);
+        }
+        Ok(items)
     }
 
     pub fn search(&self, query: &str) -> Result<Page, String> {
@@ -921,6 +951,7 @@ fn collect(node: &Value, page: &mut Page) {
                             title: String::new(),
                             layout: Layout::Tracks,
                             items: Vec::new(),
+                            all: None,
                         });
                     }
                     page.sections.last_mut().unwrap().items.extend(item(child));
@@ -959,7 +990,23 @@ fn shelf(kind: &str, node: &Value) -> Section {
         }
         _ => (text(&node["title"]), Layout::Tracks),
     };
-    Section { title, layout, items }
+    let all = match kind {
+        "musicCarouselShelfRenderer" => target(
+            node,
+            "/header/musicCarouselShelfBasicHeaderRenderer/moreContentButton/buttonRenderer/navigationEndpoint",
+        ),
+        "musicShelfRenderer" => target(node, "/bottomEndpoint").or_else(|| target(node, "/title/runs/0/navigationEndpoint")),
+        _ => None,
+    };
+    Section { title, layout, items, all }
+}
+
+fn target(node: &Value, endpoint: &str) -> Option<Target> {
+    let browse = node.pointer(endpoint)?.get("browseEndpoint")?;
+    Some(Target {
+        browse_id: browse["browseId"].as_str().filter(|id| !id.is_empty())?.to_owned(),
+        params: browse["params"].as_str().unwrap_or_default().to_owned(),
+    })
 }
 
 fn card(node: &Value) -> Item {
@@ -1220,6 +1267,42 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shelves_expose_where_the_full_list_lives() {
+        let song = |id: &str| json!({ "musicResponsiveListItemRenderer": { "title": { "runs": [{ "text": id }] }, "playlistItemData": { "videoId": id } } });
+        let response = json!({ "contents": [
+            { "musicShelfRenderer": {
+                "title": { "runs": [{ "text": "Songs" }] },
+                "contents": [song("a")],
+                "bottomEndpoint": { "browseEndpoint": { "browseId": "VLOLAK5uy_x" } },
+            } },
+            { "musicCarouselShelfRenderer": {
+                "header": { "musicCarouselShelfBasicHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Albums" }] },
+                    "moreContentButton": { "buttonRenderer": { "navigationEndpoint": {
+                        "browseEndpoint": { "browseId": "MPADUC123", "params": "ggMCEgA" },
+                    } } },
+                } },
+                "contents": [{ "musicTwoRowItemRenderer": { "title": { "runs": [{ "text": "One" }] }, "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREb_One" } } } }],
+            } },
+            { "musicCarouselShelfRenderer": {
+                "header": { "musicCarouselShelfBasicHeaderRenderer": { "title": { "runs": [{ "text": "Fans also like" }] } } },
+                "contents": [{ "musicTwoRowItemRenderer": { "title": { "runs": [{ "text": "Two" }] }, "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREb_Two" } } } }],
+            } },
+        ] });
+        let sections = parse_page(&response).sections;
+        let targets: Vec<_> = sections.iter().map(|s| s.all.clone()).collect();
+        let songs = Target {
+            browse_id: "VLOLAK5uy_x".into(),
+            params: String::new(),
+        };
+        let albums = Target {
+            browse_id: "MPADUC123".into(),
+            params: "ggMCEgA".into(),
+        };
+        assert_eq!(targets, vec![Some(songs), Some(albums), None]);
+    }
 
     #[test]
     fn prefers_opus_and_falls_back_to_aac() {
