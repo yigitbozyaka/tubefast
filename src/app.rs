@@ -261,6 +261,7 @@ pub struct App {
     cancel_sign_in: Arc<AtomicBool>,
     cover_queue: Vec<String>,
     cover_tried: HashSet<String>,
+    fetching_all: HashSet<(Route, usize)>,
     cover_lookups: usize,
     media: Option<Media>,
     discord: Option<Discord>,
@@ -342,6 +343,7 @@ impl App {
             cancel_sign_in: Arc::default(),
             cover_queue: Vec::new(),
             cover_tried: HashSet::new(),
+            fetching_all: HashSet::new(),
             cover_lookups: 0,
             media,
             discord,
@@ -641,12 +643,10 @@ impl App {
                 }
                 Event::Part(..) => {}
                 Event::FullSection(route, at, items) => {
-                    if let Some(Load::Ready(page)) = self.pages.get_mut(&route)
-                        && let Some(section) = page.sections.get_mut(at)
-                    {
-                        section.all = None;
-                        section.items = items;
+                    if let Some(Load::Ready(page)) = self.pages.get_mut(&route) {
+                        settle_section(page, at, items);
                     }
+                    self.fetching_all.remove(&(route, at));
                 }
                 Event::Page(Route::Home, result) => {
                     let page = self.home_page(false);
@@ -889,11 +889,10 @@ impl App {
                     Some(Load::Ready(page)) => page.sections.get(at).and_then(|section| section.all.clone()),
                     _ => None,
                 };
-                if let Some(target) = target {
-                    self.background(move |yt| match yt.full_section(&target) {
-                        Ok(items) if !items.is_empty() => Some(Event::FullSection(route, at, items)),
-                        _ => None,
-                    });
+                if let Some(target) = target
+                    && self.fetching_all.insert((route.clone(), at))
+                {
+                    self.background(move |yt| Some(Event::FullSection(route, at, yt.full_section(&target).unwrap_or_default())));
                 }
             }
             Action::Reload => {
@@ -1125,9 +1124,49 @@ fn release_notes(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn settle_section(page: &mut Page, at: usize, items: Vec<Item>) {
+    if let Some(section) = page.sections.get_mut(at) {
+        section.all = None;
+        if !items.is_empty() {
+            section.items = items;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ytm::{Layout, Target};
+
+    #[test]
+    fn full_list_replaces_only_its_own_section_and_failure_keeps_items() {
+        let song = |title: &str| Item {
+            title: title.into(),
+            ..Item::default()
+        };
+        let target = Target {
+            browse_id: "VLOLAK".into(),
+            params: String::new(),
+        };
+        let section = |title: &str| Section {
+            title: title.into(),
+            layout: Layout::Tracks,
+            items: vec![song("shown")],
+            all: Some(target.clone()),
+        };
+        let mut page = Page {
+            sections: vec![section("Songs"), section("Albums")],
+            ..Page::default()
+        };
+        settle_section(&mut page, 1, vec![song("a"), song("b")]);
+        assert_eq!(page.sections[1].items.len(), 2);
+        assert!(page.sections[1].all.is_none());
+        assert_eq!(page.sections[0].items.len(), 1);
+        assert!(page.sections[0].all.is_some());
+        settle_section(&mut page, 0, Vec::new());
+        assert_eq!(page.sections[0].items.len(), 1);
+        assert!(page.sections[0].all.is_none());
+    }
 
     #[test]
     fn reads_release_notes_as_plain_lines() {

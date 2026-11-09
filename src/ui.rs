@@ -1047,7 +1047,6 @@ fn grid(ui: &mut Ui, count: usize, columns: usize, cell: Vec2, gap: Vec2, mut pa
 
 fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: bool, fetchable: bool) -> bool {
     let (title, layout, items) = (section.title.as_str(), section.layout, section.items.as_slice());
-    let mut wants_all = false;
     let width = ui.available_width();
     let (cards, card_width) = columns(width, CARD_MIN, CARD_GAP);
     let (cells, cell_width) = columns(width, COMPACT_MIN, 12.0);
@@ -1066,7 +1065,6 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: b
             let text = if open { "Show less" } else { "Show all" };
             if text_button(ui, row.right_center(), id.with("fold"), text).clicked() {
                 open = !open;
-                wants_all = open && remote;
                 ui.data_mut(|data| data.insert_temp(id, open));
             }
         }
@@ -1098,7 +1096,7 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: b
             }
         }
     }
-    wants_all
+    remote && open
 }
 
 fn top_result(ui: &mut Ui, cx: &mut Cx, items: &[Item], id: Id) {
@@ -1324,7 +1322,14 @@ fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: O
                         .as_ref()
                         .is_some_and(|header| !header.is_artist && section.items.iter().all(|item| item.thumb == header.thumb));
                 let id = ui.id().with(index);
-                if section_view(ui, cx, section, id, numbered, page.header.is_some()) {
+                if section_view(
+                    ui,
+                    cx,
+                    section,
+                    id,
+                    numbered,
+                    page.header.as_ref().is_some_and(|header| header.is_artist),
+                ) {
                     cx.out.push(Action::ShowAll(index));
                 }
             }
