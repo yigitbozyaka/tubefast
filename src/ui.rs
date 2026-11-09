@@ -535,6 +535,7 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
 pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     let mut out = Vec::new();
     if !(app.saved.overlay && app.overlay_open) {
+        forget_overlay_window();
         return out;
     }
     let home = app.overlay_origin.unwrap_or(OVERLAY_HOME);
@@ -549,7 +550,7 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
         .with_resizable(false)
         .with_active(false);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("overlay"), builder, |ctx, _| {
-        style_overlay_window(usable_opacity(app.saved.overlay_opacity));
+        style_overlay_window(ctx, usable_opacity(app.saved.overlay_opacity));
         egui::CentralPanel::default()
             .frame(Frame::NONE)
             .show(ctx, |ui| overlay_card(app, ui, &mut out));
@@ -565,31 +566,65 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
 }
 
 #[cfg(windows)]
-fn style_overlay_window(opacity: f32) {
-    use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE,
-    };
+static OVERLAY_WINDOW: std::sync::Mutex<(isize, u8)> = std::sync::Mutex::new((0, 0));
+
+#[cfg(windows)]
+fn own_overlay_window() -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
     let title: Vec<u16> = OVERLAY_TITLE.encode_utf16().chain([0]).collect();
-    unsafe {
-        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+    let mut window = std::ptr::null_mut();
+    loop {
+        window = unsafe { FindWindowExW(std::ptr::null_mut(), window, std::ptr::null(), title.as_ptr()) };
         if window.is_null() {
-            return;
+            return None;
         }
-        let wanted = (WS_EX_NOACTIVATE | WS_EX_LAYERED) as isize;
-        let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
-        if style & wanted != wanted {
-            SetWindowLongPtrW(window, GWL_EXSTYLE, style | wanted);
-            let corners = DWMWCP_ROUND;
-            DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE as u32, (&raw const corners).cast(), 4);
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut owner) };
+        if owner == unsafe { GetCurrentProcessId() } {
+            return Some(window);
         }
-        SetLayeredWindowAttributes(window, 0, (opacity * 255.0) as u8, LWA_ALPHA);
     }
 }
 
+#[cfg(windows)]
+fn style_overlay_window(ctx: &egui::Context, opacity: f32) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    };
+    let alpha = (opacity * 255.0) as u8;
+    let mut styled = OVERLAY_WINDOW.lock().unwrap();
+    if styled.0 != 0 && styled.1 == alpha {
+        return;
+    }
+    let window = if styled.0 != 0 { Some(styled.0 as _) } else { own_overlay_window() };
+    let Some(window) = window else {
+        ctx.request_repaint();
+        return;
+    };
+    unsafe {
+        if styled.0 == 0 {
+            let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+            SetWindowLongPtrW(window, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE | WS_EX_LAYERED) as isize);
+            let corners = DWMWCP_ROUND;
+            DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE as u32, (&raw const corners).cast(), 4);
+        }
+        SetLayeredWindowAttributes(window, 0, alpha, LWA_ALPHA);
+    }
+    *styled = (window as isize, alpha);
+}
+
+#[cfg(windows)]
+fn forget_overlay_window() {
+    *OVERLAY_WINDOW.lock().unwrap() = (0, 0);
+}
+
 #[cfg(not(windows))]
-fn style_overlay_window(_: f32) {}
+fn style_overlay_window(_: &egui::Context, _: f32) {}
+
+#[cfg(not(windows))]
+fn forget_overlay_window() {}
 
 #[cfg(windows)]
 fn cursor_in_points(ctx: &egui::Context) -> Option<Pos2> {
