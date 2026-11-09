@@ -32,6 +32,7 @@ const HOME_SEEDS: usize = 3;
 const COVER_LOOKUPS: usize = 2;
 const QUEUED_COVERS: usize = 30;
 const REMEMBERED_COVERS: usize = 1500;
+pub const OVERLAY_OPACITY_MIN: f32 = 0.3;
 const WINDOW_KEY: &str = "window";
 pub const WINDOW_SIZE: [f32; 2] = [1360.0, 860.0];
 pub const WINDOW_MIN: [f32; 2] = [940.0, 600.0];
@@ -82,7 +83,11 @@ pub struct Saved {
     pub discord_headline: Headline,
     pub discord_name: String,
     pub hotkeys: bool,
-    pub hotkey_combos: [Option<Combo>; 5],
+    #[serde(deserialize_with = "hotkeys::padded_combos")]
+    pub hotkey_combos: [Option<Combo>; hotkeys::COUNT],
+    pub overlay: bool,
+    pub overlay_opacity: f32,
+    pub overlay_position: Option<[f32; 2]>,
     pub notes_seen: String,
 }
 
@@ -153,6 +158,9 @@ impl Default for Saved {
             discord_name: String::new(),
             hotkeys: false,
             hotkey_combos: hotkeys::standard_combos(),
+            overlay: false,
+            overlay_opacity: 0.9,
+            overlay_position: None,
             notes_seen: String::new(),
         }
     }
@@ -229,6 +237,10 @@ pub enum Action {
     GlobalHotkeys(bool),
     Record(Option<Command>),
     ResetHotkeys,
+    ToggleOverlay,
+    OverlayEnabled(bool),
+    OverlayOpacity(f32),
+    OverlayMoved([f32; 2]),
 }
 
 enum Event {
@@ -289,6 +301,7 @@ pub struct App {
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
+    pub overlay_open: bool,
     pub notes: Vec<String>,
     restart: Option<PathBuf>,
 }
@@ -369,6 +382,7 @@ impl App {
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
+            overlay_open: false,
             notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
         };
@@ -904,6 +918,13 @@ impl App {
                 self.recording = None;
                 self.restart_hotkeys();
             }
+            Action::ToggleOverlay => self.overlay_open = self.saved.overlay && !self.overlay_open,
+            Action::OverlayEnabled(enabled) => {
+                self.saved.overlay = enabled;
+                self.overlay_open = false;
+            }
+            Action::OverlayOpacity(opacity) => self.saved.overlay_opacity = opacity.clamp(OVERLAY_OPACITY_MIN, 1.0),
+            Action::OverlayMoved(position) => self.saved.overlay_position = Some(position),
             Action::Like(item) => {
                 let liked = !self.saved.liked.iter().any(|known| known.key() == item.key());
                 toggle(&mut self.saved.liked, item.clone());
@@ -1028,6 +1049,7 @@ impl eframe::App for App {
         self.drain(ctx, &mut playback);
         let mut actions = if self.record(ctx) { Vec::new() } else { self.shortcuts(ctx) };
         actions.extend(ui::draw(self, ctx));
+        actions.extend(ui::overlay(self, ctx));
         for action in actions {
             self.apply(action, &mut playback);
         }
@@ -1049,6 +1071,10 @@ impl eframe::App for App {
             let (headline, name) = (self.saved.discord_headline, &self.saved.discord_name);
             discord.show(track, headline, name, position_ms, duration_ms);
         }
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
