@@ -2262,6 +2262,10 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let moved = ui.data(|data| data.get_temp::<Option<usize>>(follow)) != Some(sung);
     ui.data_mut(|data| data.insert_temp(follow, sung));
     let width = ui.available_width();
+    let romanized = app.saved.lyrics_romanized;
+    if lyrics.romanized.iter().any(Option::is_some) && switch_row(ui, vec2(width, 38.0), icon::TRANSLATE, "Show romanization", romanized) {
+        out.push(Action::RomanizeLyrics(!romanized));
+    }
     let sense = if lyrics.synced { Sense::click() } else { Sense::hover() };
     for (index, (start, line)) in lyrics.lines.iter().enumerate() {
         if line.is_empty() {
@@ -2269,7 +2273,15 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
             continue;
         }
         let galley = fit(ui, line, bold(20.0), TEXT, width, 4);
-        let (rect, response) = ui.allocate_exact_size(vec2(width, galley.size().y + 14.0), sense);
+        let reading = lyrics
+            .romanized
+            .get(index)
+            .and_then(Option::as_deref)
+            .filter(|_| romanized)
+            .map(|reading| fit(ui, reading, sans(15.0), TEXT, width, 3));
+        let reading_height = reading.as_ref().map_or(0.0, |reading| reading.size().y + 2.0);
+        let line_height = galley.size().y;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, line_height + reading_height + 14.0), sense);
         let current = sung == Some(index);
         if current && moved {
             ui.scroll_to_rect(rect, Some(Align::Center));
@@ -2283,6 +2295,11 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
         let hover = hover_of(ui, &response);
         let ink = TEXT.gamma_multiply(0.34 + 0.66 * lit.max(0.5 * hover));
         ui.painter().galley_with_override_text_color(rect.min + vec2(0.0, 7.0), galley, ink);
+        if let Some(reading) = reading {
+            let tone = ink.gamma_multiply(0.7);
+            ui.painter()
+                .galley_with_override_text_color(rect.min + vec2(0.0, 9.0 + line_height), reading, tone);
+        }
         if lyrics.synced {
             point_at(&response);
         }

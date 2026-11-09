@@ -78,6 +78,7 @@ pub struct Saved {
     pub current: Option<usize>,
     pub position_ms: u64,
     pub lyrics_open: bool,
+    pub lyrics_romanized: bool,
     pub discord: bool,
     pub discord_headline: Headline,
     pub discord_name: String,
@@ -148,6 +149,7 @@ impl Default for Saved {
             current: None,
             position_ms: 0,
             lyrics_open: false,
+            lyrics_romanized: false,
             discord: false,
             discord_headline: Headline::App,
             discord_name: String::new(),
@@ -220,6 +222,7 @@ pub enum Action {
     Move(usize, usize),
     Expand(bool),
     ShowLyrics(bool),
+    RomanizeLyrics(bool),
     ClearHistory,
     RestoreHistory(Vec<Item>),
     ShowOnDiscord(bool),
@@ -986,6 +989,7 @@ impl App {
             Action::CloseNotes => self.notes.clear(),
             Action::Move(from, gap) => playback.reorder(from, gap),
             Action::Expand(open) => self.expanded = open && self.saved.current.is_some(),
+            Action::RomanizeLyrics(romanized) => self.saved.lyrics_romanized = romanized,
             Action::ShowLyrics(open) => {
                 self.saved.lyrics_open = open;
                 if matches!(self.lyrics, Some((_, Words::Failed))) {

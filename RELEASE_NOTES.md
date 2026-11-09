@@ -1,2 +1,3 @@
 - Repeat and the next song keep working while the window is minimized, also on Linux with Wayland
 - After an update, a small card at the bottom left shows what is new
+- Lyrics can show a romanized line under Korean and Russian lyrics, turn it on with the new switch in the lyrics panel
