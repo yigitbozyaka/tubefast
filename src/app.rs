@@ -33,6 +33,8 @@ const HOME_SEEDS: usize = 3;
 const COVER_LOOKUPS: usize = 2;
 const QUEUED_COVERS: usize = 30;
 const REMEMBERED_COVERS: usize = 1500;
+pub const OVERLAY_OPACITY_MIN: f32 = 0.3;
+const OVERLAY_OPACITY_DEFAULT: f32 = 0.9;
 const WINDOW_KEY: &str = "window";
 pub const WINDOW_SIZE: [f32; 2] = [1360.0, 860.0];
 pub const WINDOW_MIN: [f32; 2] = [940.0, 600.0];
@@ -85,7 +87,11 @@ pub struct Saved {
     pub discord_name: String,
     pub hotkeys: bool,
     pub hide_on_close: bool,
-    pub hotkey_combos: [Option<Combo>; 5],
+    #[serde(deserialize_with = "hotkeys::padded_combos")]
+    pub hotkey_combos: [Option<Combo>; hotkeys::COUNT],
+    pub overlay: bool,
+    pub overlay_opacity: f32,
+    pub overlay_position: Option<[f32; 2]>,
     pub notes_seen: String,
 }
 
@@ -158,6 +164,9 @@ impl Default for Saved {
             hotkeys: false,
             hide_on_close: false,
             hotkey_combos: hotkeys::standard_combos(),
+            overlay: false,
+            overlay_opacity: OVERLAY_OPACITY_DEFAULT,
+            overlay_position: None,
             notes_seen: String::new(),
         }
     }
@@ -237,6 +246,11 @@ pub enum Action {
     HideOnClose(bool),
     Record(Option<Command>),
     ResetHotkeys,
+    ToggleOverlay,
+    OverlayEnabled(bool),
+    OverlayOpacity(f32),
+    OverlayMoved([f32; 2]),
+    OverlayResetPosition,
 }
 
 enum Event {
@@ -301,6 +315,8 @@ pub struct App {
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
+    pub overlay_open: bool,
+    pub overlay_origin: Option<[f32; 2]>,
     pub notes: Vec<String>,
     restart: Option<PathBuf>,
 }
@@ -384,6 +400,8 @@ impl App {
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
+            overlay_open: false,
+            overlay_origin: None,
             notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
         };
@@ -960,6 +978,20 @@ impl App {
                 self.recording = None;
                 self.restart_hotkeys();
             }
+            Action::ToggleOverlay => {
+                self.overlay_open = overlay_after_toggle(self.saved.overlay, self.overlay_open);
+                self.overlay_origin = self.saved.overlay_position;
+            }
+            Action::OverlayEnabled(enabled) => {
+                self.saved.overlay = enabled;
+                self.overlay_open = false;
+            }
+            Action::OverlayOpacity(opacity) => self.saved.overlay_opacity = usable_opacity(opacity),
+            Action::OverlayMoved(position) => self.saved.overlay_position = Some(position),
+            Action::OverlayResetPosition => {
+                self.saved.overlay_position = None;
+                self.overlay_origin = None;
+            }
             Action::Like(item) => {
                 let liked = !self.saved.liked.iter().any(|known| known.key() == item.key());
                 toggle(&mut self.saved.liked, item.clone());
@@ -1091,6 +1123,7 @@ impl eframe::App for App {
         self.drain(ctx, &mut playback);
         let mut actions = if self.record(ctx) { Vec::new() } else { self.shortcuts(ctx) };
         actions.extend(ui::draw(self, ctx));
+        actions.extend(ui::overlay(self, ctx));
         for action in actions {
             self.apply(action, &mut playback);
         }
@@ -1142,6 +1175,18 @@ fn link_discord(sender: &Sender<Event>, ctx: &egui::Context) -> Discord {
         let _ = sender.send(Event::Discord(linked));
         ctx.request_repaint();
     })
+}
+
+fn overlay_after_toggle(enabled: bool, open: bool) -> bool {
+    enabled && !open
+}
+
+pub fn usable_opacity(opacity: f32) -> f32 {
+    if opacity.is_nan() {
+        OVERLAY_OPACITY_DEFAULT
+    } else {
+        opacity.clamp(OVERLAY_OPACITY_MIN, 1.0)
+    }
 }
 
 fn newer_version(release_url: &str, current: &str) -> Option<String> {
@@ -1214,6 +1259,23 @@ mod tests {
         settle_section(&mut page, 0, &target, Vec::new());
         assert_eq!(page.sections[0].items.len(), 1);
         assert!(page.sections[0].all.is_none());
+    }
+
+    #[test]
+    fn the_overlay_only_opens_when_enabled() {
+        assert!(!overlay_after_toggle(false, false));
+        assert!(overlay_after_toggle(true, false));
+        assert!(!overlay_after_toggle(true, true));
+        assert!(!overlay_after_toggle(false, true));
+    }
+
+    #[test]
+    fn broken_opacity_falls_back_into_range() {
+        assert_eq!(usable_opacity(f32::NAN), OVERLAY_OPACITY_DEFAULT);
+        assert_eq!(usable_opacity(-4.0), OVERLAY_OPACITY_MIN);
+        assert_eq!(usable_opacity(7.0), 1.0);
+        assert_eq!(usable_opacity(f32::INFINITY), 1.0);
+        assert_eq!(usable_opacity(0.5), 0.5);
     }
 
     #[test]
