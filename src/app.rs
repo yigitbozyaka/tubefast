@@ -33,6 +33,7 @@ const COVER_LOOKUPS: usize = 2;
 const QUEUED_COVERS: usize = 30;
 const REMEMBERED_COVERS: usize = 1500;
 pub const OVERLAY_OPACITY_MIN: f32 = 0.3;
+const OVERLAY_OPACITY_DEFAULT: f32 = 0.9;
 const WINDOW_KEY: &str = "window";
 pub const WINDOW_SIZE: [f32; 2] = [1360.0, 860.0];
 pub const WINDOW_MIN: [f32; 2] = [940.0, 600.0];
@@ -159,7 +160,7 @@ impl Default for Saved {
             hotkeys: false,
             hotkey_combos: hotkeys::standard_combos(),
             overlay: false,
-            overlay_opacity: 0.9,
+            overlay_opacity: OVERLAY_OPACITY_DEFAULT,
             overlay_position: None,
             notes_seen: String::new(),
         }
@@ -241,6 +242,7 @@ pub enum Action {
     OverlayEnabled(bool),
     OverlayOpacity(f32),
     OverlayMoved([f32; 2]),
+    OverlayResetPosition,
 }
 
 enum Event {
@@ -302,6 +304,7 @@ pub struct App {
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
     pub overlay_open: bool,
+    pub overlay_origin: Option<[f32; 2]>,
     pub notes: Vec<String>,
     restart: Option<PathBuf>,
 }
@@ -383,6 +386,7 @@ impl App {
             hotkey_taken: Vec::new(),
             recording: None,
             overlay_open: false,
+            overlay_origin: None,
             notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
         };
@@ -918,13 +922,20 @@ impl App {
                 self.recording = None;
                 self.restart_hotkeys();
             }
-            Action::ToggleOverlay => self.overlay_open = self.saved.overlay && !self.overlay_open,
+            Action::ToggleOverlay => {
+                self.overlay_open = overlay_after_toggle(self.saved.overlay, self.overlay_open);
+                self.overlay_origin = self.saved.overlay_position;
+            }
             Action::OverlayEnabled(enabled) => {
                 self.saved.overlay = enabled;
                 self.overlay_open = false;
             }
-            Action::OverlayOpacity(opacity) => self.saved.overlay_opacity = opacity.clamp(OVERLAY_OPACITY_MIN, 1.0),
+            Action::OverlayOpacity(opacity) => self.saved.overlay_opacity = usable_opacity(opacity),
             Action::OverlayMoved(position) => self.saved.overlay_position = Some(position),
+            Action::OverlayResetPosition => {
+                self.saved.overlay_position = None;
+                self.overlay_origin = None;
+            }
             Action::Like(item) => {
                 let liked = !self.saved.liked.iter().any(|known| known.key() == item.key());
                 toggle(&mut self.saved.liked, item.clone());
@@ -1073,10 +1084,6 @@ impl eframe::App for App {
         }
     }
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        egui::Rgba::TRANSPARENT.to_array()
-    }
-
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(program) = &self.restart {
             update::restart(program, &crate::profile_arguments());
@@ -1107,6 +1114,18 @@ fn link_discord(sender: &Sender<Event>, ctx: &egui::Context) -> Discord {
     })
 }
 
+fn overlay_after_toggle(enabled: bool, open: bool) -> bool {
+    enabled && !open
+}
+
+pub fn usable_opacity(opacity: f32) -> f32 {
+    if opacity.is_nan() {
+        OVERLAY_OPACITY_DEFAULT
+    } else {
+        opacity.clamp(OVERLAY_OPACITY_MIN, 1.0)
+    }
+}
+
 fn newer_version(release_url: &str, current: &str) -> Option<String> {
     let numbers = |version: &str| version.split('.').map(|part| part.parse().ok()).collect::<Option<Vec<u32>>>();
     let latest = release_url.rsplit_once("/tag/v")?.1;
@@ -1131,6 +1150,23 @@ fn release_notes(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_overlay_only_opens_when_enabled() {
+        assert!(!overlay_after_toggle(false, false));
+        assert!(overlay_after_toggle(true, false));
+        assert!(!overlay_after_toggle(true, true));
+        assert!(!overlay_after_toggle(false, true));
+    }
+
+    #[test]
+    fn broken_opacity_falls_back_into_range() {
+        assert_eq!(usable_opacity(f32::NAN), OVERLAY_OPACITY_DEFAULT);
+        assert_eq!(usable_opacity(-4.0), OVERLAY_OPACITY_MIN);
+        assert_eq!(usable_opacity(7.0), 1.0);
+        assert_eq!(usable_opacity(f32::INFINITY), 1.0);
+        assert_eq!(usable_opacity(0.5), 0.5);
+    }
 
     #[test]
     fn reads_release_notes_as_plain_lines() {

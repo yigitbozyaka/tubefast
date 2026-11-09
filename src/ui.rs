@@ -1,4 +1,4 @@
-use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, Words};
+use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, Words, usable_opacity};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
@@ -61,8 +61,8 @@ const SETTING_ROW: f32 = 48.0;
 const HOTKEY_ROW: f32 = 56.0;
 const STATUS_ROW: f32 = 26.0;
 const SECTION_GAP: f32 = 32.0;
+const OVERLAY_TITLE: &str = "Tubefast overlay";
 const OVERLAY_WIDTH: f32 = 340.0;
-const OVERLAY_HEIGHT: f32 = 390.0;
 const OVERLAY_HOME: [f32; 2] = [24.0, 24.0];
 const OVERLAY_ROWS: usize = 4;
 const OVERLAY_ROW: f32 = 48.0;
@@ -537,23 +537,24 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     if !(app.saved.overlay && app.overlay_open) {
         return out;
     }
-    let home = app.saved.overlay_position.unwrap_or(OVERLAY_HOME);
+    let home = app.overlay_origin.unwrap_or(OVERLAY_HOME);
+    let saved = app.saved.overlay_position.unwrap_or(OVERLAY_HOME);
     let builder = egui::ViewportBuilder::default()
-        .with_title(format!("{APP_NAME} overlay"))
-        .with_inner_size([OVERLAY_WIDTH, OVERLAY_HEIGHT])
+        .with_title(OVERLAY_TITLE)
+        .with_inner_size([OVERLAY_WIDTH, overlay_height(overlay_rows(app))])
         .with_position(home)
         .with_decorations(false)
-        .with_transparent(true)
         .with_always_on_top()
         .with_taskbar(false)
         .with_resizable(false)
         .with_active(false);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("overlay"), builder, |ctx, _| {
+        style_overlay_window(usable_opacity(app.saved.overlay_opacity));
         egui::CentralPanel::default()
             .frame(Frame::NONE)
             .show(ctx, |ui| overlay_card(app, ui, &mut out));
         let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
-        if let Some(outer) = outer.filter(|outer| (outer.min - pos2(home[0], home[1])).length() > 1.0) {
+        if let Some(outer) = outer.filter(|outer| (outer.min - pos2(saved[0], saved[1])).length() > 1.0) {
             out.push(Action::OverlayMoved([outer.min.x, outer.min.y]));
         }
         if closing {
@@ -563,18 +564,78 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     out
 }
 
-fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
-    let upcoming = app.saved.current.map_or(0, |current| current + 1);
-    let rows = app.saved.queue.len().saturating_sub(upcoming).min(OVERLAY_ROWS);
+#[cfg(windows)]
+fn style_overlay_window(opacity: f32) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE,
+    };
+    let title: Vec<u16> = OVERLAY_TITLE.encode_utf16().chain([0]).collect();
+    unsafe {
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        if window.is_null() {
+            return;
+        }
+        let wanted = (WS_EX_NOACTIVATE | WS_EX_LAYERED) as isize;
+        let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        if style & wanted != wanted {
+            SetWindowLongPtrW(window, GWL_EXSTYLE, style | wanted);
+            let corners = DWMWCP_ROUND;
+            DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE as u32, (&raw const corners).cast(), 4);
+        }
+        SetLayeredWindowAttributes(window, 0, (opacity * 255.0) as u8, LWA_ALPHA);
+    }
+}
+
+#[cfg(not(windows))]
+fn style_overlay_window(_: f32) {}
+
+#[cfg(windows)]
+fn cursor_in_points(ctx: &egui::Context) -> Option<Pos2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut cursor = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut cursor) } != 0).then(|| pos2(cursor.x as f32, cursor.y as f32) / ctx.pixels_per_point())
+}
+
+#[cfg(not(windows))]
+fn cursor_in_points(_: &egui::Context) -> Option<Pos2> {
+    None
+}
+
+fn overlay_upcoming(app: &App) -> usize {
+    app.saved.current.map_or(0, |current| current + 1)
+}
+
+fn overlay_rows(app: &App) -> usize {
+    app.saved.queue.len().saturating_sub(overlay_upcoming(app)).min(OVERLAY_ROWS)
+}
+
+fn overlay_height(rows: usize) -> f32 {
     let queue_height = if rows > 0 { 28.0 + rows as f32 * OVERLAY_ROW } else { 0.0 };
-    let height = 2.0 * OVERLAY_PAD + OVERLAY_ART + 66.0 + queue_height;
+    2.0 * OVERLAY_PAD + OVERLAY_ART + 66.0 + queue_height
+}
+
+fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
+    let upcoming = overlay_upcoming(app);
+    let rows = overlay_rows(app);
+    let height = overlay_height(rows);
     let area = ui.max_rect();
     let card = Rect::from_min_size(area.min, vec2(area.width(), height));
-    let fill = PANEL.gamma_multiply(app.saved.overlay_opacity);
-    ui.painter().rect(card, 16.0, fill, Stroke::new(1.0, veil(0.1)), StrokeKind::Inside);
+    ui.painter().rect(card, 8.0, PANEL, Stroke::new(1.0, veil(0.1)), StrokeKind::Inside);
     let drag = ui.interact(card, Id::new("overlay-drag"), Sense::drag());
-    if drag.drag_started() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    let grip = Id::new("overlay-grip");
+    let outer = ui.ctx().input(|input| input.viewport().outer_rect);
+    if let (true, Some(cursor), Some(outer)) = (drag.drag_started(), cursor_in_points(ui.ctx()), outer) {
+        ui.data_mut(|data| data.insert_temp(grip, cursor - outer.min));
+    }
+    if let (true, Some(cursor), Some(offset)) = (
+        drag.dragged(),
+        cursor_in_points(ui.ctx()),
+        ui.data(|data| data.get_temp::<Vec2>(grip)),
+    ) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(cursor - offset));
     }
     let inner = card.shrink(OVERLAY_PAD);
     let close = Rect::from_center_size(pos2(inner.right() - 12.0, inner.top() + 12.0), Vec2::splat(28.0));
@@ -2000,11 +2061,22 @@ fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
         }
         let on = ui.ctx().animate_bool_with_time(Id::new("overlay-on"), app.saved.overlay, 0.16);
         ui.multiply_opacity(egui::lerp(0.4..=1.0, on));
-        if let Some(opacity) = slider_row(ui, size, icon::CIRCLE_HALF, "Opacity", app.saved.overlay_opacity, app.saved.overlay) {
+        if let Some(opacity) = slider_row(
+            ui,
+            size,
+            icon::CIRCLE_HALF,
+            "Opacity",
+            usable_opacity(app.saved.overlay_opacity),
+            app.saved.overlay,
+        ) {
             out.push(Action::OverlayOpacity(opacity));
         }
     });
-    let text = "Opens over windowed and borderless games with the Show / hide overlay hotkey. Drag it to move it.";
+    let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
+    if app.saved.overlay_position.is_some() && text_button(ui, reset_at, Id::new("overlay-reset"), "Reset position").clicked() {
+        out.push(Action::OverlayResetPosition);
+    }
+    let text = "Opens with the Show / hide overlay hotkey, which needs global hotkeys on. Drag it to move it.";
     let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
     label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
 }
