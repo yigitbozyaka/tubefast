@@ -2,6 +2,7 @@ use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
+use crate::tray;
 use crate::ytm::{Item, Layout};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
@@ -1800,6 +1801,18 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
 }
 
+fn window_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    if !tray::SUPPORTED {
+        return;
+    }
+    section(ui, "Window", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(ui, size, icon::APP_WINDOW, "Minimize to tray on close", app.saved.hide_on_close) {
+            out.push(Action::HideOnClose(!app.saved.hide_on_close));
+        }
+    });
+}
+
 fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     let full = ui.available_width();
     let width = full.min(SETTINGS_WIDTH);
@@ -1809,6 +1822,7 @@ fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     label(ui, at, Align2::LEFT_BOTTOM, "Settings", display(40.0), TEXT, width);
     discord_section(ui, app, out);
     hotkey_section(ui, app, out);
+    window_section(ui, app, out);
 }
 
 fn nav_item(ui: &mut Ui, symbol: &str, text: &str, active: bool, trailing: &str) -> Response {

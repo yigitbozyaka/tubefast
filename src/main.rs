@@ -9,6 +9,7 @@ mod media;
 mod opus;
 mod playback;
 mod player;
+mod tray;
 mod ui;
 mod update;
 mod ytm;

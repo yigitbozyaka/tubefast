@@ -1,2 +1,3 @@
 - Repeat and the next song keep working while the window is minimized, also on Linux with Wayland
 - After an update, a small card at the bottom left shows what is new
+- Settings can send Tubefast to the system tray when you close the window (Windows)
