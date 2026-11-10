@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub const SUPPORTED: bool = cfg!(windows);
 static QUITTING: AtomicBool = AtomicBool::new(false);
 
 pub fn quitting() -> bool {
@@ -236,12 +235,13 @@ mod native {
 
 #[cfg(windows)]
 impl Tray {
-    pub fn start(window: isize, wake: impl Fn() + Send + 'static) -> Option<Self> {
+    pub fn start(window: isize, ctx: eframe::egui::Context) -> Option<Self> {
         use windows_sys::Win32::System::Threading::GetCurrentThreadId;
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG};
 
         let (ready, started) = std::sync::mpsc::channel();
         let (done, finished) = std::sync::mpsc::channel();
+        let wake = move || ctx.request_repaint();
         std::thread::Builder::new()
             .name("tray".into())
             .spawn(move || unsafe {
@@ -287,15 +287,100 @@ impl Drop for Tray {
 }
 
 #[cfg(not(windows))]
-pub struct Tray;
+const SHOW_ID: &str = "show";
+#[cfg(not(windows))]
+const QUIT_ID: &str = "quit";
+
+#[cfg(not(windows))]
+pub struct Tray {
+    _icon: tray_icon::TrayIcon,
+    ctx: eframe::egui::Context,
+    minimize_only: bool,
+}
+
+#[cfg(not(windows))]
+fn reveal(ctx: &eframe::egui::Context) {
+    use eframe::egui::ViewportCommand;
+    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(ViewportCommand::Focus);
+    ctx.request_repaint();
+}
+
+#[cfg(not(windows))]
+fn quit(ctx: &eframe::egui::Context) {
+    begin_quit();
+    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+    ctx.request_repaint();
+}
+
+#[cfg(not(windows))]
+fn on_wayland() -> bool {
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
+    std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11
+}
 
 #[cfg(not(windows))]
 impl Tray {
-    pub fn start(_: isize, _: impl Fn() + Send + 'static) -> Option<Self> {
-        None
+    pub fn start(_: isize, ctx: eframe::egui::Context) -> Option<Self> {
+        use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+        use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+        let menu = Menu::new();
+        menu.append_items(&[
+            &MenuItem::with_id(SHOW_ID, "Show Tubefast", true, None),
+            &MenuItem::with_id(QUIT_ID, "Quit", true, None),
+        ])
+        .ok()?;
+        let art = crate::ui::app_icon();
+        let icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_menu_on_left_click(false)
+            .with_tooltip(crate::APP_NAME)
+            .with_icon(Icon::from_rgba(art.rgba, art.width, art.height).ok()?)
+            .build()
+            .ok()?;
+        let menu_ctx = ctx.clone();
+        MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.as_ref() {
+            SHOW_ID => reveal(&menu_ctx),
+            QUIT_ID => quit(&menu_ctx),
+            _ => {}
+        }));
+        let click_ctx = ctx.clone();
+        TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal(&click_ctx);
+            }
+        }));
+        Some(Self {
+            _icon: icon,
+            ctx,
+            minimize_only: on_wayland(),
+        })
     }
 
-    pub fn hide(&self) {}
+    pub fn hide(&self) {
+        use eframe::egui::ViewportCommand;
+        let command = if self.minimize_only {
+            ViewportCommand::Minimized(true)
+        } else {
+            ViewportCommand::Visible(false)
+        };
+        self.ctx.send_viewport_cmd(command);
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for Tray {
+    fn drop(&mut self) {
+        tray_icon::menu::MenuEvent::set_event_handler(None::<fn(tray_icon::menu::MenuEvent)>);
+        tray_icon::TrayIconEvent::set_event_handler(None::<fn(tray_icon::TrayIconEvent)>);
+    }
 }
 
 #[cfg(test)]

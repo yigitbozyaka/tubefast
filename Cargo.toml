@@ -35,12 +35,14 @@ block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "NSData", "NSDictionary", "NSGeometry", "NSString", "NSValue"] }
+tray-icon = { version = "0.26", default-features = false }
 objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 async-channel = "2"
 futures-lite = "2"
 mpris-server = "0.10"
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 
 [profile.release]
 lto = "fat"
