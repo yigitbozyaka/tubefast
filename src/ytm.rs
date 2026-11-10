@@ -113,6 +113,7 @@ pub struct Section {
     pub layout: Layout,
     pub items: Vec<Item>,
     pub all: Option<Target>,
+    pub brief: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -394,6 +395,7 @@ impl Client {
                                     layout: Layout::Compact,
                                     items,
                                     all: None,
+                                    brief: None,
                                 }],
                             );
                         }
@@ -952,6 +954,7 @@ fn collect(node: &Value, page: &mut Page) {
                             layout: Layout::Tracks,
                             items: Vec::new(),
                             all: None,
+                            brief: None,
                         });
                     }
                     page.sections.last_mut().unwrap().items.extend(item(child));
@@ -998,7 +1001,13 @@ fn shelf(kind: &str, node: &Value) -> Section {
         "musicShelfRenderer" => target(node, "/bottomEndpoint").or_else(|| target(node, "/title/runs/0/navigationEndpoint")),
         _ => None,
     };
-    Section { title, layout, items, all }
+    Section {
+        title,
+        layout,
+        items,
+        all,
+        brief: None,
+    }
 }
 
 fn target(node: &Value, endpoint: &str) -> Option<Target> {
