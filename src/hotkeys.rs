@@ -240,10 +240,17 @@ impl Drop for Hotkeys {
     }
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+mod portal;
+
 #[cfg(not(windows))]
-pub struct Hotkeys {
-    manager: global_hotkey::GlobalHotKeyManager,
-    registered: Vec<global_hotkey::hotkey::HotKey>,
+pub enum Hotkeys {
+    Grabbed {
+        manager: global_hotkey::GlobalHotKeyManager,
+        registered: Vec<global_hotkey::hotkey::HotKey>,
+    },
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Portal(#[allow(dead_code)] async_channel::Sender<()>),
 }
 
 #[cfg(not(windows))]
@@ -280,13 +287,44 @@ fn hotkey_of(combo: Combo) -> Option<global_hotkey::hotkey::HotKey> {
 }
 
 #[cfg(not(windows))]
-pub fn unavailable() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        return None;
-    }
+fn wayland_session() -> bool {
     let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11 {
-        Some("Wayland does not let apps listen for keys in the background. Log in with an X11 session to use them")
+    std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn through_portal() -> bool {
+    wayland_session() && !portal::refused()
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn through_portal() -> bool {
+    false
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn portal_trigger(command: Command) -> Option<String> {
+    portal::trigger(command)
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn portal_trigger(_: Command) -> Option<String> {
+    None
+}
+
+pub fn listed() -> Vec<Command> {
+    Command::ALL
+        .into_iter()
+        .filter(|command| !(through_portal() && *command == Command::Overlay))
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn unavailable() -> Option<&'static str> {
+    if cfg!(target_os = "macos") || through_portal() {
+        None
+    } else if wayland_session() {
+        Some("This desktop's global shortcuts portal is missing or refused Tubefast, so Wayland cannot listen for keys")
     } else if std::env::var_os("DISPLAY").is_none() {
         Some("No X11 display was found")
     } else {
@@ -306,6 +344,10 @@ impl Hotkeys {
 
         if unavailable().is_some() {
             return None;
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if through_portal() {
+            return Some((Self::Portal(portal::start(bindings, press)?), Vec::new()));
         }
         let manager = GlobalHotKeyManager::new().ok()?;
         let (mut registered, mut taken, mut commands) = (Vec::new(), Vec::new(), Vec::new());
@@ -329,15 +371,17 @@ impl Hotkeys {
                 press(*command);
             }
         }));
-        Some((Self { manager, registered }, taken))
+        Some((Self::Grabbed { manager, registered }, taken))
     }
 }
 
 #[cfg(not(windows))]
 impl Drop for Hotkeys {
     fn drop(&mut self) {
-        global_hotkey::GlobalHotKeyEvent::set_event_handler(None::<fn(global_hotkey::GlobalHotKeyEvent)>);
-        let _ = self.manager.unregister_all(&self.registered);
+        if let Self::Grabbed { manager, registered } = self {
+            global_hotkey::GlobalHotKeyEvent::set_event_handler(None::<fn(global_hotkey::GlobalHotKeyEvent)>);
+            let _ = manager.unregister_all(registered);
+        }
     }
 }
 

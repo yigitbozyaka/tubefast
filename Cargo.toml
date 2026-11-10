@@ -41,6 +41,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-media-player = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "MPMediaItem", "MPNowPlayingInfoCenter", "MPRemoteCommand", "MPRemoteCommandCenter", "MPRemoteCommandEvent"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+ashpd = { version = "0.12", default-features = false, features = ["async-std"] }
 async-channel = "2"
 futures-lite = "2"
 mpris-server = "0.10"
