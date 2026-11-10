@@ -24,7 +24,13 @@ pub fn window_of(cc: &eframe::CreationContext<'_>) -> isize {
 }
 
 #[cfg(not(windows))]
-pub fn window_of(_: &eframe::CreationContext<'_>) -> isize {
+static ON_WAYLAND: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(windows))]
+pub fn window_of(cc: &eframe::CreationContext<'_>) -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let wayland = matches!(cc.window_handle().map(|handle| handle.as_raw()), Ok(RawWindowHandle::Wayland(_)));
+    ON_WAYLAND.store(wayland, Ordering::SeqCst);
     0
 }
 
@@ -316,8 +322,7 @@ fn quit(ctx: &eframe::egui::Context) {
 
 #[cfg(not(windows))]
 fn on_wayland() -> bool {
-    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
-    std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11
+    ON_WAYLAND.load(Ordering::SeqCst)
 }
 
 #[cfg(not(windows))]
