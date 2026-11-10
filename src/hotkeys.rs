@@ -7,7 +7,6 @@ use std::fmt;
 pub const ALT: u8 = 1;
 pub const CTRL: u8 = 2;
 pub const SHIFT: u8 = 4;
-pub const SUPPORTED: bool = cfg!(windows);
 pub const COUNT: usize = 6;
 const VOLUME_STEP: f32 = 0.05;
 

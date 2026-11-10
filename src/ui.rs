@@ -548,14 +548,18 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
         .with_position(home)
         .with_decorations(false)
         .with_always_on_top()
+        .with_transparent(!cfg!(windows))
         .with_taskbar(false)
         .with_resizable(false)
         .with_active(false);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("overlay"), builder, |ctx, _| {
         style_overlay_window(ctx, usable_opacity(app.saved.overlay_opacity));
-        egui::CentralPanel::default()
-            .frame(Frame::NONE)
-            .show(ctx, |ui| overlay_card(app, ui, &mut out));
+        egui::CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+            if !cfg!(windows) {
+                ui.multiply_opacity(usable_opacity(app.saved.overlay_opacity));
+            }
+            overlay_card(app, ui, &mut out);
+        });
         let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
         let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
         if app.overlay_snapping {
@@ -679,6 +683,9 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let drag = ui.interact(card, Id::new("overlay-drag"), Sense::drag());
     let grip = Id::new("overlay-grip");
     let outer = ui.ctx().input(|input| input.viewport().outer_rect);
+    if drag.drag_started() && !cfg!(windows) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
     if let (true, Some(cursor), Some(outer)) = (drag.drag_started(), cursor_in_points(ui.ctx()), outer) {
         ui.data_mut(|data| data.insert_temp(grip, cursor - outer.min));
     }
@@ -2166,8 +2173,22 @@ fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, ena
     Some(egui::lerp(OVERLAY_OPACITY_MIN..=1.0, fraction))
 }
 
+fn overlay_unavailable() -> Option<&'static str> {
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
+    let on_wayland = cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11;
+    on_wayland.then_some("Wayland does not let apps stay on top of other windows, so the overlay needs an X11 session")
+}
+
 fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    if !hotkeys::SUPPORTED {
+    if let Some(reason) = overlay_unavailable() {
+        section(ui, "Overlay", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), SETTING_ROW), Sense::hover());
+            let at = pos2(row.left() + 22.0, row.center().y);
+            ui.painter()
+                .text(at, Align2::CENTER_CENTER, icon::PICTURE_IN_PICTURE, glyph(17.0), MUTED);
+            let at = pos2(row.left() + 46.0, row.center().y);
+            label(ui, at, Align2::LEFT_CENTER, reason, medium(13.5), MUTED, row.width() - 58.0);
+        });
         return;
     }
     let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
