@@ -832,8 +832,7 @@ impl App {
         if !self.saved.hide_on_close {
             return;
         }
-        let ctx = self.ctx.clone();
-        self.tray = Tray::start(self.window, move || ctx.request_repaint());
+        self.tray = Tray::start(self.window, self.ctx.clone());
     }
 
     fn set_recording(&mut self, command: Option<Command>) {
@@ -1117,6 +1116,14 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
+        if cfg!(windows) {
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
+        } else {
+            egui::Color32::TRANSPARENT.to_normalized_gamma_f32()
+        }
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|input| input.viewport().close_requested()) && tray::hides_on_close(self.tray.is_some(), tray::quitting()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

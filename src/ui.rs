@@ -2,7 +2,6 @@ use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, 
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
-use crate::tray;
 use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
@@ -549,14 +548,18 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
         .with_position(home)
         .with_decorations(false)
         .with_always_on_top()
+        .with_transparent(!cfg!(windows))
         .with_taskbar(false)
         .with_resizable(false)
         .with_active(false);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("overlay"), builder, |ctx, _| {
         style_overlay_window(ctx, usable_opacity(app.saved.overlay_opacity));
-        egui::CentralPanel::default()
-            .frame(Frame::NONE)
-            .show(ctx, |ui| overlay_card(app, ui, &mut out));
+        egui::CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+            if !cfg!(windows) {
+                ui.multiply_opacity(usable_opacity(app.saved.overlay_opacity));
+            }
+            overlay_card(app, ui, &mut out);
+        });
         let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
         let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
         if app.overlay_snapping {
@@ -680,6 +683,9 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let drag = ui.interact(card, Id::new("overlay-drag"), Sense::drag());
     let grip = Id::new("overlay-grip");
     let outer = ui.ctx().input(|input| input.viewport().outer_rect);
+    if drag.drag_started() && !cfg!(windows) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
     if let (true, Some(cursor), Some(outer)) = (drag.drag_started(), cursor_in_points(ui.ctx()), outer) {
         ui.data_mut(|data| data.insert_temp(grip, cursor - outer.min));
     }
@@ -1951,11 +1957,12 @@ fn keycaps(ui: &Ui, right_center: Pos2, parts: &[String], tint: Color32) -> f32 
 }
 
 fn hotkey_row(ui: &mut Ui, app: &App, command: Command, enabled: bool, out: &mut Vec<Action>) {
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let portal = hotkeys::through_portal();
+    let sense = if enabled && !portal { Sense::click() } else { Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), HOTKEY_ROW), sense);
     let recording = app.recording == Some(command);
     let taken = app.hotkey_taken.contains(&command);
-    let hover = if enabled { hover_of(ui, &response) } else { 0.0 };
+    let hover = if enabled && !portal { hover_of(ui, &response) } else { 0.0 };
     let lit = ui
         .ctx()
         .animate_bool_with_time(response.id.with("recording"), recording, HOVER_TIME);
@@ -1974,6 +1981,10 @@ fn hotkey_row(ui: &mut Ui, app: &App, command: Command, enabled: bool, out: &mut
         .text(pos2(rect.left() + 22.0, middle), Align2::CENTER_CENTER, symbol, glyph(17.0), tone);
     let edge = pos2(rect.right() - 14.0, middle);
     let caps_left = match (recording, app.saved.hotkey_combos[command as usize]) {
+        _ if portal => match hotkeys::portal_trigger(command) {
+            Some(trigger) => keycaps(ui, edge, &trigger.split('+').map(str::to_owned).collect::<Vec<_>>(), TEXT),
+            None => label(ui, edge, Align2::RIGHT_CENTER, "Set in system settings", sans(13.0), FAINT, 160.0).left(),
+        },
         (true, _) => keycaps(ui, edge, &["Press keys\u{2026}".to_owned()], ACCENT),
         (false, Some(combo)) => keycaps(ui, edge, &combo.parts(), TEXT),
         (false, None) => label(ui, edge, Align2::RIGHT_CENTER, "Not set", sans(13.0), FAINT, 120.0).left(),
@@ -2066,21 +2077,21 @@ fn discord_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
 }
 
 fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    let rows = if hotkeys::SUPPORTED {
-        Command::ALL.len() as f32 * HOTKEY_ROW
+    let unavailable = hotkeys::unavailable();
+    let rows = if unavailable.is_none() {
+        hotkeys::listed().len() as f32 * HOTKEY_ROW
     } else {
         0.0
     };
     let height = 2.0 * CARD_PAD + SETTING_ROW + rows;
     let card = section(ui, "Global hotkeys", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
-        if !hotkeys::SUPPORTED {
+        if let Some(reason) = unavailable {
             let (row, _) = ui.allocate_exact_size(size, Sense::hover());
             let at = pos2(row.left() + 22.0, row.center().y);
             ui.painter().text(at, Align2::CENTER_CENTER, icon::KEYBOARD, glyph(17.0), MUTED);
-            let text = "Global hotkeys are only available on Windows for now";
             let at = pos2(row.left() + 46.0, row.center().y);
-            label(ui, at, Align2::LEFT_CENTER, text, medium(13.5), MUTED, size.x - 58.0);
+            label(ui, at, Align2::LEFT_CENTER, reason, medium(13.5), MUTED, size.x - 58.0);
             return;
         }
         if switch_row(ui, size, icon::KEYBOARD, "Enable global hotkeys", app.saved.hotkeys) {
@@ -2088,28 +2099,30 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
         }
         let on = ui.ctx().animate_bool_with_time(Id::new("hotkeys-on"), app.saved.hotkeys, 0.16);
         ui.multiply_opacity(egui::lerp(0.4..=1.0, on));
-        for command in Command::ALL {
+        for command in hotkeys::listed() {
             hotkey_row(ui, app, command, app.saved.hotkeys, out);
         }
     });
-    if !hotkeys::SUPPORTED {
+    if unavailable.is_some() {
         return;
     }
     let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
-    if app.saved.hotkey_combos != hotkeys::standard_combos()
+    if !hotkeys::through_portal()
+        && app.saved.hotkey_combos != hotkeys::standard_combos()
         && text_button(ui, reset_at, Id::new("hotkeys-reset"), "Reset to defaults").clicked()
     {
         out.push(Action::ResetHotkeys);
     }
-    let text = "Hotkeys keep working while Tubefast is minimized. Each one needs Ctrl, Alt or Shift.";
+    let text = if hotkeys::through_portal() {
+        "The keys are chosen in your desktop's system settings, under Shortcuts. Hotkeys keep working while Tubefast is minimized."
+    } else {
+        "Hotkeys keep working while Tubefast is minimized. Each one needs Ctrl, Alt or Shift."
+    };
     let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
     label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
 }
 
 fn window_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    if !tray::SUPPORTED {
-        return;
-    }
     section(ui, "Window", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
         if switch_row(ui, size, icon::APP_WINDOW, "Minimize to tray on close", app.saved.hide_on_close) {
@@ -2160,8 +2173,22 @@ fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, ena
     Some(egui::lerp(OVERLAY_OPACITY_MIN..=1.0, fraction))
 }
 
+fn overlay_unavailable() -> Option<&'static str> {
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
+    let on_wayland = cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11;
+    on_wayland.then_some("Wayland does not let apps stay on top of other windows, so the overlay needs an X11 session")
+}
+
 fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    if !hotkeys::SUPPORTED {
+    if let Some(reason) = overlay_unavailable() {
+        section(ui, "Overlay", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), SETTING_ROW), Sense::hover());
+            let at = pos2(row.left() + 22.0, row.center().y);
+            ui.painter()
+                .text(at, Align2::CENTER_CENTER, icon::PICTURE_IN_PICTURE, glyph(17.0), MUTED);
+            let at = pos2(row.left() + 46.0, row.center().y);
+            label(ui, at, Align2::LEFT_CENTER, reason, medium(13.5), MUTED, row.width() - 58.0);
+        });
         return;
     }
     let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
