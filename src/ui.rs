@@ -2167,7 +2167,24 @@ fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, ena
     Some(egui::lerp(OVERLAY_OPACITY_MIN..=1.0, fraction))
 }
 
+fn overlay_unavailable() -> Option<&'static str> {
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
+    let on_wayland = cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11;
+    on_wayland.then_some("Wayland does not let apps stay on top of other windows, so the overlay needs an X11 session")
+}
+
 fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    if let Some(reason) = overlay_unavailable() {
+        section(ui, "Overlay", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), SETTING_ROW), Sense::hover());
+            let at = pos2(row.left() + 22.0, row.center().y);
+            ui.painter()
+                .text(at, Align2::CENTER_CENTER, icon::PICTURE_IN_PICTURE, glyph(17.0), MUTED);
+            let at = pos2(row.left() + 46.0, row.center().y);
+            label(ui, at, Align2::LEFT_CENTER, reason, medium(13.5), MUTED, row.width() - 58.0);
+        });
+        return;
+    }
     let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
     let card = section(ui, "Overlay", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
