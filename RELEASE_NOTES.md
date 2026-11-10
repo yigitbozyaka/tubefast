@@ -5,3 +5,4 @@
 - A media overlay opens over windowed and borderless games with Ctrl+Alt+O. Turn on global hotkeys and the overlay in Settings, choose what it shows, drag it to move it. It cannot draw over exclusive fullscreen
 - Global hotkeys now work on macOS and on Linux, with X11 or with Wayland through the desktop's shortcuts portal, where the keys are set in the system settings
 - The media overlay also works on macOS and on Linux with X11. On Wayland it is not available
+- Updating from inside Tubefast now works on Linux (AppImage or a binary in a folder you can write to) and on macOS too
