@@ -2518,18 +2518,18 @@ fn sign_in_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
             ui.add_space(12.0);
             paragraph(
                 ui,
-                "Opens a separate Edge or Chrome window. Sign in to Google there and it closes by itself.",
+                "Opens a separate Chrome, Edge, Brave, Firefox or a similar browser window. Sign in to Google there and it closes by itself.",
                 sans(13.0),
                 MUTED,
                 3,
             );
             ui.add_space(22.0);
 
-            eyebrow(ui, "Or paste your cookie", 0.0);
+            eyebrow(ui, "Or paste your cookie (harder)", 0.0);
             let steps = [
-                "1.  Open music.youtube.com in your browser and sign in.",
+                "1.  Open a private window, go to music.youtube.com and sign in.",
                 "2.  Press F12, open Network and click a request to music.youtube.com.",
-                "3.  Copy the whole cookie value under Request Headers and paste it here.",
+                "3.  Copy the whole cookie value under Request Headers, paste it here, then close that window without signing out.",
             ];
             for step in steps {
                 paragraph(ui, step, sans(13.0), MUTED, 2);
@@ -2586,6 +2586,115 @@ fn sign_in_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
         });
     if modal.inner || modal.should_close() {
         out.push(Action::CloseSignIn);
+    }
+    browser_picker(app, ctx, out);
+}
+
+fn browser_picker(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
+    let Some(sign_in) = app.sign_in.as_ref().filter(|sign_in| sign_in.picking) else {
+        return;
+    };
+    let frame = Frame::new()
+        .fill(rgb(0x15161A))
+        .stroke(Stroke::new(1.0, veil(0.08)))
+        .corner_radius(18)
+        .inner_margin(Margin::same(26));
+    let modal = egui::Modal::new(Id::new("browser-picker"))
+        .frame(frame)
+        .backdrop_color(shade(0.5))
+        .show(ctx, |ui| {
+            ui.set_width(340.0);
+            let width = ui.available_width();
+            let (head, _) = ui.allocate_exact_size(vec2(width, 40.0), Sense::hover());
+            ui.painter()
+                .text(head.left_center(), Align2::LEFT_CENTER, "Choose a browser", display(30.0), TEXT);
+            let slot = Rect::from_center_size(pos2(head.right() - 16.0, head.center().y), Vec2::splat(34.0));
+            let closed = icon_button(ui, slot, Id::new("browser-picker-close"), icon::X, glyph(16.0), MUTED, "Close").clicked();
+            ui.add_space(16.0);
+            for (index, browser) in sign_in.browsers.iter().enumerate() {
+                let (row, _) = ui.allocate_exact_size(vec2(width, 56.0), Sense::hover());
+                let last_used = browser.name == app.saved.browser;
+                if browser_tile(ui, row.min, width, browser.name, last_used).clicked() {
+                    out.push(Action::PickBrowser(index));
+                }
+                ui.add_space(8.0);
+            }
+            closed
+        });
+    if modal.inner || modal.should_close() {
+        out.push(Action::ClosePicker);
+    }
+}
+
+fn browser_tile(ui: &Ui, at: Pos2, width: f32, name: &str, last_used: bool) -> Response {
+    let rect = Rect::from_min_size(at, vec2(width, 56.0));
+    let response = ui.interact(rect, Id::new(("browser-tile", name)), Sense::click());
+    let hover = hover_of(ui, &response);
+    let body = if response.is_pointer_button_down_on() {
+        rect.shrink(1.0)
+    } else {
+        rect
+    };
+    ui.painter().rect_filled(body, 14.0, veil(0.06 + 0.06 * hover));
+    let logo = Rect::from_center_size(pos2(rect.left() + 32.0, rect.center().y), Vec2::splat(28.0));
+    browser_logo(ui, name, logo, TEXT);
+    label(
+        ui,
+        pos2(rect.left() + 62.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        name,
+        medium(14.5),
+        TEXT,
+        width - 170.0,
+    );
+    if last_used {
+        label(
+            ui,
+            pos2(rect.right() - 18.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            "Last used",
+            sans(12.0),
+            MUTED,
+            90.0,
+        );
+    }
+    describe(&response, name);
+    response
+}
+
+fn logo_bytes(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "Chrome" => include_bytes!("../assets/browsers/chrome.png"),
+        "Brave" => include_bytes!("../assets/browsers/brave.png"),
+        "Opera GX" => include_bytes!("../assets/browsers/operagx.png"),
+        "Firefox" => include_bytes!("../assets/browsers/firefox.png"),
+        "LibreWolf" => include_bytes!("../assets/browsers/librewolf.png"),
+        "Zen" => include_bytes!("../assets/browsers/zen.png"),
+        "Floorp" => include_bytes!("../assets/browsers/floorp.png"),
+        _ => return None,
+    })
+}
+
+fn browser_logo(ui: &Ui, name: &str, rect: Rect, ink: Color32) {
+    let key = Id::new(("browser-logo", name));
+    let cached = ui.ctx().data(|data| data.get_temp::<egui::TextureHandle>(key));
+    let texture = cached.or_else(|| {
+        let decoded = image::load_from_memory(logo_bytes(name)?).ok()?.to_rgba8();
+        let size = [decoded.width() as usize, decoded.height() as usize];
+        let handle = ui.ctx().load_texture(
+            name,
+            egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw()),
+            egui::TextureOptions::LINEAR,
+        );
+        ui.ctx().data_mut(|data| data.insert_temp(key, handle.clone()));
+        Some(handle)
+    });
+    match texture {
+        Some(texture) => egui::Image::from_texture((texture.id(), rect.size())).tint(ink).paint_at(ui, rect),
+        None => drop(
+            ui.painter()
+                .text(rect.center(), Align2::CENTER_CENTER, icon::GLOBE, solid(24.0), ink),
+        ),
     }
 }
 

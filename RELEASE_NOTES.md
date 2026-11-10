@@ -6,3 +6,5 @@
 - Global hotkeys now work on macOS and on Linux, with X11 or with Wayland through the desktop's shortcuts portal, where the keys are set in the system settings
 - The media overlay also works on macOS and on Linux with X11. On Wayland it is not available
 - Updating from inside Tubefast now works on Linux (AppImage or a binary in a folder you can write to) and on macOS too
+- Sign in with Firefox, LibreWolf, Zen, Waterfox or Floorp as well as Chrome, Edge, Brave and Opera GX. With more than one browser installed, Continue in browser lets you pick one and remembers it
+- Your sign-in now keeps up with the cookies YouTube refreshes, which should stop the random sign-outs. Pasted cookies are checked for the session cookies they need, and the paste steps and the expired sign-in message are clearer
