@@ -36,13 +36,15 @@ Numbers are from the release build on Windows 11. Memory is the working set a fe
 
 | | |
 |---|---|
-| **Search and browse** | Results appear as you type. Artist, album and playlist pages, with back and forward history. |
+| **Search and browse** | Results appear as you type. Artist, album and playlist pages, with back and forward history. On an artist page, **Show all** loads the full list of top songs, albums and singles and EPs. |
 | **A queue that keeps going** | Play an album or a single song. When the queue runs out, a radio based on the last track continues it. Shuffle and repeat included. |
 | **A queue you cannot lose** | Close the app and the queue, the track and the position are still there next time. Replace a queue you built by accident and **Undo** brings it back. Drag a row to reorder what plays next. |
-| **Now playing and lyrics** | Click the cover or the title in the bar for a full-window view of the track. Its lyrics tab follows the song line by line when YouTube Music has timed lyrics, looks for them on [lrclib.net](https://lrclib.net) when it does not, and shows plain text when neither has them. |
+| **Now playing and lyrics** | Click the cover or the title in the bar for a full-window view of the track. Its lyrics tab follows the song line by line when YouTube Music has timed lyrics, looks for them on [lrclib.net](https://lrclib.net) when it does not, and shows plain text when neither has them. Korean and Russian lyrics can show an approximate romanized line under each line, with a switch in the lyrics panel. |
 | **Updates itself** | When a new version is out, Tubefast tells you and installs it with one click, then restarts with your queue where it was. |
 | **Media keys** | Play, pause, next and previous keys work from any window, and the track shows up in the Windows media overlay in Now Playing on macOS and in the Linux desktop's media controls (MPRIS), with its cover and progress. |
-| **Global hotkeys** | On Windows, turn on **Global hotkeys** in Settings and play, pause, skip and change Tubefast's volume while a game or any other app has focus. Every shortcut can be changed or cleared, and a shortcut another app already holds is marked. They go straight to Tubefast, so other media players do not get in the way. Off until you turn it on. |
+| **Global hotkeys** | On Windows, turn on **Global hotkeys** in Settings and play, pause, skip, change Tubefast's volume and open the media overlay while a game or any other app has focus. Every shortcut can be changed or cleared, and a shortcut another app already holds is marked. They go straight to Tubefast, so other media players do not get in the way. Off until you turn it on. |
+| **Media overlay** | On Windows, with **Global hotkeys** turned on in Settings, press `Ctrl` + `Alt` + `O` (changeable there) to open an always on top overlay with the current song, playback controls and the next songs in the queue. It does not take focus from your game. Opacity, position, playback controls and next up can each be changed or hidden in Settings. It works over windowed and borderless games, not exclusive fullscreen. |
+| **Minimize to tray** | On Windows, turn on **Minimize to tray on close** under Settings > Window and closing the window sends Tubefast to the tray. Music keeps playing and global hotkeys keep working. Left click the tray icon to bring it back, right click for Show and Quit. |
 | **Discord status** | Turn on **Show on Discord** in Settings (the gear at the bottom of the sidebar) and your Discord profile shows the song you are listening to, with its artist, cover and progress. The same section picks what the short status next to your name says: Tubefast, the artist, the song or a text of your own. It is off until you turn it on. |
 | **A home feed that knows you** | Signed out, the feed is built from what you played here. Signed in, you get your own YouTube Music feed and playlists. |
 | **Your library, kept locally** | Liked songs, listening history and saved albums, playlists and artists live on your computer. |
@@ -126,6 +128,7 @@ Your session never leaves your computer. It is stored in your user profile, encr
 | Media keys | Play or pause, next, previous, from any window |
 | `Alt` + `←` / `Alt` + `→` | Back / forward |
 | `F5` or `Ctrl` + `R` | Reload the page |
+| `Ctrl` + `Alt` + `O` | Show or hide the media overlay (Windows, needs Global hotkeys turned on in Settings, can be changed there) |
 
 Right-click a track, or use the **⋯** button on a row, for play next, add to queue, like, go to artist and go to album.
 
@@ -170,7 +173,7 @@ On Linux, install the ALSA headers first (`sudo apt install libasound2-dev` on D
 
 ## Not there yet
 
-A tray icon, syncing likes back to your account, a light theme, an installer, a notarized macOS build, and Flathub and AUR packages. Pull requests for any of these are welcome.
+Syncing likes back to your account, a light theme, an installer, a notarized macOS build, and Flathub and AUR packages. Pull requests for any of these are welcome.
 
 ## Acknowledgements
 
