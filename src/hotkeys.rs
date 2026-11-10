@@ -378,9 +378,13 @@ impl Hotkeys {
 #[cfg(not(windows))]
 impl Drop for Hotkeys {
     fn drop(&mut self) {
-        if let Self::Grabbed { manager, registered } = self {
-            global_hotkey::GlobalHotKeyEvent::set_event_handler(None::<fn(global_hotkey::GlobalHotKeyEvent)>);
-            let _ = manager.unregister_all(registered);
+        match self {
+            Self::Grabbed { manager, registered } => {
+                global_hotkey::GlobalHotKeyEvent::set_event_handler(None::<fn(global_hotkey::GlobalHotKeyEvent)>);
+                let _ = manager.unregister_all(registered);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::Portal(_) => {}
         }
     }
 }
