@@ -4,4 +4,4 @@
 - A single failed YouTube request no longer signs you out, and a second Tubefast window can no longer erase your sign-in
 - Korean and Russian lyrics can show an approximate romanized line under each line, turned on with the switch in the lyrics panel. It follows standard sound rules without a dictionary, so some words, such as compounds, may be off
 - Settings can send Tubefast to the system tray when you close the window (Windows)
-- A media overlay opens over windowed and borderless games with Ctrl+Alt+O (Windows). Turn on global hotkeys and the overlay in Settings, drag it to move it. It cannot draw over exclusive fullscreen
+- A media overlay opens over windowed and borderless games with Ctrl+Alt+O (Windows). Turn on global hotkeys and the overlay in Settings, choose what it shows, drag it to move it. It cannot draw over exclusive fullscreen
