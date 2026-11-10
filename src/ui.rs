@@ -406,6 +406,7 @@ struct Cx<'a> {
     paused: bool,
     liked: &'a [Item],
     single: bool,
+    loading_sections: Vec<usize>,
     out: &'a mut Vec<Action>,
 }
 
@@ -1287,7 +1288,7 @@ fn grid(ui: &mut Ui, count: usize, columns: usize, cell: Vec2, gap: Vec2, mut pa
     }
 }
 
-fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: bool, fetchable: bool) -> bool {
+fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: bool, fetchable: bool, loading: bool) -> bool {
     let (title, layout, items) = (section.title.as_str(), section.layout, section.items.as_slice());
     let width = ui.available_width();
     let (cards, card_width) = columns(width, CARD_MIN, CARD_GAP);
@@ -1295,7 +1296,7 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: b
     let visible = match layout {
         Layout::Cards => cards,
         Layout::Compact => cells * COMPACT_ROWS,
-        Layout::Tracks | Layout::Top => usize::MAX,
+        Layout::Tracks | Layout::Top => section.brief.unwrap_or(usize::MAX),
     };
     let remote = fetchable && section.all.is_some();
     let foldable = remote || items.len() > visible;
@@ -1303,7 +1304,11 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: b
     if !title.is_empty() || foldable {
         let (row, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
         label(ui, row.left_center(), Align2::LEFT_CENTER, title, bold(20.0), TEXT, width - 120.0);
-        if foldable {
+        if loading {
+            egui::Spinner::new()
+                .color(ACCENT)
+                .paint_at(ui, Rect::from_center_size(row.right_center() - vec2(16.0, 0.0), Vec2::splat(16.0)));
+        } else if foldable {
             let text = if open { "Show less" } else { "Show all" };
             if text_button(ui, row.right_center(), id.with("fold"), text).clicked() {
                 open = !open;
@@ -1564,6 +1569,7 @@ fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: O
                         .as_ref()
                         .is_some_and(|header| !header.is_artist && section.items.iter().all(|item| item.thumb == header.thumb));
                 let id = ui.id().with(index);
+                let loading = cx.loading_sections.contains(&index);
                 if section_view(
                     ui,
                     cx,
@@ -1571,6 +1577,7 @@ fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: O
                     id,
                     numbered,
                     page.header.as_ref().is_some_and(|header| header.is_artist),
+                    loading,
                 ) {
                     cx.out.push(Action::ShowAll(index));
                 }
@@ -1803,6 +1810,12 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         paused: app.player.paused(),
         liked: &app.saved.liked,
         single: matches!(route, Route::Search(_) | Route::Home),
+        loading_sections: app
+            .fetching_all
+            .iter()
+            .filter(|(fetching, _)| *fetching == route)
+            .map(|(_, at)| *at)
+            .collect(),
         out: &mut *out,
     };
     let margin = Margin {

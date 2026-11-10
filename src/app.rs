@@ -282,7 +282,7 @@ pub struct App {
     cancel_sign_in: Arc<AtomicBool>,
     cover_queue: Vec<String>,
     cover_tried: HashSet<String>,
-    fetching_all: HashSet<(Route, usize)>,
+    pub fetching_all: HashSet<(Route, usize)>,
     cover_lookups: usize,
     media: Option<Media>,
     discord: Option<Discord>,
@@ -1214,6 +1214,7 @@ fn settle_section(page: &mut Page, at: usize, target: &Target, items: Vec<Item>)
     if let Some(section) = page.sections.get_mut(at).filter(|section| section.all.as_ref() == Some(target)) {
         section.all = None;
         if !items.is_empty() {
+            section.brief = Some(section.items.len());
             section.items = items;
         }
     }
@@ -1239,6 +1240,7 @@ mod tests {
             layout: Layout::Tracks,
             items: vec![song("shown")],
             all: Some(target.clone()),
+            brief: None,
         };
         let mut page = Page {
             sections: vec![section("Songs"), section("Albums")],
@@ -1253,11 +1255,13 @@ mod tests {
         assert!(page.sections[1].all.is_some());
         settle_section(&mut page, 1, &target, vec![song("a"), song("b")]);
         assert_eq!(page.sections[1].items.len(), 2);
+        assert_eq!(page.sections[1].brief, Some(1));
         assert!(page.sections[1].all.is_none());
         assert_eq!(page.sections[0].items.len(), 1);
         assert!(page.sections[0].all.is_some());
         settle_section(&mut page, 0, &target, Vec::new());
         assert_eq!(page.sections[0].items.len(), 1);
+        assert_eq!(page.sections[0].brief, None);
         assert!(page.sections[0].all.is_none());
     }
 
