@@ -832,8 +832,7 @@ impl App {
         if !self.saved.hide_on_close {
             return;
         }
-        let ctx = self.ctx.clone();
-        self.tray = Tray::start(self.window, move || ctx.request_repaint());
+        self.tray = Tray::start(self.window, self.ctx.clone());
     }
 
     fn set_recording(&mut self, command: Option<Command>) {
