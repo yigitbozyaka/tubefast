@@ -91,6 +91,12 @@ pub fn forget() {
     }
 }
 
+pub fn forget_if_stored(cookie: &str) {
+    if load().as_deref() == Some(cookie) {
+        forget();
+    }
+}
+
 #[cfg(windows)]
 fn seal(data: &[u8], protect: bool) -> Option<Vec<u8>> {
     use std::ptr::{null, null_mut};

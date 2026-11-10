@@ -1,8 +1,9 @@
-use crate::app::{Action, App, Covers, Load, Repeat, Route, Words};
+use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, Words, usable_opacity};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
-use crate::ytm::{Item, Layout};
+use crate::tray;
+use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
@@ -61,6 +62,15 @@ const SETTING_ROW: f32 = 48.0;
 const HOTKEY_ROW: f32 = 56.0;
 const STATUS_ROW: f32 = 26.0;
 const SECTION_GAP: f32 = 32.0;
+const OVERLAY_TITLE: &str = "Tubefast overlay";
+const OVERLAY_CLOSE_DIM: f32 = 0.22;
+const OVERLAY_WIDTH: f32 = 340.0;
+const OVERLAY_HOME: [f32; 2] = [24.0, 24.0];
+const OVERLAY_ROWS: usize = 4;
+const OVERLAY_ROW: f32 = 48.0;
+const OVERLAY_PAD: f32 = 14.0;
+const OVERLAY_ART: f32 = 56.0;
+const SLIDER_WIDTH: f32 = 160.0;
 const CARD_PAD: f32 = 6.0;
 const CARD_RADIUS: f32 = 12.0;
 
@@ -397,6 +407,7 @@ struct Cx<'a> {
     paused: bool,
     liked: &'a [Item],
     single: bool,
+    loading_sections: Vec<usize>,
     out: &'a mut Vec<Action>,
 }
 
@@ -522,6 +533,276 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     notice(app, ctx, &mut out);
     release_notes(app, ctx, &mut out);
     out
+}
+
+pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
+    let mut out = Vec::new();
+    if !(app.saved.overlay && app.overlay_open) {
+        forget_overlay_window();
+        return out;
+    }
+    let home = app.overlay_origin.unwrap_or(OVERLAY_HOME);
+    let saved = app.saved.overlay_position.unwrap_or(OVERLAY_HOME);
+    let builder = egui::ViewportBuilder::default()
+        .with_title(OVERLAY_TITLE)
+        .with_inner_size([OVERLAY_WIDTH, overlay_height(overlay_rows(app), app.saved.overlay_controls)])
+        .with_position(home)
+        .with_decorations(false)
+        .with_always_on_top()
+        .with_taskbar(false)
+        .with_resizable(false)
+        .with_active(false);
+    ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("overlay"), builder, |ctx, _| {
+        style_overlay_window(ctx, usable_opacity(app.saved.overlay_opacity));
+        egui::CentralPanel::default()
+            .frame(Frame::NONE)
+            .show(ctx, |ui| overlay_card(app, ui, &mut out));
+        let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
+        let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
+        if app.overlay_snapping {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(OVERLAY_HOME[0], OVERLAY_HOME[1])));
+            ctx.request_repaint();
+            if near(OVERLAY_HOME) {
+                out.push(Action::OverlaySnapped);
+            }
+        } else if let (Some(outer), false) = (outer, near(saved)) {
+            out.push(Action::OverlayMoved([outer.min.x, outer.min.y]));
+        }
+        if closing {
+            out.push(Action::ToggleOverlay);
+        }
+    });
+    out
+}
+
+#[cfg(windows)]
+static OVERLAY_WINDOW: std::sync::Mutex<(isize, u8)> = std::sync::Mutex::new((0, 0));
+
+#[cfg(windows)]
+fn own_overlay_window() -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetWindowThreadProcessId};
+    let title: Vec<u16> = OVERLAY_TITLE.encode_utf16().chain([0]).collect();
+    let mut window = std::ptr::null_mut();
+    loop {
+        window = unsafe { FindWindowExW(std::ptr::null_mut(), window, std::ptr::null(), title.as_ptr()) };
+        if window.is_null() {
+            return None;
+        }
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut owner) };
+        if owner == unsafe { GetCurrentProcessId() } {
+            return Some(window);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn style_overlay_window(ctx: &egui::Context, opacity: f32) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongPtrW, LWA_ALPHA, SetLayeredWindowAttributes, SetWindowLongPtrW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    };
+    let alpha = (opacity * 255.0) as u8;
+    let mut styled = OVERLAY_WINDOW.lock().unwrap();
+    if styled.0 != 0 && styled.1 == alpha {
+        return;
+    }
+    let window = if styled.0 != 0 { Some(styled.0 as _) } else { own_overlay_window() };
+    let Some(window) = window else {
+        ctx.request_repaint();
+        return;
+    };
+    unsafe {
+        if styled.0 == 0 {
+            let style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+            SetWindowLongPtrW(window, GWL_EXSTYLE, style | (WS_EX_NOACTIVATE | WS_EX_LAYERED) as isize);
+            let corners = DWMWCP_ROUND;
+            DwmSetWindowAttribute(window, DWMWA_WINDOW_CORNER_PREFERENCE as u32, (&raw const corners).cast(), 4);
+        }
+        SetLayeredWindowAttributes(window, 0, alpha, LWA_ALPHA);
+    }
+    *styled = (window as isize, alpha);
+}
+
+#[cfg(windows)]
+fn forget_overlay_window() {
+    *OVERLAY_WINDOW.lock().unwrap() = (0, 0);
+}
+
+#[cfg(not(windows))]
+fn style_overlay_window(_: &egui::Context, _: f32) {}
+
+#[cfg(not(windows))]
+fn forget_overlay_window() {}
+
+#[cfg(windows)]
+fn cursor_in_points(ctx: &egui::Context) -> Option<Pos2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut cursor = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut cursor) } != 0).then(|| pos2(cursor.x as f32, cursor.y as f32) / ctx.pixels_per_point())
+}
+
+#[cfg(not(windows))]
+fn cursor_in_points(_: &egui::Context) -> Option<Pos2> {
+    None
+}
+
+fn overlay_upcoming(app: &App) -> usize {
+    app.saved.current.map_or(0, |current| current + 1)
+}
+
+fn overlay_rows(app: &App) -> usize {
+    if !app.saved.overlay_next_up {
+        return 0;
+    }
+    app.saved.queue.len().saturating_sub(overlay_upcoming(app)).min(OVERLAY_ROWS)
+}
+
+fn overlay_base_height(controls: bool) -> f32 {
+    2.0 * OVERLAY_PAD + OVERLAY_ART + 38.0 + if controls { 28.0 } else { 0.0 }
+}
+
+fn overlay_height(rows: usize, controls: bool) -> f32 {
+    let queue_height = if rows > 0 { 28.0 + rows as f32 * OVERLAY_ROW } else { 0.0 };
+    overlay_base_height(controls) + queue_height
+}
+
+fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
+    let upcoming = overlay_upcoming(app);
+    let rows = overlay_rows(app);
+    let controls = app.saved.overlay_controls;
+    let height = overlay_height(rows, controls);
+    let area = ui.max_rect();
+    let card = Rect::from_min_size(area.min, vec2(area.width(), height));
+    ui.painter().rect(card, 8.0, PANEL, Stroke::new(1.0, veil(0.1)), StrokeKind::Inside);
+    let drag = ui.interact(card, Id::new("overlay-drag"), Sense::drag());
+    let grip = Id::new("overlay-grip");
+    let outer = ui.ctx().input(|input| input.viewport().outer_rect);
+    if let (true, Some(cursor), Some(outer)) = (drag.drag_started(), cursor_in_points(ui.ctx()), outer) {
+        ui.data_mut(|data| data.insert_temp(grip, cursor - outer.min));
+    }
+    if let (true, Some(cursor), Some(offset)) = (
+        drag.dragged(),
+        cursor_in_points(ui.ctx()),
+        ui.data(|data| data.get_temp::<Vec2>(grip)),
+    ) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(cursor - offset));
+    }
+    let inner = card.shrink(OVERLAY_PAD);
+    let close = Rect::from_center_size(pos2(inner.right() - 12.0, inner.top() + 12.0), Vec2::splat(28.0));
+    let over_card = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pointer| card.contains(pointer));
+    let seen = ui.ctx().animate_bool_with_time(Id::new("overlay-hover"), over_card, HOVER_TIME);
+    let close_tone = MUTED.gamma_multiply(egui::lerp(OVERLAY_CLOSE_DIM..=1.0, seen));
+    if icon_button(
+        ui,
+        close,
+        Id::new("overlay-close"),
+        icon::X,
+        glyph(14.0),
+        close_tone,
+        "Hide overlay",
+    )
+    .clicked()
+    {
+        out.push(Action::ToggleOverlay);
+    }
+    let item = app.now_playing();
+    let art = Rect::from_min_size(inner.min, Vec2::splat(OVERLAY_ART));
+    let (left, width) = (art.right() + 12.0, inner.right() - art.right() - 52.0);
+    match item {
+        Some(item) => {
+            artwork(ui, &app.art, app.saved.covers.of(item), art, 8.0);
+            let (title, byline) = (pos2(left, art.center().y - 10.0), pos2(left, art.center().y + 10.0));
+            label(ui, title, Align2::LEFT_CENTER, &item.title, medium(14.0), TEXT, width);
+            label(ui, byline, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
+        }
+        None => {
+            ui.painter().rect_filled(art, 8.0, RAISED);
+            let at = pos2(left, art.center().y);
+            label(ui, at, Align2::LEFT_CENTER, "Nothing playing", medium(14.0), MUTED, width);
+        }
+    }
+
+    let (duration, position) = (app.player.duration_ms(), app.player.position_ms());
+    let played = if duration > 0 {
+        (position as f32 / duration as f32).min(1.0)
+    } else {
+        0.0
+    };
+    let bar = Rect::from_min_size(pos2(inner.left(), art.bottom() + 14.0), vec2(inner.width(), 4.0));
+    ui.painter().rect_filled(bar, 2.0, veil(0.16));
+    ui.painter()
+        .rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * played, bar.height())), 2.0, ACCENT);
+    let (start, end) = (pos2(bar.left(), bar.bottom() + 10.0), pos2(bar.right(), bar.bottom() + 10.0));
+    label(ui, start, Align2::LEFT_CENTER, &clock(position), sans(11.5), FAINT, 60.0);
+    label(ui, end, Align2::RIGHT_CENTER, &clock(duration), sans(11.5), FAINT, 60.0);
+
+    if controls {
+        overlay_controls(app, ui, out, pos2(bar.center().x, bar.bottom() + 40.0));
+    }
+
+    if rows == 0 {
+        return;
+    }
+    let heading = pos2(inner.left(), card.top() + overlay_base_height(controls) + 14.0);
+    label(ui, heading, Align2::LEFT_CENTER, "Next up", bold(12.0), FAINT, inner.width());
+    for at in 0..rows {
+        let (index, item) = (upcoming + at, &app.saved.queue[upcoming + at]);
+        let top = heading.y + 14.0 + at as f32 * OVERLAY_ROW;
+        let slot = Rect::from_min_size(pos2(inner.left(), top), vec2(inner.width(), OVERLAY_ROW));
+        let response = ui.interact(slot, Id::new(("overlay-row", index)), Sense::click());
+        let (below, width) = queue_row(ui, app, item, slot.shrink2(vec2(0.0, 4.0)), hover_of(ui, &response));
+        label(ui, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
+        describe(&response, &item.title);
+        if response.clicked() {
+            out.push(Action::Jump(index));
+        }
+    }
+}
+
+fn overlay_controls(app: &App, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
+    let item = app.now_playing();
+    let around = |offset: f32, size: f32| Rect::from_center_size(middle + vec2(offset, 0.0), Vec2::splat(size));
+    let tone = if item.is_some() { TEXT } else { FAINT };
+    if icon_button(
+        ui,
+        around(-52.0, 36.0),
+        Id::new("overlay-previous"),
+        icon::SKIP_BACK,
+        solid(18.0),
+        tone,
+        "Previous",
+    )
+    .clicked()
+    {
+        out.push(Action::Previous);
+    }
+    let (symbol, hint) = if app.playing() {
+        (icon::PAUSE, "Pause")
+    } else {
+        (icon::PLAY, "Play")
+    };
+    if icon_button(ui, around(0.0, 40.0), Id::new("overlay-toggle"), symbol, solid(22.0), tone, hint).clicked() {
+        out.push(Action::Toggle);
+    }
+    if icon_button(
+        ui,
+        around(52.0, 36.0),
+        Id::new("overlay-next"),
+        icon::SKIP_FORWARD,
+        solid(18.0),
+        tone,
+        "Next",
+    )
+    .clicked()
+    {
+        out.push(Action::Next);
+    }
 }
 
 fn fit(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32, rows: usize) -> Arc<Galley> {
@@ -1045,21 +1326,27 @@ fn grid(ui: &mut Ui, count: usize, columns: usize, cell: Vec2, gap: Vec2, mut pa
     }
 }
 
-fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[Item], id: Id, numbered: bool) {
+fn section_view(ui: &mut Ui, cx: &mut Cx, section: &Section, id: Id, numbered: bool, fetchable: bool, loading: bool) -> bool {
+    let (title, layout, items) = (section.title.as_str(), section.layout, section.items.as_slice());
     let width = ui.available_width();
     let (cards, card_width) = columns(width, CARD_MIN, CARD_GAP);
     let (cells, cell_width) = columns(width, COMPACT_MIN, 12.0);
     let visible = match layout {
         Layout::Cards => cards,
         Layout::Compact => cells * COMPACT_ROWS,
-        Layout::Tracks | Layout::Top => usize::MAX,
+        Layout::Tracks | Layout::Top => section.brief.unwrap_or(usize::MAX),
     };
-    let foldable = items.len() > visible;
+    let remote = fetchable && section.all.is_some();
+    let foldable = remote || items.len() > visible;
     let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
     if !title.is_empty() || foldable {
         let (row, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
         label(ui, row.left_center(), Align2::LEFT_CENTER, title, bold(20.0), TEXT, width - 120.0);
-        if foldable {
+        if loading {
+            egui::Spinner::new()
+                .color(ACCENT)
+                .paint_at(ui, Rect::from_center_size(row.right_center() - vec2(16.0, 0.0), Vec2::splat(16.0)));
+        } else if foldable {
             let text = if open { "Show less" } else { "Show all" };
             if text_button(ui, row.right_center(), id.with("fold"), text).clicked() {
                 open = !open;
@@ -1094,6 +1381,7 @@ fn section_view(ui: &mut Ui, cx: &mut Cx, title: &str, layout: Layout, items: &[
             }
         }
     }
+    remote && open
 }
 
 fn top_result(ui: &mut Ui, cx: &mut Cx, items: &[Item], id: Id) {
@@ -1319,7 +1607,18 @@ fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: O
                         .as_ref()
                         .is_some_and(|header| !header.is_artist && section.items.iter().all(|item| item.thumb == header.thumb));
                 let id = ui.id().with(index);
-                section_view(ui, cx, &section.title, section.layout, &section.items, id, numbered);
+                let loading = cx.loading_sections.contains(&index);
+                if section_view(
+                    ui,
+                    cx,
+                    section,
+                    id,
+                    numbered,
+                    page.header.as_ref().is_some_and(|header| header.is_artist),
+                    loading,
+                ) {
+                    cx.out.push(Action::ShowAll(index));
+                }
             }
             if page.partial {
                 ui.add_space(30.0);
@@ -1549,6 +1848,12 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         paused: app.player.paused(),
         liked: &app.saved.liked,
         single: matches!(route, Route::Search(_) | Route::Home),
+        loading_sections: app
+            .fetching_all
+            .iter()
+            .filter(|(fetching, _)| *fetching == route)
+            .map(|(_, at)| *at)
+            .collect(),
         out: &mut *out,
     };
     let margin = Margin {
@@ -1662,6 +1967,7 @@ fn hotkey_row(ui: &mut Ui, app: &App, command: Command, enabled: bool, out: &mut
         Command::Previous => icon::SKIP_BACK,
         Command::VolumeUp => icon::SPEAKER_HIGH,
         Command::VolumeDown => icon::SPEAKER_LOW,
+        Command::Overlay => icon::PICTURE_IN_PICTURE,
     };
     let tone = MUTED.lerp_to_gamma(TEXT, hover);
     ui.painter()
@@ -1800,6 +2106,98 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
 }
 
+fn window_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    if !tray::SUPPORTED {
+        return;
+    }
+    section(ui, "Window", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(ui, size, icon::APP_WINDOW, "Minimize to tray on close", app.saved.hide_on_close) {
+            out.push(Action::HideOnClose(!app.saved.hide_on_close));
+        }
+    });
+}
+
+fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, enabled: bool) -> Option<f32> {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let middle = rect.center().y;
+    ui.painter()
+        .text(pos2(rect.left() + 22.0, middle), Align2::CENTER_CENTER, symbol, glyph(17.0), MUTED);
+    let track = Rect::from_center_size(pos2(rect.right() - 27.0 - SLIDER_WIDTH / 2.0, middle), vec2(SLIDER_WIDTH, 4.0));
+    let name_width = track.left() - rect.left() - 100.0;
+    label(
+        ui,
+        pos2(rect.left() + 46.0, middle),
+        Align2::LEFT_CENTER,
+        text,
+        medium(13.5),
+        TEXT,
+        name_width,
+    );
+    let fraction = (value - OVERLAY_OPACITY_MIN) / (1.0 - OVERLAY_OPACITY_MIN);
+    let reach = pos2(track.left() + track.width() * fraction, middle);
+    ui.painter().rect_filled(track, 2.0, veil(0.16));
+    ui.painter()
+        .rect_filled(Rect::from_min_max(track.min, pos2(reach.x, track.bottom())), 2.0, ACCENT);
+    ui.painter().circle_filled(reach, 7.0, TEXT);
+    let percent = format!("{}%", (value * 100.0).round());
+    label(
+        ui,
+        pos2(track.left() - 14.0, middle),
+        Align2::RIGHT_CENTER,
+        &percent,
+        sans(12.5),
+        MUTED,
+        60.0,
+    );
+    if !enabled {
+        return None;
+    }
+    let grab = ui.interact(track.expand2(vec2(10.0, 12.0)), Id::new(("slider", text)), Sense::click_and_drag());
+    describe(&grab, text);
+    let pointer = grab.interact_pointer_pos().filter(|_| grab.dragged() || grab.clicked())?;
+    let fraction = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
+    Some(egui::lerp(OVERLAY_OPACITY_MIN..=1.0, fraction))
+}
+
+fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    if !hotkeys::SUPPORTED {
+        return;
+    }
+    let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
+    let card = section(ui, "Overlay", height, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(ui, size, icon::PICTURE_IN_PICTURE, "Enable overlay", app.saved.overlay) {
+            out.push(Action::OverlayEnabled(!app.saved.overlay));
+        }
+        let on = ui.ctx().animate_bool_with_time(Id::new("overlay-on"), app.saved.overlay, 0.16);
+        ui.multiply_opacity(egui::lerp(0.4..=1.0, on));
+        if let Some(opacity) = slider_row(
+            ui,
+            size,
+            icon::CIRCLE_HALF,
+            "Opacity",
+            usable_opacity(app.saved.overlay_opacity),
+            app.saved.overlay,
+        ) {
+            out.push(Action::OverlayOpacity(opacity));
+        }
+        if switch_row(ui, size, icon::PLAY_CIRCLE, "Show playback controls", app.saved.overlay_controls) {
+            out.push(Action::OverlayControls(!app.saved.overlay_controls));
+        }
+        if switch_row(ui, size, icon::LIST_BULLETS, "Show next up", app.saved.overlay_next_up) {
+            out.push(Action::OverlayNextUp(!app.saved.overlay_next_up));
+        }
+    });
+    let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
+    if app.saved.overlay_position.is_some() && text_button(ui, reset_at, Id::new("overlay-reset"), "Reset position").clicked() {
+        out.push(Action::OverlayResetPosition);
+    }
+    let text = "Opens with the Show / hide overlay hotkey, which needs global hotkeys on. Drag it to move it.";
+    let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
+    label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
+}
+
 fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     let full = ui.available_width();
     let width = full.min(SETTINGS_WIDTH);
@@ -1809,6 +2207,8 @@ fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     label(ui, at, Align2::LEFT_BOTTOM, "Settings", display(40.0), TEXT, width);
     discord_section(ui, app, out);
     hotkey_section(ui, app, out);
+    window_section(ui, app, out);
+    overlay_section(ui, app, out);
 }
 
 fn nav_item(ui: &mut Ui, symbol: &str, text: &str, active: bool, trailing: &str) -> Response {
@@ -2262,6 +2662,10 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let moved = ui.data(|data| data.get_temp::<Option<usize>>(follow)) != Some(sung);
     ui.data_mut(|data| data.insert_temp(follow, sung));
     let width = ui.available_width();
+    let romanized = app.saved.lyrics_romanized;
+    if lyrics.romanized.iter().any(Option::is_some) && switch_row(ui, vec2(width, 38.0), icon::TRANSLATE, "Show romanization", romanized) {
+        out.push(Action::RomanizeLyrics(!romanized));
+    }
     let sense = if lyrics.synced { Sense::click() } else { Sense::hover() };
     for (index, (start, line)) in lyrics.lines.iter().enumerate() {
         if line.is_empty() {
@@ -2269,7 +2673,15 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
             continue;
         }
         let galley = fit(ui, line, bold(20.0), TEXT, width, 4);
-        let (rect, response) = ui.allocate_exact_size(vec2(width, galley.size().y + 14.0), sense);
+        let reading = lyrics
+            .romanized
+            .get(index)
+            .and_then(Option::as_deref)
+            .filter(|_| romanized)
+            .map(|reading| fit(ui, reading, sans(15.0), TEXT, width, 3));
+        let reading_height = reading.as_ref().map_or(0.0, |reading| reading.size().y + 2.0);
+        let line_height = galley.size().y;
+        let (rect, response) = ui.allocate_exact_size(vec2(width, line_height + reading_height + 14.0), sense);
         let current = sung == Some(index);
         if current && moved {
             ui.scroll_to_rect(rect, Some(Align::Center));
@@ -2283,6 +2695,11 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
         let hover = hover_of(ui, &response);
         let ink = TEXT.gamma_multiply(0.34 + 0.66 * lit.max(0.5 * hover));
         ui.painter().galley_with_override_text_color(rect.min + vec2(0.0, 7.0), galley, ink);
+        if let Some(reading) = reading {
+            let tone = ink.gamma_multiply(0.7);
+            ui.painter()
+                .galley_with_override_text_color(rect.min + vec2(0.0, 9.0 + line_height), reading, tone);
+        }
         if lyrics.synced {
             point_at(&response);
         }
@@ -2886,6 +3303,17 @@ fn release_notes(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_overlay_shrinks_with_what_it_hides() {
+        let full = overlay_height(OVERLAY_ROWS, true);
+        let no_controls = overlay_height(OVERLAY_ROWS, false);
+        let no_queue = overlay_height(0, true);
+        let compact = overlay_height(0, false);
+        assert!(compact < no_controls && compact < no_queue);
+        assert!(no_controls < full && no_queue < full);
+        assert_eq!(compact, overlay_base_height(false));
+    }
 
     #[test]
     fn links_each_artist_name_to_its_own_page() {

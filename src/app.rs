@@ -5,9 +5,10 @@ use crate::hotkeys::{self, Combo, Command, Hotkeys};
 use crate::media::Media;
 use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
+use crate::tray::{self, Tray};
 use crate::ui;
 use crate::update::{self, Plan};
-use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, VIDEO_FRAME_HOST};
+use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,8 @@ const HOME_SEEDS: usize = 3;
 const COVER_LOOKUPS: usize = 2;
 const QUEUED_COVERS: usize = 30;
 const REMEMBERED_COVERS: usize = 1500;
+pub const OVERLAY_OPACITY_MIN: f32 = 0.3;
+const OVERLAY_OPACITY_DEFAULT: f32 = 0.9;
 const WINDOW_KEY: &str = "window";
 pub const WINDOW_SIZE: [f32; 2] = [1360.0, 860.0];
 pub const WINDOW_MIN: [f32; 2] = [940.0, 600.0];
@@ -78,11 +81,19 @@ pub struct Saved {
     pub current: Option<usize>,
     pub position_ms: u64,
     pub lyrics_open: bool,
+    pub lyrics_romanized: bool,
     pub discord: bool,
     pub discord_headline: Headline,
     pub discord_name: String,
     pub hotkeys: bool,
-    pub hotkey_combos: [Option<Combo>; 5],
+    pub hide_on_close: bool,
+    #[serde(deserialize_with = "hotkeys::padded_combos")]
+    pub hotkey_combos: [Option<Combo>; hotkeys::COUNT],
+    pub overlay: bool,
+    pub overlay_opacity: f32,
+    pub overlay_position: Option<[f32; 2]>,
+    pub overlay_controls: bool,
+    pub overlay_next_up: bool,
     pub notes_seen: String,
 }
 
@@ -148,11 +159,18 @@ impl Default for Saved {
             current: None,
             position_ms: 0,
             lyrics_open: false,
+            lyrics_romanized: false,
             discord: false,
             discord_headline: Headline::App,
             discord_name: String::new(),
             hotkeys: false,
+            hide_on_close: false,
             hotkey_combos: hotkeys::standard_combos(),
+            overlay: false,
+            overlay_opacity: OVERLAY_OPACITY_DEFAULT,
+            overlay_position: None,
+            overlay_controls: true,
+            overlay_next_up: true,
             notes_seen: String::new(),
         }
     }
@@ -189,6 +207,7 @@ pub enum Action {
     Back,
     Forward,
     Reload,
+    ShowAll(usize),
     Play(Vec<Item>, usize),
     Jump(usize),
     PlayNext(Item),
@@ -220,6 +239,7 @@ pub enum Action {
     Move(usize, usize),
     Expand(bool),
     ShowLyrics(bool),
+    RomanizeLyrics(bool),
     ClearHistory,
     RestoreHistory(Vec<Item>),
     ShowOnDiscord(bool),
@@ -227,13 +247,23 @@ pub enum Action {
     DiscordName(String),
     VolumeBy(f32),
     GlobalHotkeys(bool),
+    HideOnClose(bool),
     Record(Option<Command>),
     ResetHotkeys,
+    ToggleOverlay,
+    OverlayEnabled(bool),
+    OverlayOpacity(f32),
+    OverlayMoved([f32; 2]),
+    OverlayResetPosition,
+    OverlaySnapped,
+    OverlayControls(bool),
+    OverlayNextUp(bool),
 }
 
 enum Event {
     Page(Route, Result<Box<Page>, String>),
     Part(u64, usize, Vec<Section>),
+    FullSection(Route, usize, Target, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     Library(Vec<Item>),
     Accounts(Vec<Account>),
@@ -259,10 +289,13 @@ pub struct App {
     cancel_sign_in: Arc<AtomicBool>,
     cover_queue: Vec<String>,
     cover_tried: HashSet<String>,
+    pub fetching_all: HashSet<(Route, usize)>,
     cover_lookups: usize,
     media: Option<Media>,
     discord: Option<Discord>,
     hotkeys: Option<Hotkeys>,
+    tray: Option<Tray>,
+    window: isize,
     replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
     playback: Arc<Mutex<Playback>>,
@@ -289,6 +322,9 @@ pub struct App {
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
+    pub overlay_open: bool,
+    pub overlay_origin: Option<[f32; 2]>,
+    pub overlay_snapping: bool,
     pub notes: Vec<String>,
     restart: Option<PathBuf>,
 }
@@ -340,10 +376,13 @@ impl App {
             cancel_sign_in: Arc::default(),
             cover_queue: Vec::new(),
             cover_tried: HashSet::new(),
+            fetching_all: HashSet::new(),
             cover_lookups: 0,
             media,
             discord,
             hotkeys: None,
+            tray: None,
+            window: tray::window_of(cc),
             replaced: None,
             growing: None,
             playback,
@@ -369,6 +408,9 @@ impl App {
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
+            overlay_open: false,
+            overlay_origin: None,
+            overlay_snapping: false,
             notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
         };
@@ -380,6 +422,7 @@ impl App {
             None => app.ensure(&Route::Home),
         }
         app.restart_hotkeys();
+        app.restart_tray();
         app.load_library();
         app.background(|yt| {
             yt.refresh_clients();
@@ -481,10 +524,14 @@ impl App {
     }
 
     fn sign_out(&mut self) {
+        auth::forget();
+        self.leave_session();
+    }
+
+    fn leave_session(&mut self) {
         self.yt.set_session(None);
         self.yt.act_as("");
         self.accounts.clear();
-        auth::forget();
         self.saved.leave_account();
         self.refresh();
     }
@@ -638,6 +685,12 @@ impl App {
                     self.pages.insert(Route::Home, Load::Ready(Box::new(self.home_page(true))));
                 }
                 Event::Part(..) => {}
+                Event::FullSection(route, at, target, items) => {
+                    if let Some(Load::Ready(page)) = self.pages.get_mut(&route) {
+                        settle_section(page, at, &target, items);
+                    }
+                    self.fetching_all.remove(&(route, at));
+                }
                 Event::Page(Route::Home, result) => {
                     let page = self.home_page(false);
                     let load = match result {
@@ -716,6 +769,7 @@ impl App {
                 }
                 Event::Updated(Ok(program)) => {
                     self.restart = Some(program);
+                    tray::begin_quit();
                     self.ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Event::Updated(Err(reason)) => {
@@ -725,8 +779,9 @@ impl App {
                 }
             }
         }
-        if self.yt.take_expired() {
-            self.sign_out();
+        if let Some(rejected) = self.yt.take_expired() {
+            auth::forget_if_stored(&rejected);
+            self.leave_session();
             self.notify("Your YouTube session ended. Sign in again.");
         }
         if let Some(typed) = self.typed {
@@ -770,6 +825,15 @@ impl App {
             self.hotkeys = Some(hotkeys);
             self.hotkey_taken = taken;
         }
+    }
+
+    fn restart_tray(&mut self) {
+        self.tray = None;
+        if !self.saved.hide_on_close {
+            return;
+        }
+        let ctx = self.ctx.clone();
+        self.tray = Tray::start(self.window, move || ctx.request_repaint());
     }
 
     fn set_recording(&mut self, command: Option<Command>) {
@@ -873,6 +937,21 @@ impl App {
             Action::Back if self.at > 0 => self.step(self.at - 1),
             Action::Forward if self.at + 1 < self.history.len() => self.step(self.at + 1),
             Action::Back | Action::Forward => {}
+            Action::ShowAll(at) => {
+                let route = self.route().clone();
+                let target = match self.pages.get(&route) {
+                    Some(Load::Ready(page)) => page.sections.get(at).and_then(|section| section.all.clone()),
+                    _ => None,
+                };
+                if let Some(target) = target
+                    && self.fetching_all.insert((route.clone(), at))
+                {
+                    self.background(move |yt| {
+                        let items = yt.full_section(&target).unwrap_or_default();
+                        Some(Event::FullSection(route, at, target, items))
+                    });
+                }
+            }
             Action::Reload => {
                 let route = self.route().clone();
                 self.pages.remove(&route);
@@ -898,12 +977,34 @@ impl App {
                 self.recording = None;
                 self.restart_hotkeys();
             }
+            Action::HideOnClose(enabled) => {
+                self.saved.hide_on_close = enabled;
+                self.restart_tray();
+            }
             Action::Record(command) => self.set_recording(command),
             Action::ResetHotkeys => {
                 self.saved.hotkey_combos = hotkeys::standard_combos();
                 self.recording = None;
                 self.restart_hotkeys();
             }
+            Action::ToggleOverlay => {
+                self.overlay_open = overlay_after_toggle(self.saved.overlay, self.overlay_open);
+                self.overlay_origin = self.saved.overlay_position;
+            }
+            Action::OverlayEnabled(enabled) => {
+                self.saved.overlay = enabled;
+                self.overlay_open = false;
+            }
+            Action::OverlayOpacity(opacity) => self.saved.overlay_opacity = usable_opacity(opacity),
+            Action::OverlayMoved(position) => self.saved.overlay_position = Some(position),
+            Action::OverlayResetPosition => {
+                self.saved.overlay_position = None;
+                self.overlay_origin = None;
+                self.overlay_snapping = self.overlay_open;
+            }
+            Action::OverlaySnapped => self.overlay_snapping = false,
+            Action::OverlayControls(shown) => self.saved.overlay_controls = shown,
+            Action::OverlayNextUp(shown) => self.saved.overlay_next_up = shown,
             Action::Like(item) => {
                 let liked = !self.saved.liked.iter().any(|known| known.key() == item.key());
                 toggle(&mut self.saved.liked, item.clone());
@@ -986,6 +1087,7 @@ impl App {
             Action::CloseNotes => self.notes.clear(),
             Action::Move(from, gap) => playback.reorder(from, gap),
             Action::Expand(open) => self.expanded = open && self.saved.current.is_some(),
+            Action::RomanizeLyrics(romanized) => self.saved.lyrics_romanized = romanized,
             Action::ShowLyrics(open) => {
                 self.saved.lyrics_open = open;
                 if matches!(self.lyrics, Some((_, Words::Failed))) {
@@ -1016,6 +1118,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested()) && tray::hides_on_close(self.tray.is_some(), tray::quitting()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if let Some(tray) = &self.tray {
+                tray.hide();
+            }
+        }
         let (size, minimized) = ctx.input(|input| (input.content_rect().size(), input.viewport().minimized == Some(true)));
         if !minimized && (size.x < WINDOW_MIN[0] - 1.0 || size.y < WINDOW_MIN[1] - 1.0) {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(WINDOW_SIZE.into()));
@@ -1028,6 +1136,7 @@ impl eframe::App for App {
         self.drain(ctx, &mut playback);
         let mut actions = if self.record(ctx) { Vec::new() } else { self.shortcuts(ctx) };
         actions.extend(ui::draw(self, ctx));
+        actions.extend(ui::overlay(self, ctx));
         for action in actions {
             self.apply(action, &mut playback);
         }
@@ -1081,6 +1190,18 @@ fn link_discord(sender: &Sender<Event>, ctx: &egui::Context) -> Discord {
     })
 }
 
+fn overlay_after_toggle(enabled: bool, open: bool) -> bool {
+    enabled && !open
+}
+
+pub fn usable_opacity(opacity: f32) -> f32 {
+    if opacity.is_nan() {
+        OVERLAY_OPACITY_DEFAULT
+    } else {
+        opacity.clamp(OVERLAY_OPACITY_MIN, 1.0)
+    }
+}
+
 fn newer_version(release_url: &str, current: &str) -> Option<String> {
     let numbers = |version: &str| version.split('.').map(|part| part.parse().ok()).collect::<Option<Vec<u32>>>();
     let latest = release_url.rsplit_once("/tag/v")?.1;
@@ -1102,9 +1223,85 @@ fn release_notes(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn settle_section(page: &mut Page, at: usize, target: &Target, items: Vec<Item>) {
+    if let Some(section) = page.sections.get_mut(at).filter(|section| section.all.as_ref() == Some(target)) {
+        section.all = None;
+        if !items.is_empty() {
+            section.brief = Some(section.items.len());
+            section.items = items;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ytm::Layout;
+
+    #[test]
+    fn full_list_replaces_only_its_own_section_and_failure_keeps_items() {
+        let song = |title: &str| Item {
+            title: title.into(),
+            ..Item::default()
+        };
+        let target = Target {
+            browse_id: "VLOLAK".into(),
+            params: String::new(),
+        };
+        let section = |title: &str| Section {
+            title: title.into(),
+            layout: Layout::Tracks,
+            items: vec![song("shown")],
+            all: Some(target.clone()),
+            brief: None,
+        };
+        let mut page = Page {
+            sections: vec![section("Songs"), section("Albums")],
+            ..Page::default()
+        };
+        let moved = Target {
+            browse_id: "MPAD".into(),
+            params: "x".into(),
+        };
+        settle_section(&mut page, 1, &moved, vec![song("a")]);
+        assert_eq!(page.sections[1].items.len(), 1);
+        assert!(page.sections[1].all.is_some());
+        settle_section(&mut page, 1, &target, vec![song("a"), song("b")]);
+        assert_eq!(page.sections[1].items.len(), 2);
+        assert_eq!(page.sections[1].brief, Some(1));
+        assert!(page.sections[1].all.is_none());
+        assert_eq!(page.sections[0].items.len(), 1);
+        assert!(page.sections[0].all.is_some());
+        settle_section(&mut page, 0, &target, Vec::new());
+        assert_eq!(page.sections[0].items.len(), 1);
+        assert_eq!(page.sections[0].brief, None);
+        assert!(page.sections[0].all.is_none());
+    }
+
+    #[test]
+    fn old_saves_show_every_overlay_part() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5,"overlay":true}"#).unwrap();
+        assert!(saved.overlay_controls && saved.overlay_next_up);
+        let saved: Saved = serde_json::from_str(r#"{"overlay_controls":false}"#).unwrap();
+        assert!(!saved.overlay_controls && saved.overlay_next_up);
+    }
+
+    #[test]
+    fn the_overlay_only_opens_when_enabled() {
+        assert!(!overlay_after_toggle(false, false));
+        assert!(overlay_after_toggle(true, false));
+        assert!(!overlay_after_toggle(true, true));
+        assert!(!overlay_after_toggle(false, true));
+    }
+
+    #[test]
+    fn broken_opacity_falls_back_into_range() {
+        assert_eq!(usable_opacity(f32::NAN), OVERLAY_OPACITY_DEFAULT);
+        assert_eq!(usable_opacity(-4.0), OVERLAY_OPACITY_MIN);
+        assert_eq!(usable_opacity(7.0), 1.0);
+        assert_eq!(usable_opacity(f32::INFINITY), 1.0);
+        assert_eq!(usable_opacity(0.5), 0.5);
+    }
 
     #[test]
     fn reads_release_notes_as_plain_lines() {
