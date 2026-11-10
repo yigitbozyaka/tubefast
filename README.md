@@ -43,7 +43,7 @@ Numbers are from the release build on Windows 11. Memory is the working set a fe
 | **Updates itself** | When a new version is out, Tubefast tells you and installs it with one click, then restarts with your queue where it was. |
 | **Media keys** | Play, pause, next and previous keys work from any window, and the track shows up in the Windows media overlay in Now Playing on macOS and in the Linux desktop's media controls (MPRIS), with its cover and progress. |
 | **Global hotkeys** | On Windows, turn on **Global hotkeys** in Settings and play, pause, skip, change Tubefast's volume and open the media overlay while a game or any other app has focus. Every shortcut can be changed or cleared, and a shortcut another app already holds is marked. They go straight to Tubefast, so other media players do not get in the way. Off until you turn it on. |
-| **Media overlay** | On Windows, with **Global hotkeys** turned on in Settings, press `Ctrl` + `Alt` + `O` (changeable there) to open an always on top overlay with the current song, playback controls and the next songs in the queue. It does not take focus from your game. Opacity, position, playback controls and next up can each be changed or hidden in Settings. It works over windowed and borderless games, not exclusive fullscreen. |
+| **Media overlay** | With **Global hotkeys** turned on in Settings, press `Ctrl` + `Alt` + `O` (changeable there) to open an always on top overlay with the current song, playback controls and the next songs in the queue. It does not take focus from your game. Opacity, position, playback controls and next up can each be changed or hidden in Settings. It works over windowed and borderless games, not exclusive fullscreen. On Linux it needs an X11 session; on Wayland, desktops do not let apps stay on top or listen for hotkeys, so it is not available there. |
 | **Minimize to tray** | On Windows, turn on **Minimize to tray on close** under Settings > Window and closing the window sends Tubefast to the tray. Music keeps playing and global hotkeys keep working. Left click the tray icon to bring it back, right click for Show and Quit. |
 | **Discord status** | Turn on **Show on Discord** in Settings (the gear at the bottom of the sidebar) and your Discord profile shows the song you are listening to, with its artist, cover and progress. The same section picks what the short status next to your name says: Tubefast, the artist, the song or a text of your own. It is off until you turn it on. |
 | **A home feed that knows you** | Signed out, the feed is built from what you played here. Signed in, you get your own YouTube Music feed and playlists. |
@@ -128,7 +128,7 @@ Your session never leaves your computer. It is stored in your user profile, encr
 | Media keys | Play or pause, next, previous, from any window |
 | `Alt` + `←` / `Alt` + `→` | Back / forward |
 | `F5` or `Ctrl` + `R` | Reload the page |
-| `Ctrl` + `Alt` + `O` | Show or hide the media overlay (Windows, needs Global hotkeys turned on in Settings, can be changed there) |
+| `Ctrl` + `Alt` + `O` | Show or hide the media overlay (needs Global hotkeys turned on in Settings, can be changed there) |
 
 Right-click a track, or use the **⋯** button on a row, for play next, add to queue, like, go to artist and go to album.
 

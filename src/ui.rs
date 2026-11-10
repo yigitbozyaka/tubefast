@@ -549,14 +549,18 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
         .with_position(home)
         .with_decorations(false)
         .with_always_on_top()
+        .with_transparent(!cfg!(windows))
         .with_taskbar(false)
         .with_resizable(false)
         .with_active(false);
     ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("overlay"), builder, |ctx, _| {
         style_overlay_window(ctx, usable_opacity(app.saved.overlay_opacity));
-        egui::CentralPanel::default()
-            .frame(Frame::NONE)
-            .show(ctx, |ui| overlay_card(app, ui, &mut out));
+        egui::CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+            if !cfg!(windows) {
+                ui.multiply_opacity(usable_opacity(app.saved.overlay_opacity));
+            }
+            overlay_card(app, ui, &mut out);
+        });
         let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
         let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
         if app.overlay_snapping {
@@ -680,6 +684,9 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let drag = ui.interact(card, Id::new("overlay-drag"), Sense::drag());
     let grip = Id::new("overlay-grip");
     let outer = ui.ctx().input(|input| input.viewport().outer_rect);
+    if drag.drag_started() && !cfg!(windows) {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
     if let (true, Some(cursor), Some(outer)) = (drag.drag_started(), cursor_in_points(ui.ctx()), outer) {
         ui.data_mut(|data| data.insert_temp(grip, cursor - outer.min));
     }
@@ -2161,9 +2168,6 @@ fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, ena
 }
 
 fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    if !hotkeys::SUPPORTED {
-        return;
-    }
     let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
     let card = section(ui, "Overlay", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
