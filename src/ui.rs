@@ -2,7 +2,6 @@ use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, 
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
-use crate::tray;
 use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
@@ -2107,9 +2106,6 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
 }
 
 fn window_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    if !tray::SUPPORTED {
-        return;
-    }
     section(ui, "Window", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
         if switch_row(ui, size, icon::APP_WINDOW, "Minimize to tray on close", app.saved.hide_on_close) {
