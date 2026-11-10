@@ -89,6 +89,8 @@ pub struct Saved {
     pub overlay: bool,
     pub overlay_opacity: f32,
     pub overlay_position: Option<[f32; 2]>,
+    pub overlay_controls: bool,
+    pub overlay_next_up: bool,
     pub notes_seen: String,
 }
 
@@ -162,6 +164,8 @@ impl Default for Saved {
             overlay: false,
             overlay_opacity: OVERLAY_OPACITY_DEFAULT,
             overlay_position: None,
+            overlay_controls: true,
+            overlay_next_up: true,
             notes_seen: String::new(),
         }
     }
@@ -243,6 +247,9 @@ pub enum Action {
     OverlayOpacity(f32),
     OverlayMoved([f32; 2]),
     OverlayResetPosition,
+    OverlaySnapped,
+    OverlayControls(bool),
+    OverlayNextUp(bool),
 }
 
 enum Event {
@@ -305,6 +312,7 @@ pub struct App {
     pub recording: Option<Command>,
     pub overlay_open: bool,
     pub overlay_origin: Option<[f32; 2]>,
+    pub overlay_snapping: bool,
     pub notes: Vec<String>,
     restart: Option<PathBuf>,
 }
@@ -387,6 +395,7 @@ impl App {
             recording: None,
             overlay_open: false,
             overlay_origin: None,
+            overlay_snapping: false,
             notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
         };
@@ -935,7 +944,11 @@ impl App {
             Action::OverlayResetPosition => {
                 self.saved.overlay_position = None;
                 self.overlay_origin = None;
+                self.overlay_snapping = self.overlay_open;
             }
+            Action::OverlaySnapped => self.overlay_snapping = false,
+            Action::OverlayControls(shown) => self.saved.overlay_controls = shown,
+            Action::OverlayNextUp(shown) => self.saved.overlay_next_up = shown,
             Action::Like(item) => {
                 let liked = !self.saved.liked.iter().any(|known| known.key() == item.key());
                 toggle(&mut self.saved.liked, item.clone());
@@ -1150,6 +1163,14 @@ fn release_notes(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_saves_show_every_overlay_part() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5,"overlay":true}"#).unwrap();
+        assert!(saved.overlay_controls && saved.overlay_next_up);
+        let saved: Saved = serde_json::from_str(r#"{"overlay_controls":false}"#).unwrap();
+        assert!(!saved.overlay_controls && saved.overlay_next_up);
+    }
 
     #[test]
     fn the_overlay_only_opens_when_enabled() {

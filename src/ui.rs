@@ -62,6 +62,7 @@ const HOTKEY_ROW: f32 = 56.0;
 const STATUS_ROW: f32 = 26.0;
 const SECTION_GAP: f32 = 32.0;
 const OVERLAY_TITLE: &str = "Tubefast overlay";
+const OVERLAY_CLOSE_DIM: f32 = 0.22;
 const OVERLAY_WIDTH: f32 = 340.0;
 const OVERLAY_HOME: [f32; 2] = [24.0, 24.0];
 const OVERLAY_ROWS: usize = 4;
@@ -542,7 +543,7 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     let saved = app.saved.overlay_position.unwrap_or(OVERLAY_HOME);
     let builder = egui::ViewportBuilder::default()
         .with_title(OVERLAY_TITLE)
-        .with_inner_size([OVERLAY_WIDTH, overlay_height(overlay_rows(app))])
+        .with_inner_size([OVERLAY_WIDTH, overlay_height(overlay_rows(app), app.saved.overlay_controls)])
         .with_position(home)
         .with_decorations(false)
         .with_always_on_top()
@@ -555,7 +556,14 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
             .frame(Frame::NONE)
             .show(ctx, |ui| overlay_card(app, ui, &mut out));
         let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
-        if let Some(outer) = outer.filter(|outer| (outer.min - pos2(saved[0], saved[1])).length() > 1.0) {
+        let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
+        if app.overlay_snapping {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(OVERLAY_HOME[0], OVERLAY_HOME[1])));
+            ctx.request_repaint();
+            if near(OVERLAY_HOME) {
+                out.push(Action::OverlaySnapped);
+            }
+        } else if let (Some(outer), false) = (outer, near(saved)) {
             out.push(Action::OverlayMoved([outer.min.x, outer.min.y]));
         }
         if closing {
@@ -644,18 +652,26 @@ fn overlay_upcoming(app: &App) -> usize {
 }
 
 fn overlay_rows(app: &App) -> usize {
+    if !app.saved.overlay_next_up {
+        return 0;
+    }
     app.saved.queue.len().saturating_sub(overlay_upcoming(app)).min(OVERLAY_ROWS)
 }
 
-fn overlay_height(rows: usize) -> f32 {
+fn overlay_base_height(controls: bool) -> f32 {
+    2.0 * OVERLAY_PAD + OVERLAY_ART + 38.0 + if controls { 28.0 } else { 0.0 }
+}
+
+fn overlay_height(rows: usize, controls: bool) -> f32 {
     let queue_height = if rows > 0 { 28.0 + rows as f32 * OVERLAY_ROW } else { 0.0 };
-    2.0 * OVERLAY_PAD + OVERLAY_ART + 66.0 + queue_height
+    overlay_base_height(controls) + queue_height
 }
 
 fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let upcoming = overlay_upcoming(app);
     let rows = overlay_rows(app);
-    let height = overlay_height(rows);
+    let controls = app.saved.overlay_controls;
+    let height = overlay_height(rows, controls);
     let area = ui.max_rect();
     let card = Rect::from_min_size(area.min, vec2(area.width(), height));
     ui.painter().rect(card, 8.0, PANEL, Stroke::new(1.0, veil(0.1)), StrokeKind::Inside);
@@ -674,7 +690,23 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     }
     let inner = card.shrink(OVERLAY_PAD);
     let close = Rect::from_center_size(pos2(inner.right() - 12.0, inner.top() + 12.0), Vec2::splat(28.0));
-    if icon_button(ui, close, Id::new("overlay-close"), icon::X, glyph(14.0), MUTED, "Hide overlay").clicked() {
+    let over_card = ui
+        .ctx()
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pointer| card.contains(pointer));
+    let seen = ui.ctx().animate_bool_with_time(Id::new("overlay-hover"), over_card, HOVER_TIME);
+    let close_tone = MUTED.gamma_multiply(egui::lerp(OVERLAY_CLOSE_DIM..=1.0, seen));
+    if icon_button(
+        ui,
+        close,
+        Id::new("overlay-close"),
+        icon::X,
+        glyph(14.0),
+        close_tone,
+        "Hide overlay",
+    )
+    .clicked()
+    {
         out.push(Action::ToggleOverlay);
     }
     let item = app.now_playing();
@@ -708,7 +740,31 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     label(ui, start, Align2::LEFT_CENTER, &clock(position), sans(11.5), FAINT, 60.0);
     label(ui, end, Align2::RIGHT_CENTER, &clock(duration), sans(11.5), FAINT, 60.0);
 
-    let middle = pos2(bar.center().x, bar.bottom() + 40.0);
+    if controls {
+        overlay_controls(app, ui, out, pos2(bar.center().x, bar.bottom() + 40.0));
+    }
+
+    if rows == 0 {
+        return;
+    }
+    let heading = pos2(inner.left(), card.top() + overlay_base_height(controls) + 14.0);
+    label(ui, heading, Align2::LEFT_CENTER, "Next up", bold(12.0), FAINT, inner.width());
+    for at in 0..rows {
+        let (index, item) = (upcoming + at, &app.saved.queue[upcoming + at]);
+        let top = heading.y + 14.0 + at as f32 * OVERLAY_ROW;
+        let slot = Rect::from_min_size(pos2(inner.left(), top), vec2(inner.width(), OVERLAY_ROW));
+        let response = ui.interact(slot, Id::new(("overlay-row", index)), Sense::click());
+        let (below, width) = queue_row(ui, app, item, slot.shrink2(vec2(0.0, 4.0)), hover_of(ui, &response));
+        label(ui, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
+        describe(&response, &item.title);
+        if response.clicked() {
+            out.push(Action::Jump(index));
+        }
+    }
+}
+
+fn overlay_controls(app: &App, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
+    let item = app.now_playing();
     let around = |offset: f32, size: f32| Rect::from_center_size(middle + vec2(offset, 0.0), Vec2::splat(size));
     let tone = if item.is_some() { TEXT } else { FAINT };
     if icon_button(
@@ -744,24 +800,6 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     .clicked()
     {
         out.push(Action::Next);
-    }
-
-    if rows == 0 {
-        return;
-    }
-    let heading = pos2(inner.left(), middle.y + 36.0);
-    label(ui, heading, Align2::LEFT_CENTER, "Next up", bold(12.0), FAINT, inner.width());
-    for at in 0..rows {
-        let (index, item) = (upcoming + at, &app.saved.queue[upcoming + at]);
-        let top = heading.y + 14.0 + at as f32 * OVERLAY_ROW;
-        let slot = Rect::from_min_size(pos2(inner.left(), top), vec2(inner.width(), OVERLAY_ROW));
-        let response = ui.interact(slot, Id::new(("overlay-row", index)), Sense::click());
-        let (below, width) = queue_row(ui, app, item, slot.shrink2(vec2(0.0, 4.0)), hover_of(ui, &response));
-        label(ui, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
-        describe(&response, &item.title);
-        if response.clicked() {
-            out.push(Action::Jump(index));
-        }
     }
 }
 
@@ -2088,7 +2126,7 @@ fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     if !hotkeys::SUPPORTED {
         return;
     }
-    let height = 2.0 * CARD_PAD + 2.0 * SETTING_ROW;
+    let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
     let card = section(ui, "Overlay", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
         if switch_row(ui, size, icon::PICTURE_IN_PICTURE, "Enable overlay", app.saved.overlay) {
@@ -2105,6 +2143,12 @@ fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
             app.saved.overlay,
         ) {
             out.push(Action::OverlayOpacity(opacity));
+        }
+        if switch_row(ui, size, icon::PLAY_CIRCLE, "Show playback controls", app.saved.overlay_controls) {
+            out.push(Action::OverlayControls(!app.saved.overlay_controls));
+        }
+        if switch_row(ui, size, icon::LIST_BULLETS, "Show next up", app.saved.overlay_next_up) {
+            out.push(Action::OverlayNextUp(!app.saved.overlay_next_up));
         }
     });
     let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
@@ -3203,6 +3247,17 @@ fn release_notes(app: &App, ctx: &egui::Context, out: &mut Vec<Action>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_overlay_shrinks_with_what_it_hides() {
+        let full = overlay_height(OVERLAY_ROWS, true);
+        let no_controls = overlay_height(OVERLAY_ROWS, false);
+        let no_queue = overlay_height(0, true);
+        let compact = overlay_height(0, false);
+        assert!(compact < no_controls && compact < no_queue);
+        assert!(no_controls < full && no_queue < full);
+        assert_eq!(compact, overlay_base_height(false));
+    }
 
     #[test]
     fn links_each_artist_name_to_its_own_page() {

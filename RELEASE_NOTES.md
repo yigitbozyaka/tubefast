@@ -1,3 +1,3 @@
 - Repeat and the next song keep working while the window is minimized, also on Linux with Wayland
 - After an update, a small card at the bottom left shows what is new
-- A media overlay opens over windowed and borderless games with Ctrl+Alt+O (Windows). Turn on global hotkeys and the overlay in Settings, drag it to move it. It cannot draw over exclusive fullscreen
+- A media overlay opens over windowed and borderless games with Ctrl+Alt+O (Windows). Turn on global hotkeys and the overlay in Settings, choose what it shows, drag it to move it. It cannot draw over exclusive fullscreen
