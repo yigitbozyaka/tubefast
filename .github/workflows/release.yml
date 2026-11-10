@@ -109,16 +109,20 @@ jobs:
       - name: Package
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: linux/package.sh target/release/tubefast .
+        run: |
+          linux/package.sh target/release/tubefast .
+          cp target/release/tubefast tubefast-linux-x64
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
+            tubefast-linux-x64
             tubefast-linux-x64.tar.gz
             Tubefast-x86_64.AppImage
       - uses: actions/upload-artifact@v4
         with:
           name: linux
           path: |
+            tubefast-linux-x64
             tubefast-linux-x64.tar.gz
             Tubefast-x86_64.AppImage
 
@@ -140,5 +144,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          sha256sum tubefast-windows-x64.zip tubefast.exe tubefast-macos-universal.zip tubefast-linux-x64.tar.gz Tubefast-x86_64.AppImage > SHA256SUMS.txt
+          sha256sum tubefast-windows-x64.zip tubefast.exe tubefast-macos-universal.zip tubefast-linux-x64 tubefast-linux-x64.tar.gz Tubefast-x86_64.AppImage > SHA256SUMS.txt
           gh release create ${{ github.ref_name }} * --title "Tubefast ${{ github.ref_name }}" --notes-file ../RELEASE_NOTES.md --generate-notes

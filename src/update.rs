@@ -5,6 +5,11 @@ use std::process::Command;
 pub const UPDATED_FLAG: &str = "--updated";
 const DOWNLOADS: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/download");
 const PROGRAM: &str = "tubefast.exe";
+const LINUX_PROGRAM: &str = "tubefast-linux-x64";
+const LINUX_APPIMAGE: &str = "Tubefast-x86_64.AppImage";
+const MACOS_ARCHIVE: &str = "tubefast-macos-universal.zip";
+const MACOS_BUNDLE: &str = "Tubefast.app";
+const WRITE_PROBE: &str = ".tubefast-write-probe";
 const CHECKSUMS: &str = "SHA256SUMS.txt";
 const PROGRAM_BYTES: u64 = 64 * 1024 * 1024;
 const SCOOP_FOLDER: &str = "\\scoop\\apps\\";
@@ -16,11 +21,68 @@ pub enum Plan {
     DownloadPage,
 }
 
+struct Placement {
+    asset: &'static str,
+    replace: PathBuf,
+    bundle: bool,
+}
+
+fn writable(folder: &Path) -> bool {
+    let probe = folder.join(WRITE_PROBE);
+    let created = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(probe);
+    created
+}
+
+fn app_bundle(program: &Path) -> Option<&Path> {
+    program
+        .ancestors()
+        .nth(3)
+        .filter(|bundle| bundle.extension().is_some_and(|extension| extension == "app"))
+}
+
+fn placement() -> Option<Placement> {
+    let program = std::env::current_exe().ok()?;
+    if cfg!(windows) {
+        return Some(Placement {
+            asset: PROGRAM,
+            replace: program,
+            bundle: false,
+        });
+    }
+    let placement = if cfg!(target_os = "macos") {
+        Placement {
+            asset: MACOS_ARCHIVE,
+            replace: app_bundle(&program)?.to_path_buf(),
+            bundle: true,
+        }
+    } else {
+        if std::env::consts::ARCH != "x86_64" {
+            return None;
+        }
+        let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from).filter(|path| path.is_file());
+        match appimage {
+            Some(appimage) => Placement {
+                asset: LINUX_APPIMAGE,
+                replace: appimage,
+                bundle: false,
+            },
+            None => Placement {
+                asset: LINUX_PROGRAM,
+                replace: program,
+                bundle: false,
+            },
+        }
+    };
+    writable(placement.replace.parent()?).then_some(placement)
+}
+
 pub fn plan() -> Plan {
     let program = std::env::current_exe().ok().filter(|_| cfg!(windows));
     match program {
         Some(program) if program.to_string_lossy().to_lowercase().contains(SCOOP_FOLDER) => Plan::PackageManager(SCOOP_COMMAND),
         Some(_) => Plan::InPlace,
+        None if placement().is_some() => Plan::InPlace,
         None => Plan::DownloadPage,
     }
 }
@@ -33,12 +95,12 @@ fn listed_checksum<'a>(checksums: &'a str, file: &str) -> Option<&'a str> {
     })
 }
 
-fn download(agent: &ureq::Agent, release: &str, into: &Path) -> Result<(), String> {
+fn download(agent: &ureq::Agent, release: &str, asset: &str, into: &Path) -> Result<(), String> {
     let failed = |error: ureq::Error| format!("the download failed ({error})");
     let checksums = agent.get(&format!("{release}/{CHECKSUMS}")).call().map_err(failed)?;
     let checksums = checksums.into_string().map_err(|e| e.to_string())?;
-    let expected = listed_checksum(&checksums, PROGRAM).ok_or("the release lists no checksum for the program")?;
-    let response = agent.get(&format!("{release}/{PROGRAM}")).call().map_err(failed)?;
+    let expected = listed_checksum(&checksums, asset).ok_or("the release lists no checksum for the program")?;
+    let response = agent.get(&format!("{release}/{asset}")).call().map_err(failed)?;
     let mut body = response.into_reader().take(PROGRAM_BYTES);
     let mut file = std::fs::File::create(into).map_err(|e| format!("this folder cannot be written to ({e})"))?;
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
@@ -60,9 +122,40 @@ fn download(agent: &ureq::Agent, release: &str, into: &Path) -> Result<(), Strin
     Err("the download does not match its published checksum".to_owned())
 }
 
+fn remove_path(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn unpack(archive: &Path, folder: &Path) -> Result<PathBuf, String> {
+    remove_path(folder);
+    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    let unpacked = Command::new("ditto").args(["-x", "-k"]).arg(archive).arg(folder).status();
+    let bundle = folder.join(MACOS_BUNDLE);
+    if unpacked.is_ok_and(|status| status.success()) && bundle.is_dir() {
+        Ok(bundle)
+    } else {
+        Err("the download could not be unpacked".to_owned())
+    }
+}
+
 fn swap(program: &Path, fresh: &Path) -> Result<(), String> {
     let previous = program.with_extension("old");
-    let _ = std::fs::remove_file(&previous);
+    remove_path(&previous);
     std::fs::rename(program, &previous).map_err(|e| format!("the running program could not be moved aside ({e})"))?;
     std::fs::rename(fresh, program).map_err(|error| {
         let _ = std::fs::rename(&previous, program);
@@ -72,10 +165,20 @@ fn swap(program: &Path, fresh: &Path) -> Result<(), String> {
 
 pub fn install(agent: &ureq::Agent, version: &str) -> Result<PathBuf, String> {
     let program = std::env::current_exe().map_err(|e| e.to_string())?;
-    let fresh = program.with_extension("new");
-    download(agent, &format!("{DOWNLOADS}/v{version}"), &fresh)?;
-    swap(&program, &fresh)?;
-    Ok(program)
+    let placement = placement().ok_or("this installation cannot update itself")?;
+    let downloaded = placement.replace.with_extension("new");
+    download(agent, &format!("{DOWNLOADS}/v{version}"), placement.asset, &downloaded)?;
+    if placement.bundle {
+        let unpacked = placement.replace.with_extension("unpacked");
+        let fresh = unpack(&downloaded, &unpacked)?;
+        swap(&placement.replace, &fresh)?;
+        remove_path(&unpacked);
+        remove_path(&downloaded);
+        return Ok(program);
+    }
+    make_executable(&downloaded)?;
+    swap(&placement.replace, &downloaded)?;
+    Ok(placement.replace)
 }
 
 pub fn restart(program: &Path, arguments: &[String]) {
@@ -83,9 +186,10 @@ pub fn restart(program: &Path, arguments: &[String]) {
 }
 
 pub fn clear_leftovers() {
-    if let Ok(program) = std::env::current_exe() {
-        let _ = std::fs::remove_file(program.with_extension("old"));
-        let _ = std::fs::remove_file(program.with_extension("new"));
+    if let Some(placement) = placement() {
+        for leftover in ["old", "new", "unpacked"] {
+            remove_path(&placement.replace.with_extension(leftover));
+        }
     }
 }
 
@@ -138,6 +242,14 @@ mod tests {
     }
 
     #[test]
+    fn finds_the_app_bundle_only_around_the_program() {
+        let inside = Path::new("/Applications/Tubefast.app/Contents/MacOS/tubefast");
+        assert_eq!(app_bundle(inside), Some(Path::new("/Applications/Tubefast.app")));
+        assert_eq!(app_bundle(Path::new("/home/me/.local/bin/tubefast")), None);
+        assert_eq!(app_bundle(Path::new("/Users/me/target/release/tubefast")), None);
+    }
+
+    #[test]
     fn installs_a_verified_download_and_refuses_a_tampered_one() {
         let folder = std::env::temp_dir().join(format!("tubefast-update-test-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
@@ -145,12 +257,12 @@ mod tests {
         std::fs::write(&program, b"the running version").unwrap();
         let agent = ureq::agent();
 
-        let tampered = download(&agent, &serve(WRONG_CHECKSUM.to_owned()), &fresh);
+        let tampered = download(&agent, &serve(WRONG_CHECKSUM.to_owned()), PROGRAM, &fresh);
         assert!(tampered.unwrap_err().contains("checksum"));
         assert!(!fresh.exists());
         assert_eq!(std::fs::read(&program).unwrap(), b"the running version");
 
-        download(&agent, &serve(sha256(NEW_PROGRAM)), &fresh).unwrap();
+        download(&agent, &serve(sha256(NEW_PROGRAM)), PROGRAM, &fresh).unwrap();
         swap(&program, &fresh).unwrap();
         assert_eq!(std::fs::read(&program).unwrap(), NEW_PROGRAM);
         assert_eq!(std::fs::read(folder.join("Tubefast.old")).unwrap(), b"the running version");
