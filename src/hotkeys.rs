@@ -241,12 +241,103 @@ impl Drop for Hotkeys {
 }
 
 #[cfg(not(windows))]
-pub struct Hotkeys;
+pub struct Hotkeys {
+    manager: global_hotkey::GlobalHotKeyManager,
+    registered: Vec<global_hotkey::hotkey::HotKey>,
+}
+
+#[cfg(not(windows))]
+fn code_name(vk: u32) -> Option<String> {
+    let name = match vk {
+        0x09 => "Tab".to_owned(),
+        0x0D => "Enter".to_owned(),
+        0x20 => "Space".to_owned(),
+        0x21 => "PageUp".to_owned(),
+        0x22 => "PageDown".to_owned(),
+        0x23 => "End".to_owned(),
+        0x24 => "Home".to_owned(),
+        0x25 => "ArrowLeft".to_owned(),
+        0x26 => "ArrowUp".to_owned(),
+        0x27 => "ArrowRight".to_owned(),
+        0x28 => "ArrowDown".to_owned(),
+        0x2D => "Insert".to_owned(),
+        0x30..=0x39 => format!("Digit{}", vk - 0x30),
+        0x41..=0x5A => format!("Key{}", char::from_u32(vk)?),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        _ => return None,
+    };
+    Some(name)
+}
+
+#[cfg(not(windows))]
+fn hotkey_of(combo: Combo) -> Option<global_hotkey::hotkey::HotKey> {
+    use global_hotkey::hotkey::{Code, HotKey, Modifiers as Held};
+    let held = [(ALT, Held::ALT), (CTRL, Held::CONTROL), (SHIFT, Held::SHIFT)]
+        .into_iter()
+        .filter(|(bit, _)| combo.mods & bit != 0)
+        .fold(Held::empty(), |held, (_, modifier)| held | modifier);
+    Some(HotKey::new(Some(held), code_name(combo.vk)?.parse::<Code>().ok()?))
+}
+
+#[cfg(not(windows))]
+pub fn unavailable() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        return None;
+    }
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11 {
+        Some("Wayland does not let apps listen for keys in the background. Log in with an X11 session to use them")
+    } else if std::env::var_os("DISPLAY").is_none() {
+        Some("No X11 display was found")
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+pub fn unavailable() -> Option<&'static str> {
+    None
+}
 
 #[cfg(not(windows))]
 impl Hotkeys {
-    pub fn start(_: Vec<(Command, Combo)>, _: impl Fn(Command) + Send + 'static) -> Option<(Self, Vec<Command>)> {
-        None
+    pub fn start(bindings: Vec<(Command, Combo)>, press: impl Fn(Command) + Send + 'static) -> Option<(Self, Vec<Command>)> {
+        use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+
+        if unavailable().is_some() {
+            return None;
+        }
+        let manager = GlobalHotKeyManager::new().ok()?;
+        let (mut registered, mut taken, mut commands) = (Vec::new(), Vec::new(), Vec::new());
+        for (command, combo) in bindings {
+            match hotkey_of(combo) {
+                Some(hotkey) if manager.register(hotkey).is_ok() => {
+                    commands.push((hotkey.id(), command));
+                    registered.push(hotkey);
+                }
+                _ => taken.push(command),
+            }
+        }
+        let press = std::sync::Mutex::new(press);
+        GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
+            if event.state() != HotKeyState::Pressed {
+                return;
+            }
+            if let Some((_, command)) = commands.iter().find(|(id, _)| *id == event.id())
+                && let Ok(press) = press.lock()
+            {
+                press(*command);
+            }
+        }));
+        Some((Self { manager, registered }, taken))
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for Hotkeys {
+    fn drop(&mut self) {
+        global_hotkey::GlobalHotKeyEvent::set_event_handler(None::<fn(global_hotkey::GlobalHotKeyEvent)>);
+        let _ = self.manager.unregister_all(&self.registered);
     }
 }
 

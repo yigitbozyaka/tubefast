@@ -2066,7 +2066,8 @@ fn discord_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
 }
 
 fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    let rows = if hotkeys::SUPPORTED {
+    let unavailable = hotkeys::unavailable();
+    let rows = if unavailable.is_none() {
         Command::ALL.len() as f32 * HOTKEY_ROW
     } else {
         0.0
@@ -2074,13 +2075,12 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     let height = 2.0 * CARD_PAD + SETTING_ROW + rows;
     let card = section(ui, "Global hotkeys", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
-        if !hotkeys::SUPPORTED {
+        if let Some(reason) = unavailable {
             let (row, _) = ui.allocate_exact_size(size, Sense::hover());
             let at = pos2(row.left() + 22.0, row.center().y);
             ui.painter().text(at, Align2::CENTER_CENTER, icon::KEYBOARD, glyph(17.0), MUTED);
-            let text = "Global hotkeys are only available on Windows for now";
             let at = pos2(row.left() + 46.0, row.center().y);
-            label(ui, at, Align2::LEFT_CENTER, text, medium(13.5), MUTED, size.x - 58.0);
+            label(ui, at, Align2::LEFT_CENTER, reason, medium(13.5), MUTED, size.x - 58.0);
             return;
         }
         if switch_row(ui, size, icon::KEYBOARD, "Enable global hotkeys", app.saved.hotkeys) {
@@ -2092,7 +2092,7 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
             hotkey_row(ui, app, command, app.saved.hotkeys, out);
         }
     });
-    if !hotkeys::SUPPORTED {
+    if unavailable.is_some() {
         return;
     }
     let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
