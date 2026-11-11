@@ -93,6 +93,15 @@ impl Item {
     pub fn key(&self) -> &str {
         if self.is_song() { &self.video_id } else { &self.browse_id }
     }
+
+    pub fn credit(&self) -> &str {
+        let mut parts = self.subtitle.split(" • ");
+        let named = self
+            .artists
+            .first()
+            .and_then(|(name, _)| parts.clone().find(|part| part.contains(name.as_str())));
+        named.or_else(|| parts.next()).unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -305,6 +314,10 @@ impl Client {
             self.expired.lock().unwrap().take();
         }
         account
+    }
+
+    pub fn current_account(&self) -> Result<Account, String> {
+        self.account()
     }
 
     fn account(&self) -> Result<Account, String> {
@@ -1364,6 +1377,18 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_credit_names_the_artists_without_the_view_count() {
+        let song = |subtitle: &str, artist: &str| Item {
+            subtitle: subtitle.to_owned(),
+            artists: vec![(artist.to_owned(), String::new())],
+            ..Item::default()
+        };
+        assert_eq!(song("Adele fasbrasil • 5.9M views", "Adele fasbrasil").credit(), "Adele fasbrasil");
+        assert_eq!(song("Video • Prince • 12M views", "Prince").credit(), "Prince");
+        assert_eq!(song("Daft Punk • Random Access Memories", "").credit(), "Daft Punk");
+    }
 
     #[test]
     fn shelves_expose_where_the_full_list_lives() {

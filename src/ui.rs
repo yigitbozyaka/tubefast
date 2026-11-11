@@ -515,16 +515,22 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
             .show_separator_line(false)
             .frame(plain(PANEL))
             .show(ctx, |ui| sidebar(app, ui, &mut out));
-        let queue_fits = app.saved.queue_open && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
+        let queue_wanted = app.saved.queue_open;
+        let queue_fits = queue_wanted && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
+        let queue_instead = queue_wanted && !queue_fits;
         egui::SidePanel::right("queue")
             .exact_width(QUEUE_WIDTH)
             .resizable(false)
             .show_separator_line(false)
             .frame(plain(PANEL))
             .show_animated(ctx, queue_fits, |ui| queue_panel(app, ui, &mut out));
-        egui::CentralPanel::default()
-            .frame(plain(BASE))
-            .show(ctx, |ui| content(app, ui, &mut out));
+        egui::CentralPanel::default().frame(plain(BASE)).show(ctx, |ui| {
+            if queue_instead {
+                queue_panel(app, ui, &mut out);
+            } else {
+                content(app, ui, &mut out);
+            }
+        });
     }
     app.title_bar.paint(frame);
     paint_scrubber(ctx, &scrub);
@@ -2076,24 +2082,27 @@ fn discord_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     });
 }
 
+fn notice_section(ui: &mut Ui, title: &str, symbol: &str, reason: &str) {
+    let text_width = ui.available_width().min(SETTINGS_WIDTH) - 2.0 * CARD_PAD - 58.0;
+    let galley = fit(ui, reason, medium(13.5), MUTED, text_width, 8);
+    let row_height = SETTING_ROW.max(galley.size().y + 24.0);
+    section(ui, title, 2.0 * CARD_PAD + row_height, |ui| {
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::hover());
+        let at = pos2(row.left() + 22.0, row.center().y);
+        ui.painter().text(at, Align2::CENTER_CENTER, symbol, glyph(17.0), MUTED);
+        let at = pos2(row.left() + 46.0, row.center().y - galley.size().y / 2.0);
+        ui.painter().galley(at, galley, MUTED);
+    });
+}
+
 fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    let unavailable = hotkeys::unavailable();
-    let rows = if unavailable.is_none() {
-        hotkeys::listed().len() as f32 * HOTKEY_ROW
-    } else {
-        0.0
-    };
-    let height = 2.0 * CARD_PAD + SETTING_ROW + rows;
+    if let Some(reason) = hotkeys::unavailable() {
+        notice_section(ui, "Global hotkeys", icon::KEYBOARD, reason);
+        return;
+    }
+    let height = 2.0 * CARD_PAD + SETTING_ROW + hotkeys::listed().len() as f32 * HOTKEY_ROW;
     let card = section(ui, "Global hotkeys", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
-        if let Some(reason) = unavailable {
-            let (row, _) = ui.allocate_exact_size(size, Sense::hover());
-            let at = pos2(row.left() + 22.0, row.center().y);
-            ui.painter().text(at, Align2::CENTER_CENTER, icon::KEYBOARD, glyph(17.0), MUTED);
-            let at = pos2(row.left() + 46.0, row.center().y);
-            label(ui, at, Align2::LEFT_CENTER, reason, medium(13.5), MUTED, size.x - 58.0);
-            return;
-        }
         if switch_row(ui, size, icon::KEYBOARD, "Enable global hotkeys", app.saved.hotkeys) {
             out.push(Action::GlobalHotkeys(!app.saved.hotkeys));
         }
@@ -2103,9 +2112,6 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
             hotkey_row(ui, app, command, app.saved.hotkeys, out);
         }
     });
-    if unavailable.is_some() {
-        return;
-    }
     let reset_at = pos2(card.right() - 10.0, card.top() - 15.0);
     if !hotkeys::through_portal()
         && app.saved.hotkey_combos != hotkeys::standard_combos()
@@ -2181,14 +2187,7 @@ fn overlay_unavailable() -> Option<&'static str> {
 
 fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     if let Some(reason) = overlay_unavailable() {
-        section(ui, "Overlay", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
-            let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), SETTING_ROW), Sense::hover());
-            let at = pos2(row.left() + 22.0, row.center().y);
-            ui.painter()
-                .text(at, Align2::CENTER_CENTER, icon::PICTURE_IN_PICTURE, glyph(17.0), MUTED);
-            let at = pos2(row.left() + 46.0, row.center().y);
-            label(ui, at, Align2::LEFT_CENTER, reason, medium(13.5), MUTED, row.width() - 58.0);
-        });
+        notice_section(ui, "Overlay", icon::PICTURE_IN_PICTURE, reason);
         return;
     }
     let height = 2.0 * CARD_PAD + 4.0 * SETTING_ROW;
@@ -3183,12 +3182,19 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
     let pressed = if toggle.is_pointer_button_down_on() { 1.0 } else { 0.0 };
     ui.painter()
         .circle_filled(center, 20.0 + lift - pressed, if active { TEXT } else { veil(0.14) });
+    let failed = app.player.failed() && !app.player.loading();
     if app.player.loading() {
         egui::Spinner::new()
             .color(PANEL)
             .paint_at(ui, Rect::from_center_size(center, Vec2::splat(18.0)));
     } else {
-        let symbol = if app.playing() { icon::PAUSE } else { icon::PLAY };
+        let symbol = if failed {
+            icon::ARROW_CLOCKWISE
+        } else if app.playing() {
+            icon::PAUSE
+        } else {
+            icon::PLAY
+        };
         ui.painter().text(
             center,
             Align2::CENTER_CENTER,
@@ -3197,7 +3203,13 @@ fn player_bar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Scrub {
             if active { PANEL } else { FAINT },
         );
     }
-    let name = if app.playing() { "Pause" } else { "Play" };
+    let name = if failed {
+        "Could not play. Try again"
+    } else if app.playing() {
+        "Pause"
+    } else {
+        "Play"
+    };
     describe(&toggle, name);
     if toggle.on_hover_text(name).clicked() {
         out.push(Action::Toggle);

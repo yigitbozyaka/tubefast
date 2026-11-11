@@ -272,6 +272,7 @@ enum Event {
     Part(u64, usize, Vec<Section>),
     FullSection(Route, usize, Target, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
+    AccountRestored(String, Result<Account, String>),
     Library(Vec<Item>),
     Accounts(Vec<Account>),
     Liked(Vec<Item>),
@@ -294,6 +295,7 @@ pub struct App {
     home_load: u64,
     geometry: Option<String>,
     cancel_sign_in: Arc<AtomicBool>,
+    restoring_account: bool,
     cover_queue: Vec<String>,
     cover_tried: HashSet<String>,
     pub fetching_all: HashSet<(Route, usize)>,
@@ -303,6 +305,7 @@ pub struct App {
     hotkeys: Option<Hotkeys>,
     tray: Option<Tray>,
     window: isize,
+    fitted: Option<egui::Vec2>,
     replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
     playback: Arc<Mutex<Playback>>,
@@ -381,6 +384,7 @@ impl App {
             home_load: 0,
             geometry: cc.storage.and_then(|storage| storage.get_string(WINDOW_KEY)),
             cancel_sign_in: Arc::default(),
+            restoring_account: false,
             cover_queue: Vec::new(),
             cover_tried: HashSet::new(),
             fetching_all: HashSet::new(),
@@ -390,6 +394,7 @@ impl App {
             hotkeys: None,
             tray: None,
             window: tray::window_of(cc),
+            fitted: None,
             replaced: None,
             growing: None,
             playback,
@@ -431,6 +436,9 @@ impl App {
         app.restart_hotkeys();
         app.restart_tray();
         app.load_library();
+        auth::secure_session_storage();
+        auth::remove_leftover_sign_in_profiles();
+        app.restore_account();
         app.background(|yt| {
             yt.refresh_clients();
             let latest = yt.agent.head(LATEST_RELEASE).call().ok()?;
@@ -512,11 +520,24 @@ impl App {
         }
     }
 
+    fn restore_account(&mut self) {
+        let Some(session) = self
+            .yt
+            .session()
+            .filter(|_| self.saved.account.is_none() && !self.restoring_account)
+        else {
+            return;
+        };
+        self.restoring_account = true;
+        self.background(move |yt| Some(Event::AccountRestored(session, yt.current_account())));
+    }
+
     fn refresh(&mut self) {
         self.pages.clear();
         self.library.clear();
         self.ensure(&self.route().clone());
         self.load_library();
+        self.restore_account();
     }
 
     fn start_sign_in(&mut self, status: &str, cookie: impl FnOnce() -> Result<String, String> + Send + 'static) {
@@ -679,6 +700,7 @@ impl App {
     }
 
     fn sync(&mut self, playback: &mut Playback) {
+        self.saved.volume = playback.player.volume();
         for item in playback.take_started() {
             self.saved.recent.retain(|recent| recent.video_id != item.video_id);
             self.saved.recent.insert(0, item);
@@ -760,6 +782,15 @@ impl App {
                     self.saved.account = Some(account);
                     self.sign_in = None;
                     self.refresh();
+                }
+                Event::AccountRestored(asked_with, restored) => {
+                    self.restoring_account = false;
+                    let same_session = self.yt.session().is_some_and(|now| auth::same_login(&now, &asked_with));
+                    match restored {
+                        Ok(account) if same_session && self.saved.account.is_none() => self.saved.account = Some(account),
+                        Err(message) if same_session => eprintln!("Could not confirm the saved YouTube sign-in: {message}"),
+                        _ => {}
+                    }
                 }
                 Event::SignedIn(Ok(_)) => self.yt.set_session(None),
                 Event::SignedIn(Err(message)) => {
@@ -1170,9 +1201,32 @@ impl eframe::App for App {
                 tray.hide();
             }
         }
-        let (size, minimized) = ctx.input(|input| (input.content_rect().size(), input.viewport().minimized == Some(true)));
-        if !minimized && (size.x < WINDOW_MIN[0] - 1.0 || size.y < WINDOW_MIN[1] - 1.0) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(WINDOW_SIZE.into()));
+        let (size, minimized, monitor, resizable) = ctx.input(|input| {
+            let viewport = input.viewport();
+            (
+                input.content_rect().size(),
+                viewport.minimized == Some(true),
+                viewport.monitor_size,
+                viewport.maximized != Some(true) && viewport.fullscreen != Some(true),
+            )
+        });
+        let fit = |target: [f32; 2]| match monitor {
+            Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
+            None => egui::vec2(target[0], target[1]),
+        };
+        let (wanted, floor) = (fit(WINDOW_SIZE), fit(WINDOW_MIN));
+        let overflows = monitor.is_some_and(|monitor| size.x > monitor.x + 1.0 || size.y > monitor.y + 1.0);
+        if !overflows {
+            self.fitted = None;
+        }
+        if !minimized && resizable && overflows {
+            if self.fitted != Some(wanted) {
+                self.fitted = Some(wanted);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+            }
+        } else if !minimized && (size.x < floor.x - 1.0 || size.y < floor.y - 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
         }
         self.art.begin_frame(ctx);
         let playback = self.playback.clone();
@@ -1197,6 +1251,8 @@ impl eframe::App for App {
         let playing = item.is_some() && !self.player.paused();
         let (position_ms, duration_ms) = (self.player.position_ms(), self.player.duration_ms());
         if let Some(media) = &mut self.media {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            media.set_volume(self.saved.volume);
             media.show(item, playing, position_ms, duration_ms);
         }
         if let Some(discord) = self.discord.as_mut().filter(|_| !self.player.loading()) {
@@ -1207,6 +1263,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        tray::release_activation();
         if let Some(program) = &self.restart {
             update::restart(program, &crate::profile_arguments());
         }
@@ -1225,6 +1282,12 @@ impl eframe::App for App {
         self.sync(&mut playback);
         self.saved.position_ms = playback.position_ms();
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        tray::release_activation();
     }
 }
 

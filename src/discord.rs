@@ -170,7 +170,7 @@ fn activity(item: &Item, cover: &str, headline: Headline, name: &str, started: u
         "type": LISTENING,
         "status_display_type": field,
         "details": line(&item.title),
-        "state": line(artist(item)),
+        "state": line(item.credit()),
         "timestamps": { "start": started, "end": started + duration_ms },
     });
     if let Some(name) = line(name) {
@@ -180,15 +180,6 @@ fn activity(item: &Item, cover: &str, headline: Headline, name: &str, started: u
         activity["assets"] = json!({ "large_image": ytm::sized(cover, COVER_SIDE) });
     }
     activity
-}
-
-fn artist(item: &Item) -> &str {
-    let mut parts = item.subtitle.split(" • ");
-    let named = item
-        .artists
-        .first()
-        .and_then(|(name, _)| parts.clone().find(|part| part.contains(name.as_str())));
-    named.or_else(|| parts.next()).unwrap_or_default()
 }
 
 fn line(text: &str) -> Option<String> {
