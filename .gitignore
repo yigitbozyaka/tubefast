@@ -1,1 +1,3 @@
 /target
+/vendor/opus-decoder/target/
+/vendor/opus-decoder/Cargo.lock
