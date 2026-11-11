@@ -51,7 +51,7 @@ const TRACK_PAGES: usize = 50;
 const REJECTION_RECHECK_DELAY: Duration = Duration::from_secs(2);
 const REJECTION_CONFIRM_AFTER: Duration = Duration::from_secs(30);
 const REJECTION_STALE_AFTER: Duration = Duration::from_secs(600);
-const SESSION_REJECTED: &str = "YouTube did not accept this sign-in. Sign in again.";
+const SESSION_REJECTED: &str = "Your saved sign-in has probably expired. Sign in again, preferably with browser login.";
 const UNUSED_KEYS: [&str; 14] = [
     "counterpart",
     "menu",
@@ -265,6 +265,27 @@ impl Client {
 
     pub fn act_as(&self, page: &str) {
         *self.page.lock().unwrap() = page.to_owned();
+    }
+
+    pub fn session(&self) -> Option<String> {
+        self.session.lock().unwrap().clone()
+    }
+
+    fn rotate(&self, used: &str, set_cookies: &[&str]) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64);
+        let mut session = self.session.lock().unwrap();
+        let Some(merged) = session
+            .as_deref()
+            .filter(|current| auth::same_login(current, used))
+            .and_then(|current| auth::merge_set_cookies(current, set_cookies, now))
+        else {
+            return;
+        };
+        *session = Some(merged);
+        drop(session);
+        auth::persist_rotation(used, set_cookies, now);
     }
 
     pub fn signed_in(&self) -> bool {
@@ -687,7 +708,12 @@ impl Client {
             outcome = request.send_json(body);
         }
         let response = match outcome {
-            Ok(response) => read(response)?,
+            Ok(response) => {
+                if let Some(used) = &cookie {
+                    self.rotate(used, &response.all("set-cookie"));
+                }
+                read(response)?
+            }
             Err(ureq::Error::Status(401, _)) if cookie.is_some() => {
                 self.judge_unauthorized(&cookie.unwrap_or_default(), Signal::Rejected);
                 return Err(SESSION_REJECTED.to_owned());

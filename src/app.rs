@@ -95,6 +95,7 @@ pub struct Saved {
     pub overlay_controls: bool,
     pub overlay_next_up: bool,
     pub notes_seen: String,
+    pub browser: String,
 }
 
 pub enum Words {
@@ -139,6 +140,9 @@ pub struct SignIn {
     pub cookie: String,
     pub busy: bool,
     pub status: String,
+    pub browsers: Vec<auth::Installed>,
+    pub chosen: usize,
+    pub picking: bool,
 }
 
 impl Default for Saved {
@@ -172,6 +176,7 @@ impl Default for Saved {
             overlay_controls: true,
             overlay_next_up: true,
             notes_seen: String::new(),
+            browser: String::new(),
         }
     }
 }
@@ -228,6 +233,8 @@ pub enum Action {
     CloseSignIn,
     BrowserSignIn,
     CookieSignIn,
+    PickBrowser(usize),
+    ClosePicker,
     SignOut,
     SwitchAccount(Account),
     Undo,
@@ -518,8 +525,21 @@ impl App {
             sign_in.status = status.to_owned();
         }
         self.background(move |yt| {
-            let signed = cookie().and_then(|cookie| Ok((yt.sign_in(cookie.clone())?, cookie)));
+            let signed = cookie().and_then(|cookie| Ok((yt.sign_in(cookie.clone())?, yt.session().unwrap_or(cookie))));
             Some(Event::SignedIn(signed))
+        });
+    }
+
+    fn launch_browser_sign_in(&mut self) {
+        self.cancel_sign_in.store(true, Relaxed);
+        self.cancel_sign_in = Arc::default();
+        let cancel = self.cancel_sign_in.clone();
+        let browser = self
+            .sign_in
+            .as_ref()
+            .and_then(|sign_in| sign_in.browsers.get(sign_in.chosen).cloned());
+        self.start_sign_in("Finish signing in in the browser window. It closes by itself.", move || {
+            auth::browser_sign_in(&cancel, &browser.ok_or(auth::NO_BROWSER)?)
         });
     }
 
@@ -1026,19 +1046,38 @@ impl App {
             Action::ToggleQueue => self.saved.queue_open ^= true,
             Action::ToggleShuffle => playback.toggle_shuffle(),
             Action::CycleRepeat => playback.cycle_repeat(),
-            Action::OpenSignIn => self.sign_in = Some(SignIn::default()),
+            Action::OpenSignIn => {
+                let browsers = auth::installed_browsers();
+                let chosen = auth::chosen_index(&browsers, &self.saved.browser);
+                self.sign_in = Some(SignIn {
+                    browsers,
+                    chosen,
+                    ..SignIn::default()
+                });
+            }
+            Action::PickBrowser(at) => {
+                if let Some(sign_in) = &mut self.sign_in
+                    && let Some(browser) = sign_in.browsers.get(at)
+                {
+                    sign_in.chosen = at;
+                    sign_in.picking = false;
+                    self.saved.browser = browser.name.to_owned();
+                    self.launch_browser_sign_in();
+                }
+            }
+            Action::ClosePicker => {
+                if let Some(sign_in) = &mut self.sign_in {
+                    sign_in.picking = false;
+                }
+            }
             Action::CloseSignIn => {
                 self.cancel_sign_in.store(true, Relaxed);
                 self.sign_in = None;
             }
-            Action::BrowserSignIn => {
-                self.cancel_sign_in.store(true, Relaxed);
-                self.cancel_sign_in = Arc::default();
-                let cancel = self.cancel_sign_in.clone();
-                self.start_sign_in("Finish signing in in the browser window. It closes by itself.", move || {
-                    auth::browser_sign_in(&cancel)
-                });
-            }
+            Action::BrowserSignIn => match &mut self.sign_in {
+                Some(sign_in) if sign_in.browsers.len() > 1 => sign_in.picking = true,
+                _ => self.launch_browser_sign_in(),
+            },
             Action::CookieSignIn => {
                 let pasted = self.sign_in.as_ref().map(|sign_in| sign_in.cookie.clone()).unwrap_or_default();
                 self.start_sign_in("Checking with YouTube.", move || auth::clean_cookie(&pasted));
