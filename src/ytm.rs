@@ -620,15 +620,40 @@ impl Client {
     }
 
     pub fn stream(&self, video_id: &str) -> Result<Stream, String> {
-        let mut response = self.player(video_id)?;
+        self.stream_if_current(video_id, || true)?
+            .ok_or_else(|| "Stream resolution was cancelled".to_owned())
+    }
+
+    pub fn stream_if_current(&self, video_id: &str, current: impl Fn() -> bool) -> Result<Option<Stream>, String> {
+        if !current() {
+            return Ok(None);
+        }
+        let Some(mut response) = self.player(video_id, &current)? else {
+            return Ok(None);
+        };
         if audio(&response).is_none() {
+            if !current() {
+                return Ok(None);
+            }
             self.visitor.lock().unwrap().clear();
-            response = self.player(video_id)?;
+            let Some(retried) = self.player(video_id, &current)? else {
+                return Ok(None);
+            };
+            response = retried;
         }
-        if audio(&response).is_none() && self.refresh_clients() {
-            response = self.player(video_id)?;
+        if audio(&response).is_none() && current() && self.refresh_clients() {
+            if !current() {
+                return Ok(None);
+            }
+            let Some(refreshed) = self.player(video_id, &current)? else {
+                return Ok(None);
+            };
+            response = refreshed;
         }
-        audio(&response).ok_or_else(|| {
+        if !current() {
+            return Ok(None);
+        }
+        audio(&response).map(Some).ok_or_else(|| {
             let status = &response["playabilityStatus"];
             let reason = if playable(&response) {
                 None
@@ -639,8 +664,14 @@ impl Client {
         })
     }
 
-    fn player(&self, video_id: &str) -> Result<Value, String> {
+    fn player(&self, video_id: &str, current: &impl Fn() -> bool) -> Result<Option<Value>, String> {
+        if !current() {
+            return Ok(None);
+        }
         let visitor = self.ensure_visitor()?;
+        if !current() {
+            return Ok(None);
+        }
         let (mut client, id, user_agent) = {
             let player = &self.clients.lock().unwrap().player;
             (player.client.clone(), player.id.clone(), player.user_agent.clone())
@@ -662,10 +693,12 @@ impl Client {
             .set("X-YouTube-Client-Version", &version)
             .set("X-Goog-Visitor-Id", &visitor);
         match request.send_json(body) {
-            Ok(response) => read(response),
-            Err(ureq::Error::Status(code, _)) => {
-                Ok(json!({ "playabilityStatus": { "reason": format!("YouTube answered with HTTP {code}") } }))
-            }
+            Ok(response) if current() => read(response).map(Some),
+            Ok(_) => Ok(None),
+            Err(_) if !current() => Ok(None),
+            Err(ureq::Error::Status(code, _)) => Ok(Some(
+                json!({ "playabilityStatus": { "reason": format!("YouTube answered with HTTP {code}") } }),
+            )),
             Err(error) => Err(describe(error)),
         }
     }
@@ -1379,6 +1412,12 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_stream_resolution_stops_before_network_requests() {
+        let client = Client::new(String::new());
+        assert!(client.stream_if_current("stale", || false).unwrap().is_none());
+    }
 
     #[test]
     fn the_credit_names_the_artists_without_the_view_count() {
