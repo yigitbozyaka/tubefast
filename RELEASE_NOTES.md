@@ -1,1 +1,2 @@
-- The media overlay now also works on Linux Wayland desktops that support the layer shell protocol, such as KDE Plasma, Hyprland and sway. GNOME does not support it, and Settings says so
+- Sign in with Brave Origin or Helium on Linux as well
+- The media overlay now also works on Linux Wayland desktops that support layer shell, such as KDE Plasma, Sway and Hyprland. It does not work on GNOME, and Settings says so

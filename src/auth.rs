@@ -49,7 +49,7 @@ const BROWSERS: [(Family, &str, &str, &str); 14] = [
     (Family::Firefox, "Floorp", "ProgramFiles", r"Floorp\floorp.exe"),
     (Family::Firefox, "Firefox", "LocalAppData", r"Mozilla Firefox\firefox.exe"),
 ];
-const BROWSERS_ELSEWHERE: [(Family, &str, &str); 19] = [
+const BROWSERS_ELSEWHERE: [(Family, &str, &str); 23] = [
     (Family::Chromium, "Chrome", "google-chrome"),
     (Family::Chromium, "Chrome", "google-chrome-stable"),
     (Family::Chromium, "Chromium", "chromium"),
@@ -57,6 +57,10 @@ const BROWSERS_ELSEWHERE: [(Family, &str, &str); 19] = [
     (Family::Chromium, "Edge", "microsoft-edge"),
     (Family::Chromium, "Brave", "brave-browser"),
     (Family::Chromium, "Brave", "brave"),
+    (Family::Chromium, "Brave Origin", "brave-origin"),
+    (Family::Chromium, "Brave Origin", "brave-origin-stable"),
+    (Family::Chromium, "Helium", "helium"),
+    (Family::Chromium, "Helium", "helium-browser"),
     (
         Family::Chromium,
         "Chrome",

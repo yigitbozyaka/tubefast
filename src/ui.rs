@@ -2750,7 +2750,7 @@ fn browser_tile(ui: &Ui, at: Pos2, width: f32, name: &str, last_used: bool) -> R
 fn logo_bytes(name: &str) -> Option<&'static [u8]> {
     Some(match name {
         "Chrome" => include_bytes!("../assets/browsers/chrome.png"),
-        "Brave" => include_bytes!("../assets/browsers/brave.png"),
+        "Brave" | "Brave Origin" => include_bytes!("../assets/browsers/brave.png"),
         "Opera GX" => include_bytes!("../assets/browsers/operagx.png"),
         "Firefox" => include_bytes!("../assets/browsers/firefox.png"),
         "LibreWolf" => include_bytes!("../assets/browsers/librewolf.png"),
