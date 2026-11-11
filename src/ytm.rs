@@ -28,6 +28,7 @@ const THUMB_WIDTH: u64 = 700;
 const COVER_SIZE: &str = "=w544-h544-l90-rj";
 pub const VIDEO_FRAME_HOST: &str = "i.ytimg.com";
 pub const QUICK_PICKS: &str = "Quick picks";
+pub const PODCASTS: &str = "FEmusic_podcasts";
 const LISTED_FRAME_SIDE: u32 = 256;
 const SHARP_FRAME: &str = "maxresdefault.jpg";
 const LYRICS_TAB: &str = "MPLY";
@@ -881,7 +882,9 @@ fn continuation(response: &Value) -> Option<String> {
 }
 
 fn tracks_continuation(playlist: &Value) -> Option<String> {
-    find(playlist, "musicPlaylistShelfRenderer").and_then(continuation)
+    find(playlist, "musicPlaylistShelfRenderer")
+        .or_else(|| find(playlist, "musicShelfRenderer").filter(|shelf| find(shelf, "musicMultiRowListItemRenderer").is_some()))
+        .and_then(continuation)
 }
 
 fn inherit_header(page: &mut Page) {
@@ -1020,17 +1023,19 @@ pub fn parse_page(response: &Value) -> Page {
     page
 }
 
-const SHELVES: [&str; 5] = [
+const SHELVES: [&str; 6] = [
     "musicCarouselShelfRenderer",
     "musicShelfRenderer",
     "musicPlaylistShelfRenderer",
     "musicCardShelfRenderer",
     "gridRenderer",
+    "musicShelfContinuation",
 ];
-const ITEMS: [&str; 3] = [
+const ITEMS: [&str; 4] = [
     "musicResponsiveListItemRenderer",
     "musicTwoRowItemRenderer",
     "playlistPanelVideoRenderer",
+    "musicMultiRowListItemRenderer",
 ];
 const HEADERS: [&str; 4] = [
     "musicResponsiveHeaderRenderer",
@@ -1264,6 +1269,7 @@ fn item(node: &Value) -> Option<Item> {
     let column = |index: usize| text(&node["flexColumns"][index]["musicResponsiveListItemFlexColumnRenderer"]["text"]);
     let title = [text(&node["title"]), column(0)].into_iter().find(|s| !s.is_empty())?;
     let bylines = [
+        text(&node["secondTitle"]),
         text(&node["subtitle"]),
         text(&node["shortBylineText"]),
         text(&node["longBylineText"]),
@@ -1284,8 +1290,10 @@ fn item(node: &Value) -> Option<Item> {
         video_id: first_str(
             node,
             &[
+                "/onTap/watchEndpoint/videoId",
                 "/playlistItemData/videoId",
                 "/videoId",
+                "/title/runs/0/navigationEndpoint/watchEndpoint/videoId",
                 "/navigationEndpoint/watchEndpoint/videoId",
                 "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint/videoId",
                 "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
@@ -1303,7 +1311,19 @@ fn item(node: &Value) -> Option<Item> {
     };
     links(node, "", &mut it);
     it.is_artist = !it.is_song() && it.browse_id.starts_with("UC");
-    tidy(&mut it);
+    let episode = it.browse_id.starts_with("MPED")
+        || find(node, "musicVideoType").and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_PODCAST_EPISODE");
+    if episode {
+        if it.duration.is_empty() {
+            let duration = text(&node["playbackProgress"]["musicPlaybackProgressRenderer"]["durationText"]);
+            it.duration = duration.trim().trim_start_matches('•').trim().to_owned();
+        }
+        if !text(&node["secondTitle"]).is_empty() {
+            it.extra = text(&node["subtitle"]);
+        }
+    } else {
+        tidy(&mut it);
+    }
     (it.is_song() || !it.browse_id.is_empty()).then_some(it)
 }
 
@@ -1379,6 +1399,110 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn episode(id: &str) -> Value {
+        json!({ "musicMultiRowListItemRenderer": {
+            "title": { "runs": [{
+                "text": "An interview (feat. a guest)",
+                "navigationEndpoint": { "browseEndpoint": { "browseId": format!("MPED{id}") } },
+            }] },
+            "secondTitle": { "runs": [{ "text": "Example podcast" }] },
+            "subtitle": { "runs": [{ "text": "Nov 7" }] },
+            "onTap": { "watchEndpoint": {
+                "videoId": id,
+                "watchEndpointMusicSupportedConfigs": {
+                    "watchEndpointMusicConfig": { "musicVideoType": "MUSIC_VIDEO_TYPE_PODCAST_EPISODE" },
+                },
+            } },
+            "playbackProgress": { "musicPlaybackProgressRenderer": {
+                "durationText": { "runs": [{ "text": " • " }, { "text": "1 hr 20 min" }] },
+            } },
+            "thumbnail": { "musicThumbnailRenderer": {
+                "thumbnail": { "thumbnails": [{ "url": "https://i.ytimg.com/vi/episode/hqdefault.jpg" }] },
+            } },
+        } })
+    }
+
+    #[test]
+    fn keeps_podcast_shows_and_playable_episodes_in_the_catalog() {
+        let response = json!({ "contents": [
+            { "musicCarouselShelfRenderer": {
+                "header": { "musicCarouselShelfBasicHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Shows" }] },
+                } },
+                "contents": [{ "musicTwoRowItemRenderer": {
+                    "title": { "runs": [{ "text": "Example podcast" }] },
+                    "navigationEndpoint": { "browseEndpoint": { "browseId": "MPSPshow" } },
+                } }],
+            } },
+            { "musicCarouselShelfRenderer": {
+                "header": { "musicCarouselShelfBasicHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Episodes" }] },
+                } },
+                "contents": [episode("episode")],
+            } },
+        ] });
+        let raw = response.to_string();
+        let lean = Lean.deserialize(&mut serde_json::Deserializer::from_str(&raw)).unwrap();
+        let page = parse_page(&lean);
+        assert_eq!(page.sections.len(), 2);
+        assert_eq!(page.sections[0].items[0].browse_id, "MPSPshow");
+        assert!(!page.sections[0].items[0].is_song());
+        let songs = page.songs();
+        assert_eq!(songs.len(), 1);
+        let episode = &songs[0];
+        assert_eq!(episode.video_id, "episode");
+        assert_eq!(episode.browse_id, "MPEDepisode");
+        assert_eq!(episode.title, "An interview (feat. a guest)");
+        assert_eq!(episode.subtitle, "Example podcast");
+        assert_eq!(episode.extra, "Nov 7");
+        assert_eq!(episode.duration, "1 hr 20 min");
+        assert_eq!(episode.thumb, "https://i.ytimg.com/vi/episode/hqdefault.jpg");
+    }
+
+    #[test]
+    fn reads_show_episodes_and_their_own_continuation() {
+        let first = json!({ "twoColumnBrowseResultsRenderer": {
+            "tabs": [{ "tabRenderer": { "content": { "sectionListRenderer": {
+                "contents": [{ "musicResponsiveHeaderRenderer": {
+                    "title": { "runs": [{ "text": "Example podcast" }] },
+                } }],
+                "continuations": [{ "nextContinuationData": { "continuation": "suggestions" } }],
+            } } } }],
+            "secondaryContents": { "sectionListRenderer": { "contents": [{ "musicShelfRenderer": {
+                "contents": [episode("first")],
+                "continuations": [{ "nextContinuationData": { "continuation": "episodes" } }],
+            } }] } },
+        } });
+        let page = parse_page(&first);
+        assert_eq!(page.header.unwrap().title, "Example podcast");
+        assert_eq!(page.sections[0].layout, Layout::Tracks);
+        assert_eq!(page.sections[0].items[0].video_id, "first");
+        assert_eq!(tracks_continuation(&first).as_deref(), Some("episodes"));
+
+        let last = json!({ "continuationContents": { "musicShelfContinuation": {
+            "contents": [episode("second"), episode("third")],
+        } } });
+        let songs: Vec<String> = parse_page(&last).songs().into_iter().map(|song| song.video_id).collect();
+        assert_eq!(songs, ["second", "third"]);
+        assert_eq!(continuation(&last), None);
+    }
+
+    #[test]
+    fn recognizes_episode_search_results_without_a_watch_navigation_endpoint() {
+        let result = json!({ "musicResponsiveListItemRenderer": {
+            "title": { "runs": [{
+                "text": "An interview (feat. a guest)",
+                "navigationEndpoint": { "browseEndpoint": { "browseId": "MPEDepisode" } },
+            }] },
+            "subtitle": { "runs": [{ "text": "Example podcast" }] },
+            "playlistItemData": { "videoId": "episode" },
+        } });
+        let songs = parse_page(&result).songs();
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].video_id, "episode");
+        assert_eq!(songs[0].title, "An interview (feat. a guest)");
+    }
 
     #[test]
     fn the_credit_names_the_artists_without_the_view_count() {

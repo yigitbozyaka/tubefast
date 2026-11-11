@@ -27,6 +27,7 @@ cargo test
 ```
 
 `cargo test -- --include-ignored` also drives the sign-in flow through a real headless Edge or Chrome.
+`cargo test podcast_catalog_show_and_audio_work_end_to_end -- --ignored` checks the live YouTube Music podcast catalog, a show's episodes, audio decoding and seeking. It requires an internet connection.
 
 ## Branches and pull requests
 

@@ -4,7 +4,7 @@ use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::overlay_wayland;
-use crate::ytm::{Item, Layout, Section};
+use crate::ytm::{Item, Layout, PODCASTS, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
 use eframe::egui::epaint::{RectShape, Shadow};
@@ -1899,7 +1899,7 @@ fn topbar(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
                 .desired_width(input.width())
                 .font(sans(14.5))
                 .text_color(TEXT)
-                .hint_text(RichText::new("Search songs, albums, artists").color(FAINT));
+                .hint_text(RichText::new("Search songs, podcasts, albums, artists").color(FAINT));
             ui.add(edit)
         })
         .inner;
@@ -2408,6 +2408,12 @@ fn sidebar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let count = |items: &[Item]| if items.is_empty() { String::new() } else { items.len().to_string() };
     let links = [
         (icon::HOUSE, "Home", Route::Home, String::new()),
+        (
+            icon::MICROPHONE_STAGE,
+            "Podcasts",
+            Route::Browse(PODCASTS.to_owned()),
+            String::new(),
+        ),
         (icon::HEART, "Liked songs", Route::Liked, count(&app.saved.liked)),
         (
             icon::CLOCK_COUNTER_CLOCKWISE,
