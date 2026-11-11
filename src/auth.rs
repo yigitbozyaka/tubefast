@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
@@ -615,8 +615,8 @@ fn discard(mut browser: Child, profile: &Path) {
         let _ = Command::new("taskkill")
             .args(["/PID", &browser.id().to_string(), "/T", "/F"])
             .creation_flags(0x0800_0000)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     let _ = browser.kill();
