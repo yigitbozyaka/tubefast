@@ -101,6 +101,58 @@ fn candidates() -> Vec<(Family, &'static str, PathBuf)> {
     }
 }
 
+fn read_head(path: &Path) -> Option<String> {
+    let mut buffer = [0u8; 512];
+    let read = std::fs::File::open(path).ok()?.read(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer[..read]).into_owned())
+}
+
+fn snap_name(program: &Path, head: impl Fn(&Path) -> Option<String>) -> Option<String> {
+    if let Ok(name) = program.strip_prefix("/snap/bin") {
+        return Some(name.to_str()?.to_owned());
+    }
+    let real = program.canonicalize().unwrap_or_else(|_| program.to_owned());
+    if let Ok(inside) = real.strip_prefix("/snap/")
+        && let Some(first) = inside.components().next().and_then(|part| part.as_os_str().to_str())
+        && first != "bin"
+    {
+        return Some(first.to_owned());
+    }
+    let file = program.file_name()?.to_str()?;
+    let name = if file == "chromium-browser" { "chromium" } else { file };
+    head(&Path::new("/snap/bin").join(name))?;
+    let wrapper = head(program)?;
+    (wrapper.starts_with("#!") && wrapper.contains("snap")).then(|| name.to_owned())
+}
+
+fn profile_leaf() -> String {
+    format!("tubefast-signin-{}", app_id())
+}
+
+fn sign_in_profile(program: &Path, home: Option<PathBuf>, default: PathBuf, head: impl Fn(&Path) -> Option<String>) -> PathBuf {
+    match (snap_name(program, head), home) {
+        (Some(name), Some(home)) => home.join("snap").join(name).join("common").join(profile_leaf()),
+        _ => default,
+    }
+}
+
+pub fn remove_leftover_sign_in_profiles() {
+    let Some(default) = eframe::storage_dir(app_id()).map(|dir| dir.join("signin-profile")) else {
+        return;
+    };
+    let mut leftovers = vec![default];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && let Ok(snaps) = std::fs::read_dir(home.join("snap"))
+    {
+        leftovers.extend(snaps.flatten().map(|snap| snap.path().join("common").join(profile_leaf())));
+    }
+    for leftover in leftovers {
+        if leftover.is_dir() {
+            let _ = std::fs::remove_dir_all(leftover);
+        }
+    }
+}
+
 fn find_program(program: &Path) -> Option<PathBuf> {
     if program.components().count() > 1 {
         return program.is_file().then(|| program.to_owned());
@@ -287,16 +339,42 @@ fn session_file() -> Option<PathBuf> {
     Some(eframe::storage_dir(app_id())?.join("session.bin"))
 }
 
+fn private_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o700))?;
+        }
+    }
+    Ok(())
+}
+
 fn lock_session(file: &Path) -> Option<std::fs::File> {
-    std::fs::create_dir_all(file.parent()?).ok()?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(file.with_extension("lock"))
-        .ok()?;
+    private_dir(file.parent()?).ok()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let lock = options.open(file.with_extension("lock")).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = lock.metadata().ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            lock.set_permissions(std::fs::Permissions::from_mode(mode & 0o700)).ok()?;
+        }
+    }
     lock.lock().ok()?;
     Some(lock)
+}
+
+pub fn secure_session_storage() {
+    if let Some(file) = session_file() {
+        drop(lock_session(&file));
+    }
 }
 
 fn read_session(file: &Path) -> Option<String> {
@@ -311,7 +389,7 @@ fn write_session(file: &Path, cookie: &str) -> Result<(), String> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut private, 0o600);
     let _ = std::fs::remove_file(&staged);
-    std::fs::create_dir_all(file.parent().unwrap_or(Path::new(".")))
+    private_dir(file.parent().unwrap_or(Path::new(".")))
         .and_then(|()| private.open(&staged)?.write_all(&sealed))
         .and_then(|()| std::fs::rename(&staged, file))
         .inspect_err(|_| {
@@ -558,6 +636,8 @@ fn launch_command(browser: &Installed, profile: &Path, url: &str, visible: bool,
                 .arg(url);
         }
     }
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     command
 }
 
@@ -579,6 +659,7 @@ fn launch(profile: &Path, url: &str, visible: bool, browser: &Installed) -> Resu
 fn watch(browser: &mut Child, port: u16, family: Family, cancel: &AtomicBool) -> Result<String, String> {
     let started = Instant::now();
     let mut socket: Option<Socket> = None;
+    let mut connected = false;
     let mut settled = 0;
     loop {
         if cancel.load(Relaxed) {
@@ -588,11 +669,16 @@ fn watch(browser: &mut Child, port: u16, family: Family, cancel: &AtomicBool) ->
             return Err("Signing in took too long. Try again.".to_owned());
         }
         if matches!(browser.try_wait(), Ok(Some(_))) {
-            return Err("The browser window was closed before you signed in.".to_owned());
+            return Err(if connected {
+                "The browser window was closed before you signed in.".to_owned()
+            } else {
+                "The browser stopped right after it started. Close any other window of it and try again.".to_owned()
+            });
         }
         std::thread::sleep(POLL_EVERY);
         let Some(connection) = &mut socket else {
             socket = Socket::open(port, family);
+            connected |= socket.is_some();
             continue;
         };
         let Ok(reply) = connection.cookies() else {
@@ -619,6 +705,14 @@ fn discard(mut browser: Child, profile: &Path) {
             .stderr(std::process::Stdio::null())
             .status();
     }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", browser.id())])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
     let _ = browser.kill();
     let _ = browser.wait();
     for _ in 0..15 {
@@ -630,9 +724,10 @@ fn discard(mut browser: Child, profile: &Path) {
 }
 
 pub fn browser_sign_in(cancel: &AtomicBool, chosen: &Installed) -> Result<String, String> {
-    let profile = eframe::storage_dir(app_id())
+    let default = eframe::storage_dir(app_id())
         .ok_or("There is no folder for the sign-in window.")?
         .join("signin-profile");
+    let profile = sign_in_profile(&chosen.program, std::env::var_os("HOME").map(PathBuf::from), default, read_head);
     let (mut browser, port) = launch(&profile, LOGIN_URL, true, chosen)?;
     let cookie = watch(&mut browser, port, chosen.family, cancel);
     discard(browser, &profile);
@@ -865,6 +960,30 @@ mod tests {
         rotate_stored(&file, "SAPISID=k", &update, 0);
         assert_eq!(read_session(&file).unwrap(), "SAPISID=k; after=stale-tmp");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_snap_browsers_profile_inside_their_own_folder() {
+        let home = || Some(PathBuf::from("/home/me"));
+        let default = || PathBuf::from("/home/me/.local/share/tubefast/signin-profile");
+        let leaf = profile_leaf();
+        let script = "#!/bin/sh
+exec /snap/bin/firefox \"$@\"";
+        let files = |path: &Path| match path.to_str()?.replace('\\', "/").as_str() {
+            "/snap/bin/firefox" | "/snap/bin/chromium" | "/opt/firefox/firefox" => Some("ELF".to_owned()),
+            "/usr/bin/firefox" | "/usr/bin/chromium-browser" => Some(script.to_owned()),
+            _ => None,
+        };
+        let snap = sign_in_profile(Path::new("/usr/bin/firefox"), home(), default(), files);
+        assert_eq!(snap, PathBuf::from("/home/me/snap/firefox/common").join(&leaf));
+        let direct = sign_in_profile(Path::new("/snap/bin/firefox"), home(), default(), files);
+        assert_eq!(direct, snap);
+        let real_binary = sign_in_profile(Path::new("/opt/firefox/firefox"), home(), default(), files);
+        assert_eq!(real_binary, default());
+        let plain = sign_in_profile(Path::new("/usr/bin/google-chrome"), home(), default(), files);
+        assert_eq!(plain, default());
+        let wrapper = sign_in_profile(Path::new("/usr/bin/chromium-browser"), home(), default(), files);
+        assert_eq!(wrapper, PathBuf::from("/home/me/snap/chromium/common").join(&leaf));
     }
 
     #[test]

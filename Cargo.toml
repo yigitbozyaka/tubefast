@@ -48,6 +48,11 @@ async-channel = "2"
 futures-lite = "2"
 mpris-server = "0.10"
 tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 [profile.release]
 lto = "fat"

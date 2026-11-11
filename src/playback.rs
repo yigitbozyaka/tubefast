@@ -115,7 +115,7 @@ impl Playback {
     fn follow_player(&mut self) {
         if let Some(message) = self.player.take_error() {
             self.player.set_paused(true);
-            self.problem = Some(message);
+            self.problem = Some(with_retry_hint(&message));
         }
         if self.player.take_ended() {
             if self.repeat == Repeat::One {
@@ -137,6 +137,7 @@ impl Playback {
             Action::Next => self.next(false),
             Action::Previous => self.previous(),
             Action::Seek(ms) => self.player.seek(ms),
+            Action::Volume(volume) => self.player.set_volume(volume.clamp(0.0, 1.0)),
             _ => {}
         }
     }
@@ -235,6 +236,12 @@ impl Playback {
 
     fn toggle(&mut self) {
         match (self.current, self.resume_at) {
+            (Some(_), _) if self.player.loading() => {}
+            (Some(current), None) if self.player.failed() => {
+                let position = self.player.position_ms();
+                self.play_index(current);
+                self.player.seek(position);
+            }
             (Some(current), Some(position)) => {
                 self.play_index(current);
                 self.player.seek(position);
@@ -322,6 +329,16 @@ impl Playback {
     }
 }
 
+fn with_retry_hint(message: &str) -> String {
+    let transient = ["Could not reach", "connection was lost", "timed out", "HTTP 5", "HTTP 429"];
+    let message = message.trim_end_matches('.');
+    if transient.iter().any(|sign| message.contains(sign)) {
+        format!("{message}. Press play to try again.")
+    } else {
+        format!("{message}.")
+    }
+}
+
 fn reorder(queue: &mut Vec<Item>, upcoming: usize, from: usize, gap: usize) -> bool {
     let to = if gap > from { gap - 1 } else { gap };
     if from == to || from.min(to) < upcoming || from.max(to) >= queue.len() {
@@ -379,6 +396,15 @@ mod tests {
             assert!(Instant::now() < deadline, "the ended song was never restarted");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn the_retry_hint_follows_only_transient_failures() {
+        assert_eq!(
+            with_retry_hint("Could not reach YouTube. Check your connection."),
+            "Could not reach YouTube. Check your connection. Press play to try again."
+        );
+        assert_eq!(with_retry_hint("Sign in to confirm your age"), "Sign in to confirm your age.");
     }
 
     #[test]

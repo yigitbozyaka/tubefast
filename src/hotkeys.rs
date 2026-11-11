@@ -323,7 +323,9 @@ pub fn unavailable() -> Option<&'static str> {
     if cfg!(target_os = "macos") || through_portal() {
         None
     } else if wayland_session() {
-        Some("This desktop's global shortcuts portal is missing or refused Tubefast, so Wayland cannot listen for keys")
+        Some(
+            "This desktop does not offer global shortcuts on Wayland, so Tubefast cannot listen for hotkeys here. The media keys on your keyboard (play, pause, next, previous) still work.",
+        )
     } else if std::env::var_os("DISPLAY").is_none() {
         Some("No X11 display was found")
     } else {

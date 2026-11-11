@@ -74,7 +74,7 @@ impl Media {
         display.SetType(MediaPlaybackType::Music)?;
         let music = display.MusicProperties()?;
         music.SetTitle(&HSTRING::from(item.title.as_str()))?;
-        music.SetArtist(&HSTRING::from(item.subtitle.as_str()))?;
+        music.SetArtist(&HSTRING::from(item.credit()))?;
         display.Update()
     }
 }
@@ -189,7 +189,7 @@ fn publish(item: Option<&Item>, playing: bool, position_ms: u64, duration_ms: u6
             center.setNowPlayingInfo(None);
             return center.setPlaybackState(State::Stopped);
         };
-        let (title, artist) = (NSString::from_str(&item.title), NSString::from_str(&item.subtitle));
+        let (title, artist) = (NSString::from_str(&item.title), NSString::from_str(item.credit()));
         let elapsed = NSNumber::new_f64(position_ms as f64 / 1000.0);
         let duration = NSNumber::new_f64(duration_ms as f64 / 1000.0);
         let rate = NSNumber::new_f64(if playing { 1.0 } else { 0.0 });
@@ -233,6 +233,7 @@ struct Update {
     position_ms: u64,
     duration_ms: u64,
     seeked: bool,
+    volume: f32,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -240,6 +241,7 @@ pub struct Media {
     updates: async_channel::Sender<Update>,
     shown: (String, bool, u64),
     at: (std::time::Instant, u64),
+    volume: (f32, f32),
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -258,7 +260,12 @@ impl Media {
             updates,
             shown: Default::default(),
             at: (std::time::Instant::now(), 0),
+            volume: (1.0, -1.0),
         })
+    }
+
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume.0 = volume;
     }
 
     pub fn show(&mut self, item: Option<&Item>, playing: bool, position_ms: u64, duration_ms: u64) {
@@ -267,17 +274,19 @@ impl Media {
         let expected = self.at.1 + if self.shown.1 { elapsed } else { 0 };
         let jumped = expected.abs_diff(position_ms) >= SEEK_SLACK_MS;
         let shown = (track.to_owned(), playing, duration_ms);
-        if self.shown == shown && !jumped && (!playing || elapsed < POSITION_EVERY_MS) {
+        if self.shown == shown && self.volume.0 == self.volume.1 && !jumped && (!playing || elapsed < POSITION_EVERY_MS) {
             return;
         }
         let seeked = self.shown.0 == shown.0 && jumped;
         (self.shown, self.at) = (shown, (std::time::Instant::now(), position_ms));
+        self.volume.1 = self.volume.0;
         let _ = self.updates.try_send(Update {
             item: item.cloned(),
             playing,
             position_ms,
             duration_ms,
             seeked,
+            volume: self.volume.0,
         });
     }
 }
@@ -312,6 +321,10 @@ async fn serve(press: impl Fn(Action) + 'static, updates: async_channel::Receive
         let press = press.clone();
         move |_, _, to| press(seek_to(to))
     });
+    player.connect_set_volume({
+        let press = press.clone();
+        move |_, volume| press(Action::Volume(volume as f32))
+    });
     player.connect_seek({
         let press = press.clone();
         move |player, by| press(seek_to(player.position() + by))
@@ -339,7 +352,7 @@ async fn follow(player: &mpris_server::Player, track: &mut (String, u64), update
             let path = format!("/dev/tubefast/track/{}", item.video_id.replace('-', "_"));
             metadata.set_trackid(TrackId::try_from(path).ok());
             metadata.set_title(Some(&item.title));
-            metadata.set_artist(Some([&item.subtitle]));
+            metadata.set_artist(Some([item.credit()]));
             let cover = crate::ytm::sized(&item.thumb, COVER_PX);
             metadata.set_art_url(Some(cover).filter(|cover| !cover.is_empty()));
             metadata.set_length(Some(Time::from_millis(update.duration_ms as i64)).filter(|_| update.duration_ms > 0));
@@ -353,6 +366,9 @@ async fn follow(player: &mpris_server::Player, track: &mut (String, u64), update
     };
     if player.playback_status() != status {
         let _ = player.set_playback_status(status).await;
+    }
+    if (player.volume() - update.volume as f64).abs() > 0.001 {
+        let _ = player.set_volume(update.volume as f64).await;
     }
     let at = Time::from_millis(update.position_ms as i64);
     player.set_position(at);

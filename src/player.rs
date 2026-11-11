@@ -30,7 +30,14 @@ const URL_LIFETIME: Duration = Duration::from_secs(3 * 60 * 60);
 const URL_CACHE_ENTRIES: usize = 64;
 const SELFTEST_FAR_SEEK_MS: u64 = 20 * 60 * 1000;
 const DEVICE_POLL: Duration = Duration::from_secs(2);
+const LOAD_RETRIES: u32 = 3;
+const STALL_AFTER: Duration = Duration::from_millis(700);
+const RECOVERED_AFTER_MS: u64 = 5000;
 const NO_OUTPUT: &str = "No audio output device was found";
+
+fn retry_delay(retry: u32) -> Option<Duration> {
+    (1..=LOAD_RETRIES).contains(&retry).then(|| Duration::from_secs(1 << (retry - 1)))
+}
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 type Chunks = Arc<Mutex<Receiver<Chunk>>>;
@@ -44,8 +51,10 @@ struct Shared {
     duration_ms: AtomicU64,
     buffered: AtomicU32,
     loading: AtomicBool,
+    buffering: AtomicBool,
     paused: AtomicBool,
     ended: AtomicBool,
+    failed: AtomicBool,
     error: Mutex<Option<String>>,
 }
 
@@ -59,10 +68,22 @@ struct Chunk {
 }
 
 enum Cmd {
-    Load { video_id: String, generation: u64, epoch: u64 },
+    Load {
+        video_id: String,
+        generation: u64,
+        epoch: u64,
+        resume_ms: Option<u64>,
+        retry: u32,
+    },
     Opened(Track),
-    Failed { generation: u64, message: String },
-    Seek { ms: u64, epoch: u64 },
+    Failed {
+        generation: u64,
+        message: String,
+    },
+    Seek {
+        ms: u64,
+        epoch: u64,
+    },
 }
 
 #[derive(Default)]
@@ -407,6 +428,7 @@ struct PcmSource {
     at: usize,
     rate: u32,
     channels: u16,
+    starved: Option<Instant>,
     shared: Arc<Shared>,
     wake: Wake,
 }
@@ -419,6 +441,7 @@ impl PcmSource {
             at: 0,
             rate: 44_100,
             channels: 2,
+            starved: None,
             shared,
             wake,
         }
@@ -431,6 +454,8 @@ impl PcmSource {
                 continue;
             }
             if chunk.end {
+                self.starved = None;
+                self.shared.buffering.store(false, Relaxed);
                 self.shared.ended.store(true, Relaxed);
                 (self.wake)();
                 break;
@@ -438,6 +463,8 @@ impl PcmSource {
             if chunk.samples.is_empty() {
                 continue;
             }
+            self.starved = None;
+            self.shared.buffering.store(false, Relaxed);
             self.shared.position_ms.store(chunk.start_ms, Relaxed);
             self.rate = chunk.rate;
             self.channels = chunk.channels;
@@ -446,6 +473,10 @@ impl PcmSource {
         }
         self.samples.clear();
         self.samples.resize(SILENCE_SAMPLES, 0.0);
+        let since = *self.starved.get_or_insert_with(Instant::now);
+        if since.elapsed() >= STALL_AFTER && !self.shared.paused.load(Relaxed) && !self.shared.buffering.swap(true, Relaxed) {
+            (self.wake)();
+        }
     }
 }
 
@@ -493,6 +524,8 @@ fn decode_loop(
     let mut pending: Option<Chunk> = None;
     let mut resume: Option<u64> = None;
     let mut epoch = 0;
+    let mut recoveries = 0;
+    let mut recovered_from: Option<u64> = None;
     loop {
         if let Some(chunk) = pending.take() {
             match pcm.try_send(chunk) {
@@ -527,18 +560,42 @@ fn decode_loop(
                 video_id,
                 generation,
                 epoch: started,
-            }) => {
-                (track, pending, resume, epoch) = (None, None, None, started);
+                resume_ms,
+                retry,
+            }) if current(generation) => {
+                if resume_ms.is_none() {
+                    (recoveries, recovered_from) = (0, None);
+                }
+                (track, pending, resume, epoch) = (None, None, resume_ms, started);
                 let (replies, shared, yt, urls) = (replies.clone(), shared.clone(), yt.clone(), urls.clone());
                 std::thread::spawn(move || {
-                    let opened = Track::open(&yt, &urls, &video_id, generation, &shared).or_else(|message| {
-                        urls.lock().unwrap().remove(&video_id);
-                        if shared.generation.load(Relaxed) == generation && yt.refresh_clients() {
-                            Track::open(&yt, &urls, &video_id, generation, &shared)
-                        } else {
-                            Err(message)
+                    let mut attempt = retry;
+                    let opened = loop {
+                        if shared.generation.load(Relaxed) != generation {
+                            return;
                         }
-                    });
+                        if let Some(delay) = retry_delay(attempt) {
+                            std::thread::sleep(delay);
+                            if shared.generation.load(Relaxed) != generation {
+                                return;
+                            }
+                        }
+                        let opened = Track::open(&yt, &urls, &video_id, generation, &shared).or_else(|message| {
+                            urls.lock().unwrap().remove(&video_id);
+                            if shared.generation.load(Relaxed) == generation && yt.refresh_clients() {
+                                Track::open(&yt, &urls, &video_id, generation, &shared)
+                            } else {
+                                Err(message)
+                            }
+                        });
+                        attempt += 1;
+                        if opened.is_ok() || retry_delay(attempt).is_none() {
+                            break opened;
+                        }
+                    };
+                    if shared.generation.load(Relaxed) != generation {
+                        return;
+                    }
                     let reply = match opened {
                         Ok(track) => Cmd::Opened(track),
                         Err(message) => {
@@ -558,6 +615,7 @@ fn decode_loop(
                 wake();
             }
             Some(Cmd::Failed { generation, message }) if current(generation) => {
+                shared.failed.store(true, Relaxed);
                 *shared.error.lock().unwrap() = Some(message);
                 shared.loading.store(false, Relaxed);
                 wake();
@@ -578,7 +636,12 @@ fn decode_loop(
             continue;
         };
         match playing.next_chunk(epoch) {
-            Ok(Some(chunk)) => pending = Some(chunk),
+            Ok(Some(chunk)) => {
+                if recovered_from.is_some_and(|from| chunk.start_ms >= from + RECOVERED_AFTER_MS) {
+                    (recoveries, recovered_from) = (0, None);
+                }
+                pending = Some(chunk);
+            }
             Ok(None) => {
                 playing.finished = true;
                 pending = Some(Chunk {
@@ -593,7 +656,22 @@ fn decode_loop(
             Err(message) => {
                 if current(playing.generation) {
                     urls.lock().unwrap().remove(&playing.video_id);
-                    *shared.error.lock().unwrap() = Some(message);
+                    if recoveries < LOAD_RETRIES {
+                        recoveries += 1;
+                        let resume_ms = shared.position_ms.load(Relaxed);
+                        recovered_from = Some(resume_ms);
+                        shared.loading.store(true, Relaxed);
+                        let _ = replies.send(Cmd::Load {
+                            video_id: playing.video_id.clone(),
+                            generation: playing.generation,
+                            epoch,
+                            resume_ms: Some(resume_ms),
+                            retry: 1,
+                        });
+                    } else {
+                        shared.failed.store(true, Relaxed);
+                        *shared.error.lock().unwrap() = Some(message);
+                    }
                     wake();
                 }
                 track = None;
@@ -686,7 +764,11 @@ impl Status {
     }
 
     pub fn loading(&self) -> bool {
-        self.0.loading.load(Relaxed)
+        self.0.loading.load(Relaxed) || (self.0.buffering.load(Relaxed) && !self.0.paused.load(Relaxed))
+    }
+
+    pub fn failed(&self) -> bool {
+        self.0.failed.load(Relaxed)
     }
 }
 
@@ -754,11 +836,15 @@ impl Player {
         self.shared.buffered.store(0, Relaxed);
         self.shared.ended.store(false, Relaxed);
         self.shared.loading.store(true, Relaxed);
+        self.shared.failed.store(false, Relaxed);
+        self.shared.buffering.store(false, Relaxed);
         self.shared.error.lock().unwrap().take();
         let _ = self.commands.send(Cmd::Load {
             video_id: video_id.to_owned(),
             generation,
             epoch,
+            resume_ms: None,
+            retry: 0,
         });
         self.set_paused(false);
     }
@@ -791,6 +877,18 @@ impl Player {
         if let Some(sink) = &self.sink {
             sink.set_volume(volume * volume);
         }
+    }
+
+    pub fn failed(&self) -> bool {
+        self.shared.failed.load(Relaxed)
+    }
+
+    pub fn loading(&self) -> bool {
+        self.shared.loading.load(Relaxed)
+    }
+
+    pub fn volume(&self) -> f32 {
+        self.volume
     }
 
     pub fn position_ms(&self) -> u64 {
@@ -862,6 +960,14 @@ pub fn selftest(query: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_back_off_and_stop() {
+        assert_eq!(retry_delay(0), None);
+        assert_eq!(retry_delay(1), Some(Duration::from_secs(1)));
+        assert_eq!(retry_delay(LOAD_RETRIES), Some(Duration::from_secs(4)));
+        assert_eq!(retry_delay(LOAD_RETRIES + 1), None);
+    }
 
     #[test]
     fn a_reopened_output_keeps_playing_the_queued_audio() {

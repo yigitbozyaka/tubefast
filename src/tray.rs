@@ -31,7 +31,119 @@ pub fn window_of(cc: &eframe::CreationContext<'_>) -> isize {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let wayland = matches!(cc.window_handle().map(|handle| handle.as_raw()), Ok(RawWindowHandle::Wayland(_)));
     ON_WAYLAND.store(wayland, Ordering::SeqCst);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    activation::capture(cc);
     0
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod activation {
+    use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+    use std::sync::Mutex;
+    use wayland_client::backend::{Backend, ObjectId};
+    use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::protocol::{wl_registry::WlRegistry, wl_surface::WlSurface};
+    use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+    use wayland_protocols::xdg::activation::v1::client::xdg_activation_v1::XdgActivationV1;
+
+    struct Silent;
+
+    impl Dispatch<WlRegistry, GlobalListContents> for Silent {
+        fn event(
+            _: &mut Self,
+            _: &WlRegistry,
+            _: <WlRegistry as Proxy>::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<XdgActivationV1, ()> for Silent {
+        fn event(_: &mut Self, _: &XdgActivationV1, _: <XdgActivationV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    struct Activator {
+        connection: Connection,
+        activation: XdgActivationV1,
+        surface: WlSurface,
+        _queue: EventQueue<Silent>,
+    }
+
+    static ACTIVATOR: Mutex<Option<Activator>> = Mutex::new(None);
+
+    fn connect(cc: &eframe::CreationContext<'_>) -> Option<Activator> {
+        let window = cc.window_handle().ok()?.as_raw();
+        let display = cc.display_handle().ok()?.as_raw();
+        let (RawWindowHandle::Wayland(window), RawDisplayHandle::Wayland(display)) = (window, display) else {
+            return None;
+        };
+        let backend = unsafe { Backend::from_foreign_display(display.display.as_ptr().cast()) };
+        let connection = Connection::from_backend(backend);
+        let (globals, queue) = registry_queue_init::<Silent>(&connection).ok()?;
+        let activation: XdgActivationV1 = globals.bind(&queue.handle(), 1..=1, ()).ok()?;
+        let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), window.surface.as_ptr().cast()) }.ok()?;
+        let surface = WlSurface::from_id(&connection, id).ok()?;
+        Some(Activator {
+            connection,
+            activation,
+            surface,
+            _queue: queue,
+        })
+    }
+
+    pub fn capture(cc: &eframe::CreationContext<'_>) {
+        release();
+        if let Some(activator) = connect(cc) {
+            *ACTIVATOR.lock().unwrap() = Some(activator);
+        }
+    }
+
+    pub fn release() {
+        if let Some(activator) = ACTIVATOR.lock().unwrap().take() {
+            activator.activation.destroy();
+            let _ = activator.connection.flush();
+        }
+    }
+
+    fn activate(token: String) -> bool {
+        match ACTIVATOR.lock().unwrap().as_ref() {
+            Some(activator) => {
+                activator.activation.activate(token, &activator.surface);
+                activator.connection.flush().is_ok()
+            }
+            None => false,
+        }
+    }
+
+    pub fn activate_from_tray_event() -> bool {
+        for _ in 0..20 {
+            if let Some(token) = ksni::current_xdg_activation_token() {
+                return activate(token);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn release_activation() {
+    activation::release();
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn release_activation() {}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn activated_by_token() -> bool {
+    activation::activate_from_tray_event()
+}
+
+#[cfg(all(not(windows), not(all(unix, not(target_os = "macos")))))]
+fn activated_by_token() -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -310,6 +422,11 @@ fn reveal(ctx: &eframe::egui::Context) {
     ctx.send_viewport_cmd(ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(ViewportCommand::Focus);
+    if on_wayland() && !activated_by_token() {
+        ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+            eframe::egui::UserAttentionType::Informational,
+        ));
+    }
     ctx.request_repaint();
 }
 
