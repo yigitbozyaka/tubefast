@@ -55,7 +55,7 @@ struct Shared {
     paused: AtomicBool,
     ended: AtomicBool,
     failed: AtomicBool,
-    error: Mutex<Option<String>>,
+    error: Mutex<Option<ytm::StreamError>>,
 }
 
 struct Chunk {
@@ -78,7 +78,7 @@ enum Cmd {
     Opened(Track),
     Failed {
         generation: u64,
-        message: String,
+        message: ytm::StreamError,
     },
     Seek {
         ms: u64,
@@ -281,7 +281,9 @@ struct Track {
 
 impl Track {
     fn open(yt: &ytm::Client, urls: &Urls, video_id: &str, generation: u64, shared: &Arc<Shared>) -> Result<Track, String> {
-        Self::open_if(yt, urls, video_id, generation, shared, &|| true)?.ok_or_else(|| "Stream resolution was cancelled".to_owned())
+        Self::open_if(yt, urls, video_id, generation, shared, &|| true)
+            .map_err(|error| error.message)?
+            .ok_or_else(|| "Stream resolution was cancelled".to_owned())
     }
 
     fn open_if(
@@ -291,7 +293,7 @@ impl Track {
         generation: u64,
         shared: &Arc<Shared>,
         current: &impl Fn() -> bool,
-    ) -> Result<Option<Track>, String> {
+    ) -> Result<Option<Track>, ytm::StreamError> {
         let Some(mut stream) = resolve_if(yt, urls, video_id, current)? else {
             return Ok(None);
         };
@@ -304,9 +306,11 @@ impl Track {
             Ok(_) => Ok(None),
             Err(_) if !current() => Ok(None),
             Err(message) => match fallback {
-                Some(aac) if current() => Self::open_stream(yt, *aac, video_id, generation, shared).map(Some),
+                Some(aac) if current() => Self::open_stream(yt, *aac, video_id, generation, shared)
+                    .map(Some)
+                    .map_err(Into::into),
                 Some(_) => Ok(None),
-                None => Err(message),
+                None => Err(message.into()),
             },
         }
     }
@@ -429,7 +433,7 @@ impl Track {
     }
 }
 
-fn resolve_if(yt: &ytm::Client, urls: &Urls, video_id: &str, current: &impl Fn() -> bool) -> Result<Option<ytm::Stream>, String> {
+fn resolve_if(yt: &ytm::Client, urls: &Urls, video_id: &str, current: &impl Fn() -> bool) -> Result<Option<ytm::Stream>, ytm::StreamError> {
     if !current() {
         return Ok(None);
     }
@@ -615,6 +619,9 @@ fn decode_loop(
                             }
                         }
                         let opened = Track::open_if(&yt, &urls, &video_id, generation, &shared, &is_current).or_else(|message| {
+                            if message.unavailable {
+                                return Err(message);
+                            }
                             urls.lock().unwrap().remove(&video_id);
                             if is_current() && yt.refresh_clients() {
                                 Track::open_if(&yt, &urls, &video_id, generation, &shared, &is_current)
@@ -623,7 +630,7 @@ fn decode_loop(
                             }
                         });
                         attempt += 1;
-                        if opened.is_ok() || retry_delay(attempt).is_none() {
+                        if opened.is_ok() || opened.as_ref().is_err_and(|error| error.unavailable) || retry_delay(attempt).is_none() {
                             break opened;
                         }
                     };
@@ -705,7 +712,7 @@ fn decode_loop(
                         });
                     } else {
                         shared.failed.store(true, Relaxed);
-                        *shared.error.lock().unwrap() = Some(message);
+                        *shared.error.lock().unwrap() = Some(message.into());
                     }
                     wake();
                 }
@@ -859,7 +866,7 @@ impl Player {
     }
 
     fn fail(&self, message: &str) {
-        *self.shared.error.lock().unwrap() = Some(message.to_owned());
+        *self.shared.error.lock().unwrap() = Some(message.to_owned().into());
         (self.wake)();
     }
 
@@ -942,7 +949,7 @@ impl Player {
         self.shared.ended.swap(false, Relaxed)
     }
 
-    pub fn take_error(&self) -> Option<String> {
+    pub fn take_error(&self) -> Option<ytm::StreamError> {
         self.shared.error.lock().unwrap().take()
     }
 }
