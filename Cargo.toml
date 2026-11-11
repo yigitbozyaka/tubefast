@@ -52,7 +52,10 @@ winit = { version = "0.30", default-features = false, features = ["wayland-csd-a
 ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
-wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+glutin = { version = "0.32", default-features = false, features = ["egl", "wayland"] }
+libc = "0.2"
+smithay-client-toolkit = { version = "0.20", default-features = false }
 
 [profile.release]
 lto = "fat"

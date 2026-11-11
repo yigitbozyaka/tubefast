@@ -2,6 +2,8 @@ use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, 
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
+#[cfg(all(unix, not(target_os = "macos")))]
+use crate::overlay_wayland;
 use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
@@ -63,7 +65,7 @@ const STATUS_ROW: f32 = 26.0;
 const SECTION_GAP: f32 = 32.0;
 const OVERLAY_TITLE: &str = "Tubefast overlay";
 const OVERLAY_CLOSE_DIM: f32 = 0.22;
-const OVERLAY_WIDTH: f32 = 340.0;
+pub const OVERLAY_WIDTH: f32 = 340.0;
 const OVERLAY_HOME: [f32; 2] = [24.0, 24.0];
 const OVERLAY_ROWS: usize = 4;
 const OVERLAY_ROW: f32 = 48.0;
@@ -540,9 +542,76 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
     out
 }
 
+#[derive(Clone, PartialEq)]
+pub struct OverlayEntry {
+    pub index: usize,
+    pub title: String,
+    pub subtitle: String,
+    pub cover: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct OverlayView {
+    pub controls: bool,
+    pub playing: bool,
+    pub position_ms: u64,
+    pub duration_ms: u64,
+    pub track: Option<OverlayEntry>,
+    pub next_up: Vec<OverlayEntry>,
+}
+
+impl OverlayView {
+    fn of(app: &App) -> Self {
+        let entry = |index: usize, item: &Item| OverlayEntry {
+            index,
+            title: item.title.clone(),
+            subtitle: item.subtitle.clone(),
+            cover: app.saved.covers.of(item).to_owned(),
+        };
+        let upcoming = overlay_upcoming(app);
+        let rows = if app.saved.overlay_next_up {
+            app.saved.queue.len().saturating_sub(upcoming).min(OVERLAY_ROWS)
+        } else {
+            0
+        };
+        Self {
+            controls: app.saved.overlay_controls,
+            playing: app.playing(),
+            position_ms: app.player.position_ms(),
+            duration_ms: app.player.duration_ms(),
+            track: app
+                .saved
+                .current
+                .and_then(|current| Some(entry(current, app.saved.queue.get(current)?))),
+            next_up: (upcoming..upcoming + rows)
+                .map(|index| entry(index, &app.saved.queue[index]))
+                .collect(),
+        }
+    }
+
+    pub fn height(&self) -> f32 {
+        overlay_height(self.next_up.len(), self.controls)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn draw_overlay_card(ctx: &egui::Context, view: &OverlayView, art: &Art, opacity: f32) -> Vec<Action> {
+    let mut out = Vec::new();
+    egui::CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+        ui.multiply_opacity(opacity);
+        overlay_card(view, art, ui, &mut out);
+    });
+    out
+}
+
 pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     let mut out = Vec::new();
-    if !(app.saved.overlay && app.overlay_open) {
+    let open = app.saved.overlay && app.overlay_open;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if hotkeys::layer_overlay() {
+        return layer_overlay(app, ctx, open);
+    }
+    if !open {
         forget_overlay_window();
         return out;
     }
@@ -550,7 +619,7 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     let saved = app.saved.overlay_position.unwrap_or(OVERLAY_HOME);
     let builder = egui::ViewportBuilder::default()
         .with_title(OVERLAY_TITLE)
-        .with_inner_size([OVERLAY_WIDTH, overlay_height(overlay_rows(app), app.saved.overlay_controls)])
+        .with_inner_size([OVERLAY_WIDTH, OverlayView::of(app).height()])
         .with_position(home)
         .with_decorations(false)
         .with_always_on_top()
@@ -564,7 +633,7 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
             if !cfg!(windows) {
                 ui.multiply_opacity(usable_opacity(app.saved.overlay_opacity));
             }
-            overlay_card(app, ui, &mut out);
+            overlay_card(&OverlayView::of(app), &app.art, ui, &mut out);
         });
         let (outer, closing) = ctx.input(|input| (input.viewport().outer_rect, input.viewport().close_requested()));
         let near = |target: [f32; 2]| outer.is_some_and(|outer| (outer.min - pos2(target[0], target[1])).length() <= 1.0);
@@ -581,6 +650,32 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
             out.push(Action::ToggleOverlay);
         }
     });
+    out
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn layer_overlay(app: &App, ctx: &egui::Context, open: bool) -> Vec<Action> {
+    if !open {
+        if let Some(Some(handle)) = app.layer_overlay.get() {
+            handle.hide();
+        }
+        return Vec::new();
+    }
+    let started = app
+        .layer_overlay
+        .get_or_init(|| overlay_wayland::Handle::start(ctx.clone(), app.http_agent()));
+    let Some(handle) = started else {
+        return vec![Action::ToggleOverlay];
+    };
+    handle.show(overlay_wayland::Frame {
+        view: OverlayView::of(app),
+        opacity: usable_opacity(app.saved.overlay_opacity),
+        position: app.saved.overlay_position.unwrap_or(OVERLAY_HOME),
+    });
+    let mut out = handle.actions();
+    if app.overlay_snapping {
+        out.push(Action::OverlaySnapped);
+    }
     out
 }
 
@@ -662,13 +757,6 @@ fn overlay_upcoming(app: &App) -> usize {
     app.saved.current.map_or(0, |current| current + 1)
 }
 
-fn overlay_rows(app: &App) -> usize {
-    if !app.saved.overlay_next_up {
-        return 0;
-    }
-    app.saved.queue.len().saturating_sub(overlay_upcoming(app)).min(OVERLAY_ROWS)
-}
-
 fn overlay_base_height(controls: bool) -> f32 {
     2.0 * OVERLAY_PAD + OVERLAY_ART + 38.0 + if controls { 28.0 } else { 0.0 }
 }
@@ -678,10 +766,9 @@ fn overlay_height(rows: usize, controls: bool) -> f32 {
     overlay_base_height(controls) + queue_height
 }
 
-fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
-    let upcoming = overlay_upcoming(app);
-    let rows = overlay_rows(app);
-    let controls = app.saved.overlay_controls;
+fn overlay_card(view: &OverlayView, art: &Art, ui: &mut Ui, out: &mut Vec<Action>) {
+    let rows = view.next_up.len();
+    let controls = view.controls;
     let height = overlay_height(rows, controls);
     let area = ui.max_rect();
     let card = Rect::from_min_size(area.min, vec2(area.width(), height));
@@ -723,30 +810,29 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     {
         out.push(Action::ToggleOverlay);
     }
-    let item = app.now_playing();
-    let art = Rect::from_min_size(inner.min, Vec2::splat(OVERLAY_ART));
-    let (left, width) = (art.right() + 12.0, inner.right() - art.right() - 52.0);
-    match item {
-        Some(item) => {
-            artwork(ui, &app.art, app.saved.covers.of(item), art, 8.0);
-            let (title, byline) = (pos2(left, art.center().y - 10.0), pos2(left, art.center().y + 10.0));
-            label(ui, title, Align2::LEFT_CENTER, &item.title, medium(14.0), TEXT, width);
-            label(ui, byline, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
+    let cover = Rect::from_min_size(inner.min, Vec2::splat(OVERLAY_ART));
+    let (left, width) = (cover.right() + 12.0, inner.right() - cover.right() - 52.0);
+    match &view.track {
+        Some(track) => {
+            artwork(ui, art, &track.cover, cover, 8.0);
+            let (title, byline) = (pos2(left, cover.center().y - 10.0), pos2(left, cover.center().y + 10.0));
+            label(ui, title, Align2::LEFT_CENTER, &track.title, medium(14.0), TEXT, width);
+            label(ui, byline, Align2::LEFT_CENTER, &track.subtitle, sans(12.5), MUTED, width);
         }
         None => {
-            ui.painter().rect_filled(art, 8.0, RAISED);
-            let at = pos2(left, art.center().y);
+            ui.painter().rect_filled(cover, 8.0, RAISED);
+            let at = pos2(left, cover.center().y);
             label(ui, at, Align2::LEFT_CENTER, "Nothing playing", medium(14.0), MUTED, width);
         }
     }
 
-    let (duration, position) = (app.player.duration_ms(), app.player.position_ms());
+    let (duration, position) = (view.duration_ms, view.position_ms);
     let played = if duration > 0 {
         (position as f32 / duration as f32).min(1.0)
     } else {
         0.0
     };
-    let bar = Rect::from_min_size(pos2(inner.left(), art.bottom() + 14.0), vec2(inner.width(), 4.0));
+    let bar = Rect::from_min_size(pos2(inner.left(), cover.bottom() + 14.0), vec2(inner.width(), 4.0));
     ui.painter().rect_filled(bar, 2.0, veil(0.16));
     ui.painter()
         .rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * played, bar.height())), 2.0, ACCENT);
@@ -755,7 +841,7 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     label(ui, end, Align2::RIGHT_CENTER, &clock(duration), sans(11.5), FAINT, 60.0);
 
     if controls {
-        overlay_controls(app, ui, out, pos2(bar.center().x, bar.bottom() + 40.0));
+        overlay_controls(view, ui, out, pos2(bar.center().x, bar.bottom() + 40.0));
     }
 
     if rows == 0 {
@@ -763,24 +849,23 @@ fn overlay_card(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     }
     let heading = pos2(inner.left(), card.top() + overlay_base_height(controls) + 14.0);
     label(ui, heading, Align2::LEFT_CENTER, "Next up", bold(12.0), FAINT, inner.width());
-    for at in 0..rows {
-        let (index, item) = (upcoming + at, &app.saved.queue[upcoming + at]);
+    for (at, entry) in view.next_up.iter().enumerate() {
         let top = heading.y + 14.0 + at as f32 * OVERLAY_ROW;
         let slot = Rect::from_min_size(pos2(inner.left(), top), vec2(inner.width(), OVERLAY_ROW));
-        let response = ui.interact(slot, Id::new(("overlay-row", index)), Sense::click());
-        let (below, width) = queue_row(ui, app, item, slot.shrink2(vec2(0.0, 4.0)), hover_of(ui, &response));
-        label(ui, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
-        describe(&response, &item.title);
+        let response = ui.interact(slot, Id::new(("overlay-row", entry.index)), Sense::click());
+        let hover = hover_of(ui, &response);
+        let (below, width) = queue_row(ui, art, &entry.cover, &entry.title, slot.shrink2(vec2(0.0, 4.0)), hover);
+        label(ui, below, Align2::LEFT_CENTER, &entry.subtitle, sans(12.5), MUTED, width);
+        describe(&response, &entry.title);
         if response.clicked() {
-            out.push(Action::Jump(index));
+            out.push(Action::Jump(entry.index));
         }
     }
 }
 
-fn overlay_controls(app: &App, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
-    let item = app.now_playing();
+fn overlay_controls(view: &OverlayView, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
     let around = |offset: f32, size: f32| Rect::from_center_size(middle + vec2(offset, 0.0), Vec2::splat(size));
-    let tone = if item.is_some() { TEXT } else { FAINT };
+    let tone = if view.track.is_some() { TEXT } else { FAINT };
     if icon_button(
         ui,
         around(-52.0, 36.0),
@@ -794,7 +879,7 @@ fn overlay_controls(app: &App, ui: &Ui, out: &mut Vec<Action>, middle: Pos2) {
     {
         out.push(Action::Previous);
     }
-    let (symbol, hint) = if app.playing() {
+    let (symbol, hint) = if view.playing {
         (icon::PAUSE, "Pause")
     } else {
         (icon::PLAY, "Play")
@@ -2182,7 +2267,8 @@ fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, ena
 fn overlay_unavailable() -> Option<&'static str> {
     let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|backend| backend == "x11");
     let on_wayland = cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some() && !forced_x11;
-    on_wayland.then_some("Wayland does not let apps stay on top of other windows, so the overlay needs an X11 session")
+    (on_wayland && !hotkeys::layer_overlay())
+        .then_some("This desktop does not let apps stay on top of other windows on Wayland, so the overlay is not available here")
 }
 
 fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
@@ -2851,17 +2937,17 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     }
 }
 
-fn queue_row(ui: &Ui, app: &App, item: &Item, slot: Rect, hover: f32) -> (Pos2, f32) {
+fn queue_row(ui: &Ui, art: &Art, cover: &str, title: &str, slot: Rect, hover: f32) -> (Pos2, f32) {
     ui.painter()
         .rect_filled(slot.expand2(vec2(8.0, 0.0)), ROW_RADIUS, veil(0.06 * hover));
-    let art = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
-    artwork(ui, &app.art, app.saved.covers.of(item), art, 5.0);
-    let (left, width) = (art.right() + 12.0, slot.right() - art.right() - 44.0);
+    let frame = Rect::from_min_size(pos2(slot.left(), slot.center().y - 20.0), Vec2::splat(40.0));
+    artwork(ui, art, cover, frame, 5.0);
+    let (left, width) = (frame.right() + 12.0, slot.right() - frame.right() - 44.0);
     label(
         ui,
         pos2(left, slot.center().y - 9.0),
         Align2::LEFT_CENTER,
-        &item.title,
+        title,
         medium(13.5),
         TEXT,
         width,
@@ -2908,7 +2994,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
             continue;
         }
         let hover = hover_of(ui, response);
-        let (below, width) = queue_row(ui, app, item, slot, hover);
+        let (below, width) = queue_row(ui, &app.art, app.saved.covers.of(item), &item.title, slot, hover);
         byline(ui, out, item, response.id.with("artist"), below, sans(12.5), width);
         describe(response, &item.title);
         if hover > 0.0 {
@@ -2954,7 +3040,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
     ghost.painter().add(shadow.as_shape(plate, ROW_RADIUS));
     ghost.painter().rect_filled(plate, ROW_RADIUS, FLOATING);
     let item = &queue[upcoming + from];
-    let (below, width) = queue_row(&ghost, app, item, lifted, 0.0);
+    let (below, width) = queue_row(&ghost, &app.art, app.saved.covers.of(item), &item.title, lifted, 0.0);
     label(&ghost, below, Align2::LEFT_CENTER, &item.subtitle, sans(12.5), MUTED, width);
     true
 }

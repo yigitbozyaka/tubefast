@@ -1,12 +1,1 @@
-- Settings can send Tubefast to the system tray when you close the window, now also on macOS and Linux
-- Global hotkeys now also work on macOS and on Linux, with X11 or with Wayland through the desktop's shortcuts portal, where the keys are set in the system settings. If your desktop has no shortcuts portal, Settings now tells you
-- The media overlay now also works on macOS and on Linux with X11. On Wayland it is not available
-- Updating from inside Tubefast now also works on Linux (AppImage or a binary in a folder you can write to) and on macOS
-- Sign in with Firefox, LibreWolf, Zen, Waterfox or Floorp as well as Chrome, Edge, Brave and Opera GX. With more than one browser installed, Continue in browser lets you pick one and remembers it. Firefox installed as a snap on Linux now works too
-- Your sign-in now keeps up with the cookies YouTube refreshes, which should stop the random sign-outs. Pasted cookies are checked for the session cookies they need, and the paste steps and the expired sign-in message are clearer
-- Your account is now restored at startup even if Tubefast was closed abruptly
-- On Linux Wayland, clicking the tray entry brings the window back
-- On Linux, the window title now shows and the window no longer opens larger than your screen
-- A song that stalls or fails to load now retries and resumes from the same spot. The play button shows when it is buffering and offers a retry if it gives up
-- On Linux, the song artist and volume changes from the desktop now show up correctly in media controls
-- In narrow windows the queue now takes the place of the main content
+- The media overlay now also works on Linux Wayland desktops that support the layer shell protocol, such as KDE Plasma, Hyprland and sway. GNOME does not support it, and Settings says so
