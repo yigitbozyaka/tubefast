@@ -311,10 +311,20 @@ pub fn portal_trigger(_: Command) -> Option<String> {
     None
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn layer_overlay() -> bool {
+    wayland_session() && crate::overlay_wayland::supported()
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn layer_overlay() -> bool {
+    false
+}
+
 pub fn listed() -> Vec<Command> {
     Command::ALL
         .into_iter()
-        .filter(|command| !(through_portal() && *command == Command::Overlay))
+        .filter(|command| *command != Command::Overlay || !through_portal() || layer_overlay())
         .collect()
 }
 

@@ -57,7 +57,7 @@ async fn run(bindings: Vec<(Command, Combo)>, press: impl Fn(Command), stop: asy
     let mut activated = std::pin::pin!(shortcuts.receive_activated().await?);
     let wanted: Vec<NewShortcut> = bindings
         .iter()
-        .filter(|(command, _)| *command != Command::Overlay)
+        .filter(|(command, _)| *command != Command::Overlay || super::layer_overlay())
         .map(|(command, combo)| NewShortcut::new(id_of(*command), command.name()).preferred_trigger(preferred_trigger(*combo).as_deref()))
         .collect();
     let bound = shortcuts.bind_shortcuts(&session, &wanted, None).await?.response()?;

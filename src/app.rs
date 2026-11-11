@@ -335,6 +335,8 @@ pub struct App {
     pub overlay_open: bool,
     pub overlay_origin: Option<[f32; 2]>,
     pub overlay_snapping: bool,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub layer_overlay: std::cell::OnceCell<Option<crate::overlay_wayland::Handle>>,
     pub notes: Vec<String>,
     restart: Option<PathBuf>,
 }
@@ -423,6 +425,8 @@ impl App {
             overlay_open: false,
             overlay_origin: None,
             overlay_snapping: false,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            layer_overlay: std::cell::OnceCell::new(),
             notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
         };
@@ -595,6 +599,11 @@ impl App {
 
     pub fn now_playing(&self) -> Option<&Item> {
         self.saved.queue.get(self.saved.current?)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn http_agent(&self) -> ureq::Agent {
+        self.yt.agent.clone()
     }
 
     pub fn playing(&self) -> bool {
