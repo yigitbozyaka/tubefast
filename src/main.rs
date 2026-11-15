@@ -9,12 +9,15 @@ mod media;
 mod opus;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod overlay_wayland;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod parked;
 mod playback;
 mod player;
 mod romanize;
 mod tray;
 mod ui;
 mod update;
+mod wake;
 mod ytm;
 
 use eframe::egui;
@@ -111,19 +114,75 @@ fn main() -> eframe::Result {
         (Some(query), None) if !query.starts_with("--") => (Some(query), false),
         _ => (None, false),
     };
+    run_window(query, autoplay, updated)
+}
+
+fn native_options() -> eframe::NativeOptions {
     let viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_app_id(app_id())
         .with_inner_size(app::WINDOW_SIZE)
         .with_min_inner_size(app::WINDOW_MIN)
         .with_icon(ui::app_icon());
-    let options = eframe::NativeOptions {
+    eframe::NativeOptions {
         viewport,
         ..Default::default()
-    };
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn run_window(query: Option<String>, autoplay: bool, updated: bool) -> eframe::Result {
     eframe::run_native(
         APP_NAME,
-        options,
+        native_options(),
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, query, autoplay, updated)))),
     )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_window(query: Option<String>, autoplay: bool, updated: bool) -> eframe::Result {
+    let slot = parked::Slot::default();
+    let mut first_start = Some((query, autoplay, updated));
+    let mut failed_windows = 0;
+    loop {
+        let (handover, start) = (slot.clone(), first_start.take());
+        let opened = eframe::run_native(
+            APP_NAME,
+            native_options(),
+            Box::new(move |cc| {
+                let app = match handover.borrow_mut().take() {
+                    Some(mut parked) => {
+                        parked.attach(cc);
+                        parked
+                    }
+                    None => {
+                        let (query, autoplay, updated) = start.unwrap_or_default();
+                        Box::new(app::App::new(cc, query, autoplay, updated))
+                    }
+                };
+                Ok(Box::new(parked::Hosted::new(app, handover)))
+            }),
+        );
+        let Some(mut app) = slot.borrow_mut().take() else {
+            return opened;
+        };
+        match opened {
+            Ok(()) => failed_windows = 0,
+            Err(error) => {
+                failed_windows += 1;
+                if !parked::may_try_a_window_again(failed_windows, tray::host_present()) {
+                    app.finish_unseen();
+                    return Err(error);
+                }
+                app.keep_state();
+            }
+        }
+        match parked::keep_alive(&mut app) {
+            parked::Outcome::Show => *slot.borrow_mut() = Some(app),
+            parked::Outcome::Quit => {
+                app.finish_unseen();
+                return Ok(());
+            }
+        }
+    }
 }
