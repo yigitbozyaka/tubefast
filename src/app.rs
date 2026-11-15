@@ -5,9 +5,10 @@ use crate::hotkeys::{self, Combo, Command, Hotkeys};
 use crate::media::Media;
 use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
-use crate::tray::{self, Tray};
+use crate::tray::{self, Closing, Tray};
 use crate::ui;
 use crate::update::{self, Plan};
+use crate::wake;
 use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
@@ -339,15 +340,17 @@ pub struct App {
     pub layer_overlay: std::cell::OnceCell<Option<crate::overlay_wayland::Handle>>,
     pub notes: Vec<String>,
     restart: Option<PathBuf>,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    parking: bool,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fresh_window: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool, updated: bool) -> Self {
         ui::install(&cc.egui_ctx);
-        let mut saved: Saved = cc
-            .storage
-            .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
-            .unwrap_or_default();
+        wake::point_at_window(cc.egui_ctx.clone());
+        let mut saved = starting_state(cc);
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
         if !yt.signed_in() {
@@ -369,14 +372,19 @@ impl App {
         let speaker = Speaker::new(&mut player);
         let status = player.status();
         let playback = Playback::new(player, yt.clone(), signals.clone(), &saved);
-        let playback = playback::run(playback, signaled, ctx.clone());
+        let playback = playback::run(playback, signaled);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        tray::save_before_forced_exit({
+            let playback = playback.clone();
+            move || crate::parked::write_playback_of(&playback)
+        });
         let (sender, events) = mpsc::channel();
         let media = Media::new(cc, move |action| {
             let _ = signals.send(Signal::Pressed(Box::new(action)));
         });
-        let discord = saved.discord.then(|| link_discord(&sender, &ctx));
+        let discord = saved.discord.then(|| link_discord(&sender));
         let mut app = Self {
-            art: Art::new(ctx.clone(), yt.agent.clone()),
+            art: Art::new(wake::wake, yt.agent.clone()),
             ctx,
             yt,
             events,
@@ -429,6 +437,10 @@ impl App {
             layer_overlay: std::cell::OnceCell::new(),
             notes: if fresh_version { release_notes(RELEASE_NOTES) } else { Vec::new() },
             restart: None,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            parking: false,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            fresh_window: false,
         };
         match query {
             Some(query) => {
@@ -451,6 +463,30 @@ impl App {
         app
     }
 
+    fn collect_saved(&mut self) {
+        self.saved.visitor = self.yt.visitor();
+        let playback = self.playback.clone();
+        let mut playback = playback.lock().unwrap();
+        self.sync(&mut playback);
+        self.saved.position_ms = playback.position_ms();
+    }
+
+    fn publish_presence(&mut self) {
+        let item = self.saved.current.and_then(|current| self.saved.queue.get(current));
+        let playing = item.is_some() && !self.player.paused();
+        let (position_ms, duration_ms) = (self.player.position_ms(), self.player.duration_ms());
+        if let Some(media) = &mut self.media {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            media.set_volume(self.saved.volume);
+            media.show(item, playing, position_ms, duration_ms);
+        }
+        if let Some(discord) = self.discord.as_mut().filter(|_| !self.player.loading()) {
+            let track = item.filter(|_| playing).map(|item| (item, self.saved.covers.of(item)));
+            let (headline, name) = (self.saved.discord_headline, &self.saved.discord_name);
+            discord.show(track, headline, name, position_ms, duration_ms);
+        }
+    }
+
     fn notify(&mut self, text: impl Into<String>) {
         self.offer(text, None, NOTICE_TIME);
     }
@@ -465,11 +501,11 @@ impl App {
     }
 
     fn background(&self, work: impl FnOnce(&Client) -> Option<Event> + Send + 'static) {
-        let (yt, sender, ctx) = (self.yt.clone(), self.sender.clone(), self.ctx.clone());
+        let (yt, sender) = (self.yt.clone(), self.sender.clone());
         std::thread::spawn(move || {
             if let Some(event) = work(&yt) {
                 let _ = sender.send(event);
-                ctx.request_repaint();
+                wake::wake();
             }
         });
     }
@@ -631,23 +667,23 @@ impl App {
             self.home_parts.clear();
         }
         let load = self.home_load;
-        let (yt, sender, ctx, route) = (self.yt.clone(), self.sender.clone(), self.ctx.clone(), route.clone());
+        let (yt, sender, route) = (self.yt.clone(), self.sender.clone(), route.clone());
         std::thread::spawn(move || {
             let emit = |order: usize, sections: Vec<Section>| {
                 let _ = sender.send(Event::Part(load, order, sections));
-                ctx.request_repaint();
+                wake::wake();
             };
             let result = match &route {
                 Route::Home => yt.home(&seeds, &emit).map(|()| Page::default()),
                 Route::Search(query) => yt.search(query),
                 Route::Browse(id) => yt.browse(id, &|page| {
                     let _ = sender.send(Event::Page(route.clone(), Ok(Box::new(page.clone()))));
-                    ctx.request_repaint();
+                    wake::wake();
                 }),
                 Route::Liked | Route::Recent | Route::Settings => return,
             };
             let _ = sender.send(Event::Page(route, result.map(Box::new)));
-            ctx.request_repaint();
+            wake::wake();
         });
     }
 
@@ -727,7 +763,7 @@ impl App {
         }
     }
 
-    fn drain(&mut self, ctx: &egui::Context, playback: &mut Playback) {
+    fn drain(&mut self, playback: &mut Playback) -> Option<Duration> {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Part(load, order, sections) if load == self.home_load => {
@@ -844,6 +880,7 @@ impl App {
             self.leave_session();
             self.notify("Your YouTube session ended. Sign in again.");
         }
+        let mut repaint_after = None;
         if let Some(typed) = self.typed {
             if typed.elapsed() >= SEARCH_DEBOUNCE {
                 self.typed = None;
@@ -852,7 +889,7 @@ impl App {
                     self.go(Route::Search(query));
                 }
             } else {
-                ctx.request_repaint_after(SEARCH_DEBOUNCE - typed.elapsed());
+                repaint_after = Some(SEARCH_DEBOUNCE - typed.elapsed());
             }
         }
         if let Some(notice) = &self.notice {
@@ -861,9 +898,10 @@ impl App {
                 self.notice = None;
                 self.replaced = None;
             } else {
-                ctx.request_repaint_after(left);
+                repaint_after = Some(repaint_after.map_or(left, |sooner| sooner.min(left)));
             }
         }
+        repaint_after
     }
 
     fn restart_hotkeys(&mut self) {
@@ -876,10 +914,10 @@ impl App {
             .into_iter()
             .filter_map(|command| Some((command, self.saved.hotkey_combos[command as usize]?)))
             .collect();
-        let (sender, ctx) = (self.sender.clone(), self.ctx.clone());
+        let sender = self.sender.clone();
         let press = move |command: Command| {
             let _ = sender.send(Event::Pressed(command.action()));
-            ctx.request_repaint();
+            wake::wake();
         };
         if let Some((hotkeys, taken)) = Hotkeys::start(bindings, press) {
             self.hotkeys = Some(hotkeys);
@@ -1183,13 +1221,78 @@ impl App {
             Action::ShowOnDiscord(shown) => {
                 self.saved.discord = shown;
                 self.discord_linked = None;
-                self.discord = shown.then(|| link_discord(&self.sender, &self.ctx));
+                self.discord = shown.then(|| link_discord(&self.sender));
             }
             Action::DiscordHeadline(headline) => self.saved.discord_headline = headline,
             Action::DiscordName(name) => {
                 self.saved.discord_name = name;
                 self.saved.discord_headline = Headline::Custom;
             }
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl App {
+    pub fn parking(&self) -> bool {
+        self.parking
+    }
+
+    fn start_parking(&mut self) {
+        self.parking = true;
+        wake::point_at_parked();
+    }
+
+    fn let_go_of_the_window(&mut self) {
+        self.art = Art::idle();
+        self.ctx = egui::Context::default();
+        self.set_recording(None);
+        self.overlay_open &= hotkeys::layer_overlay();
+        self.fitted = None;
+    }
+
+    pub fn attach(&mut self, cc: &eframe::CreationContext<'_>) {
+        ui::install(&cc.egui_ctx);
+        self.ctx = cc.egui_ctx.clone();
+        wake::point_at_window(self.ctx.clone());
+        self.art = Art::new(wake::wake, self.yt.agent.clone());
+        self.title_bar = ui::TitleBar::new(cc);
+        self.window = tray::window_of(cc);
+        self.geometry = cc.storage.and_then(|storage| storage.get_string(WINDOW_KEY));
+        self.parking = false;
+        self.fresh_window = true;
+    }
+
+    pub fn step_unseen(&mut self) -> (bool, bool) {
+        let playback = self.playback.clone();
+        let mut playback = playback.lock().unwrap();
+        self.speaker.follow_default_device(&mut playback.player);
+        self.sync(&mut playback);
+        self.drain(&mut playback);
+        let layered = hotkeys::layer_overlay();
+        let shown = layered && self.saved.overlay && self.overlay_open;
+        let actions = if layered { ui::layer_overlay(self, shown) } else { Vec::new() };
+        for action in actions {
+            self.apply(action, &mut playback);
+        }
+        self.sync(&mut playback);
+        drop(playback);
+        self.look_up_covers();
+        self.publish_presence();
+        (self.playing() || self.player.loading(), shown)
+    }
+
+    pub fn keep_state(&mut self) {
+        self.collect_saved();
+        if let Some(files) = crate::parked::Files::of_profile() {
+            files.write_state(&self.saved);
+        }
+    }
+
+    pub fn finish_unseen(&mut self) {
+        self.keep_state();
+        if let Some(program) = &self.restart {
+            update::restart(program, &crate::profile_arguments());
         }
     }
 }
@@ -1204,11 +1307,27 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|input| input.viewport().close_requested()) && tray::hides_on_close(self.tray.is_some(), tray::quitting()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if let Some(tray) = &self.tray {
-                tray.hide();
+        wake::frame_drawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if std::mem::take(&mut self.fresh_window) {
+            tray::present_new_window(ctx);
+        }
+        if ctx.input(|input| input.viewport().close_requested()) {
+            match tray::on_close_request(self.tray.is_some()) {
+                Closing::Quit => {}
+                Closing::Hide => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    if let Some(tray) = &self.tray {
+                        tray.hide();
+                    }
+                }
+                Closing::Park => {
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    self.start_parking();
+                }
             }
+        } else if cfg!(all(unix, not(target_os = "macos"))) && tray::quitting() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         let (size, minimized, monitor, resizable) = ctx.input(|input| {
             let viewport = input.viewport();
@@ -1242,7 +1361,9 @@ impl eframe::App for App {
         let mut playback = playback.lock().unwrap();
         self.speaker.follow_default_device(&mut playback.player);
         self.sync(&mut playback);
-        self.drain(ctx, &mut playback);
+        if let Some(after) = self.drain(&mut playback) {
+            ctx.request_repaint_after(after);
+        }
         let mut actions = if self.record(ctx) { Vec::new() } else { self.shortcuts(ctx) };
         actions.extend(ui::draw(self, ctx));
         actions.extend(ui::overlay(self, ctx));
@@ -1256,23 +1377,15 @@ impl eframe::App for App {
         if self.playing() || self.player.loading() {
             ctx.request_repaint_after(PROGRESS_TICK);
         }
-        let item = self.saved.current.and_then(|current| self.saved.queue.get(current));
-        let playing = item.is_some() && !self.player.paused();
-        let (position_ms, duration_ms) = (self.player.position_ms(), self.player.duration_ms());
-        if let Some(media) = &mut self.media {
-            #[cfg(all(unix, not(target_os = "macos")))]
-            media.set_volume(self.saved.volume);
-            media.show(item, playing, position_ms, duration_ms);
-        }
-        if let Some(discord) = self.discord.as_mut().filter(|_| !self.player.loading()) {
-            let track = item.filter(|_| playing).map(|item| (item, self.saved.covers.of(item)));
-            let (headline, name) = (self.saved.discord_headline, &self.saved.discord_name);
-            discord.show(track, headline, name, position_ms, duration_ms);
-        }
+        self.publish_presence();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         tray::release_activation();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if self.parking {
+            self.let_go_of_the_window();
+        }
         if let Some(program) = &self.restart {
             update::restart(program, &crate::profile_arguments());
         }
@@ -1285,13 +1398,23 @@ impl eframe::App for App {
             (_, true) => {}
             (_, false) => self.geometry = storage.get_string(WINDOW_KEY),
         }
-        self.saved.visitor = self.yt.visitor();
-        let playback = self.playback.clone();
-        let mut playback = playback.lock().unwrap();
-        self.sync(&mut playback);
-        self.saved.position_ms = playback.position_ms();
+        self.collect_saved();
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
+        #[cfg(all(unix, not(target_os = "macos")))]
+        crate::parked::forget_superseded();
     }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
+    crate::parked::recover(cc.storage.and_then(|storage| eframe::get_value(storage, eframe::APP_KEY)))
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
+    cc.storage
+        .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
+        .unwrap_or_default()
 }
 
 impl Drop for App {
@@ -1300,11 +1423,11 @@ impl Drop for App {
     }
 }
 
-fn link_discord(sender: &Sender<Event>, ctx: &egui::Context) -> Discord {
-    let (sender, ctx) = (sender.clone(), ctx.clone());
+fn link_discord(sender: &Sender<Event>) -> Discord {
+    let sender = sender.clone();
     Discord::start(move |linked| {
         let _ = sender.send(Event::Discord(linked));
-        ctx.request_repaint();
+        wake::wake();
     })
 }
 

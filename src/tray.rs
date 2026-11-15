@@ -10,8 +10,38 @@ pub fn begin_quit() {
     QUITTING.store(true, Ordering::SeqCst);
 }
 
-pub fn hides_on_close(tray_running: bool, quitting: bool) -> bool {
-    tray_running && !quitting
+#[derive(Debug, PartialEq, Eq)]
+pub enum Closing {
+    Quit,
+    Hide,
+    Park,
+}
+
+pub fn closing(tray_running: bool, quitting: bool, wayland: bool, host_present: bool) -> Closing {
+    if !tray_running || quitting {
+        Closing::Quit
+    } else if !wayland {
+        Closing::Hide
+    } else if host_present {
+        Closing::Park
+    } else {
+        Closing::Quit
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+pub fn on_close_request(tray_running: bool) -> Closing {
+    closing(tray_running, quitting(), false, true)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn host_present() -> bool {
+    host::present()
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn on_close_request(tray_running: bool) -> Closing {
+    closing(tray_running, quitting(), on_wayland(), host::present())
 }
 
 #[cfg(windows)]
@@ -117,14 +147,189 @@ mod activation {
         }
     }
 
-    pub fn activate_from_tray_event() -> bool {
+    static STASHED: Mutex<Option<String>> = Mutex::new(None);
+
+    fn token_of_tray_event() -> Option<String> {
         for _ in 0..20 {
             if let Some(token) = ksni::current_xdg_activation_token() {
-                return activate(token);
+                return Some(token);
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        false
+        None
+    }
+
+    pub fn activate_from_tray_event() -> bool {
+        token_of_tray_event().is_some_and(activate)
+    }
+
+    pub fn stash_token_of_tray_event() {
+        *STASHED.lock().unwrap() = token_of_tray_event();
+    }
+
+    pub fn activate_stashed() -> bool {
+        let stashed = STASHED.lock().unwrap().take();
+        stashed.is_some_and(activate)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn present_new_window(ctx: &eframe::egui::Context) {
+    use eframe::egui::ViewportCommand;
+    ctx.send_viewport_cmd(ViewportCommand::Focus);
+    if !activation::activate_stashed() {
+        ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+            eframe::egui::UserAttentionType::Informational,
+        ));
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub use watchdog::save_before_forced_exit;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod watchdog {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    const GRACE: Duration = Duration::from_millis(1000);
+
+    static BEFORE_EXIT: Mutex<Option<Box<dyn Fn() + Send>>> = Mutex::new(None);
+
+    pub fn save_before_forced_exit(save: impl Fn() + Send + 'static) {
+        *BEFORE_EXIT.lock().unwrap() = Some(Box::new(save));
+    }
+
+    pub fn frozen(frames_before: u64, frames_after: u64) -> bool {
+        frames_before == frames_after
+    }
+
+    pub fn start() {
+        let before = crate::wake::frames_drawn();
+        let _ = std::thread::Builder::new()
+            .name("quit-watchdog".to_owned())
+            .spawn(move || {
+                std::thread::sleep(GRACE);
+                if !frozen(before, crate::wake::frames_drawn()) {
+                    return;
+                }
+                if let Some(save) = BEFORE_EXIT.lock().unwrap().as_ref() {
+                    save();
+                }
+                unsafe { libc::_exit(0) };
+            });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_window_that_drew_nothing_since_quit_began_is_frozen() {
+            assert!(frozen(7, 7));
+            assert!(!frozen(7, 8));
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod host {
+    use ashpd::zbus::fdo::DBusProxy;
+    use ashpd::zbus::names::BusName;
+    use ashpd::zbus::proxy::{Builder, CacheProperties};
+    use ashpd::zbus::{Connection, Proxy};
+    use futures_lite::{StreamExt, future};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const WATCHER: &str = "org.kde.StatusNotifierWatcher";
+    const PATH: &str = "/StatusNotifierWatcher";
+    const HOST_FLAG: &str = "IsStatusNotifierHostRegistered";
+
+    static PRESENT: AtomicBool = AtomicBool::new(false);
+
+    pub fn present() -> bool {
+        PRESENT.load(Ordering::SeqCst)
+    }
+
+    pub fn host_shown(watcher_owned: bool, host_registered: Option<bool>) -> bool {
+        watcher_owned && host_registered.unwrap_or(true)
+    }
+
+    pub struct Watch {
+        _stop: async_channel::Sender<()>,
+    }
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            PRESENT.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub fn host_lost(known: Option<bool>, now: bool) -> bool {
+        known == Some(true) && !now
+    }
+
+    fn publish(known: &mut Option<bool>, now: bool) {
+        PRESENT.store(now, Ordering::SeqCst);
+        if host_lost(*known, now) {
+            crate::wake::bring_back_if_parked();
+        }
+        *known = Some(now);
+    }
+
+    pub fn watch() -> Option<Watch> {
+        let (keeper, stop) = async_channel::bounded(1);
+        std::thread::Builder::new()
+            .name("tray-host-watch".to_owned())
+            .spawn(move || {
+                let mut known = None;
+                let asked_to_stop = future::block_on(follow(stop, &mut known)).unwrap_or(false);
+                if !asked_to_stop {
+                    publish(&mut known, false);
+                }
+            })
+            .ok()?;
+        Some(Watch { _stop: keeper })
+    }
+
+    async fn shown_by(dbus: &DBusProxy<'_>, watcher: &Proxy<'_>) -> bool {
+        let owned = match BusName::try_from(WATCHER) {
+            Ok(name) => dbus.name_has_owner(name).await.unwrap_or(false),
+            Err(_) => false,
+        };
+        let registered = if owned {
+            watcher.get_property::<bool>(HOST_FLAG).await.ok()
+        } else {
+            None
+        };
+        host_shown(owned, registered)
+    }
+
+    async fn follow(stop: async_channel::Receiver<()>, known: &mut Option<bool>) -> ashpd::zbus::Result<bool> {
+        let connection = Connection::session().await?;
+        let dbus = DBusProxy::new(&connection).await?;
+        let watcher = Builder::<Proxy<'_>>::new(&connection)
+            .destination(WATCHER)?
+            .path(PATH)?
+            .interface(WATCHER)?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?;
+        let owner = dbus.receive_name_owner_changed_with_args(&[(0, WATCHER)]).await?.map(|_| ());
+        let registered = watcher.receive_signal("StatusNotifierHostRegistered").await?.map(|_| ());
+        let unregistered = watcher.receive_signal("StatusNotifierHostUnregistered").await?.map(|_| ());
+        let mut changes = std::pin::pin!(owner.or(registered).or(unregistered));
+        loop {
+            publish(known, shown_by(&dbus, &watcher).await);
+            let changed = async { changes.next().await.is_none().then_some(false) };
+            let stopped = async {
+                let _ = stop.recv().await;
+                Some(true)
+            };
+            if let Some(asked_to_stop) = future::or(changed, stopped).await {
+                return Ok(asked_to_stop);
+            }
+        }
     }
 }
 
@@ -412,8 +617,8 @@ const QUIT_ID: &str = "quit";
 #[cfg(not(windows))]
 pub struct Tray {
     _icon: tray_icon::TrayIcon,
-    ctx: eframe::egui::Context,
-    minimize_only: bool,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    _host: Option<host::Watch>,
 }
 
 #[cfg(not(windows))]
@@ -431,10 +636,39 @@ fn reveal(ctx: &eframe::egui::Context) {
 }
 
 #[cfg(not(windows))]
-fn quit(ctx: &eframe::egui::Context) {
+fn show() {
+    match crate::wake::window_context() {
+        Some(ctx) => reveal(&ctx),
+        None => ask_parked_app_for_a_window(),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn ask_parked_app_for_a_window() {
+    activation::stash_token_of_tray_event();
+    crate::wake::request_show();
+}
+
+#[cfg(all(not(windows), not(all(unix, not(target_os = "macos")))))]
+fn ask_parked_app_for_a_window() {}
+
+#[cfg(not(windows))]
+fn quit() {
     begin_quit();
-    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
-    ctx.request_repaint();
+    match crate::wake::window_context() {
+        Some(ctx) => {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+            ctx.request_repaint();
+            #[cfg(all(unix, not(target_os = "macos")))]
+            if on_wayland() {
+                watchdog::start();
+            }
+        }
+        None => {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            crate::wake::request_quit();
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -444,7 +678,7 @@ fn on_wayland() -> bool {
 
 #[cfg(not(windows))]
 impl Tray {
-    pub fn start(_: isize, ctx: eframe::egui::Context) -> Option<Self> {
+    pub fn start(_: isize, _: eframe::egui::Context) -> Option<Self> {
         use tray_icon::menu::{Menu, MenuEvent, MenuItem};
         use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
@@ -462,13 +696,11 @@ impl Tray {
             .with_icon(Icon::from_rgba(art.rgba, art.width, art.height).ok()?)
             .build()
             .ok()?;
-        let menu_ctx = ctx.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| match event.id.as_ref() {
-            SHOW_ID => reveal(&menu_ctx),
-            QUIT_ID => quit(&menu_ctx),
+            SHOW_ID => show(),
+            QUIT_ID => quit(),
             _ => {}
         }));
-        let click_ctx = ctx.clone();
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -476,24 +708,20 @@ impl Tray {
                 ..
             } = event
             {
-                reveal(&click_ctx);
+                show();
             }
         }));
         Some(Self {
             _icon: icon,
-            ctx,
-            minimize_only: on_wayland(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            _host: if on_wayland() { host::watch() } else { None },
         })
     }
 
     pub fn hide(&self) {
-        use eframe::egui::ViewportCommand;
-        let command = if self.minimize_only {
-            ViewportCommand::Minimized(true)
-        } else {
-            ViewportCommand::Visible(false)
-        };
-        self.ctx.send_viewport_cmd(command);
+        if let Some(ctx) = crate::wake::window_context() {
+            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Visible(false));
+        }
     }
 }
 
@@ -511,9 +739,47 @@ mod tests {
 
     #[test]
     fn closing_hides_only_while_the_tray_runs_and_not_quitting() {
-        assert!(hides_on_close(true, false));
-        assert!(!hides_on_close(false, false));
-        assert!(!hides_on_close(true, true));
-        assert!(!hides_on_close(false, true));
+        for wayland in [false, true] {
+            for host in [false, true] {
+                assert_eq!(closing(false, false, wayland, host), Closing::Quit);
+                assert_eq!(closing(true, true, wayland, host), Closing::Quit);
+                assert_eq!(closing(false, true, wayland, host), Closing::Quit);
+            }
+        }
+    }
+
+    #[test]
+    fn outside_wayland_closing_still_hides_the_window_in_place() {
+        assert_eq!(closing(true, false, false, false), Closing::Hide);
+        assert_eq!(closing(true, false, false, true), Closing::Hide);
+    }
+
+    #[test]
+    fn on_wayland_the_window_goes_away_only_when_a_tray_host_can_bring_it_back() {
+        assert_eq!(closing(true, false, true, true), Closing::Park);
+        assert_eq!(closing(true, false, true, false), Closing::Quit);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn only_a_host_that_was_there_and_is_gone_counts_as_lost() {
+        use host::host_lost;
+        assert!(host_lost(Some(true), false));
+        assert!(!host_lost(None, false));
+        assert!(!host_lost(Some(false), false));
+        assert!(!host_lost(Some(true), true));
+        assert!(!host_lost(Some(false), true));
+        assert!(!host_lost(None, true));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_tray_host_needs_an_owned_watcher_and_a_registered_host() {
+        use host::host_shown;
+        assert!(!host_shown(false, None));
+        assert!(!host_shown(false, Some(true)));
+        assert!(!host_shown(true, Some(false)));
+        assert!(host_shown(true, Some(true)));
+        assert!(host_shown(true, None));
     }
 }
