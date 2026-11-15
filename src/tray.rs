@@ -206,18 +206,16 @@ mod watchdog {
 
     pub fn start() {
         let before = crate::wake::frames_drawn();
-        let _ = std::thread::Builder::new()
-            .name("quit-watchdog".to_owned())
-            .spawn(move || {
-                std::thread::sleep(GRACE);
-                if !frozen(before, crate::wake::frames_drawn()) {
-                    return;
-                }
-                if let Some(save) = BEFORE_EXIT.lock().unwrap().as_ref() {
-                    save();
-                }
-                unsafe { libc::_exit(0) };
-            });
+        let _ = std::thread::Builder::new().name("quit-watchdog".to_owned()).spawn(move || {
+            std::thread::sleep(GRACE);
+            if !frozen(before, crate::wake::frames_drawn()) {
+                return;
+            }
+            if let Some(save) = BEFORE_EXIT.lock().unwrap().as_ref() {
+                save();
+            }
+            unsafe { libc::_exit(0) };
+        });
     }
 
     #[cfg(test)]

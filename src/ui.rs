@@ -661,9 +661,7 @@ pub fn layer_overlay(app: &App, open: bool) -> Vec<Action> {
         }
         return Vec::new();
     }
-    let started = app
-        .layer_overlay
-        .get_or_init(|| overlay_wayland::Handle::start(app.http_agent()));
+    let started = app.layer_overlay.get_or_init(|| overlay_wayland::Handle::start(app.http_agent()));
     let Some(handle) = started else {
         return vec![Action::ToggleOverlay];
     };
