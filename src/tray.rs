@@ -653,19 +653,16 @@ fn ask_parked_app_for_a_window() {}
 #[cfg(not(windows))]
 fn quit() {
     begin_quit();
-    match crate::wake::window_context() {
-        Some(ctx) => {
-            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
-            ctx.request_repaint();
-            #[cfg(all(unix, not(target_os = "macos")))]
-            if on_wayland() {
-                watchdog::start();
-            }
-        }
-        None => {
-            #[cfg(all(unix, not(target_os = "macos")))]
-            crate::wake::request_quit();
-        }
+    let Some(ctx) = crate::wake::window_context() else {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        crate::wake::request_quit();
+        return;
+    };
+    ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+    ctx.request_repaint();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if on_wayland() {
+        watchdog::start();
     }
 }
 
