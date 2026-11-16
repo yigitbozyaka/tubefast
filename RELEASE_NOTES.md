@@ -2,3 +2,4 @@
 - The media overlay now also works on Linux Wayland desktops that support layer shell, such as KDE Plasma, Sway and Hyprland. It does not work on GNOME, and Settings says so
 - On Linux Wayland, closing the window to the tray now really hides it (it leaves the taskbar and Alt+Tab while the music plays on), Quit in the tray menu works even when the window is minimized, and a desktop with no tray makes the close button quit as usual
 - Turning shuffle off puts the queue back in its normal order
+- The queue panel now shows the whole queue, including songs that already played, and you can click any song to jump to it

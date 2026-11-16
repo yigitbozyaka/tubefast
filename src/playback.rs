@@ -229,7 +229,8 @@ impl Playback {
         if index >= self.queue.len() {
             return;
         }
-        let played = if self.repeat == Repeat::All {
+        let going_back = self.current.is_some_and(|current| index < current);
+        let played = if self.repeat == Repeat::All || going_back {
             0
         } else {
             index.saturating_sub(PLAYED_KEPT)
@@ -656,5 +657,44 @@ mod tests {
             assert!(!reorder(&mut queue, 1, from, gap));
         }
         assert_eq!(order(&queue), "acdbe");
+    }
+
+    #[test]
+    fn jumping_back_to_a_played_song_keeps_the_whole_queue() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abcdef"), 0);
+        playback.play_index(4);
+        playback.play_index(1);
+        assert_eq!(order(playback.queue()), "abcdef");
+        assert_eq!(playing(&playback), "b");
+        playback.play_index(5);
+        assert_eq!(order(playback.queue()), "abcdef");
+        assert_eq!(playing(&playback), "f");
+    }
+
+    #[test]
+    fn jumping_back_never_trims_what_played_long_ago() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        let many: String = ('a'..='z').chain('A'..='Z').chain('0'..='9').chain(['-', '_', '.', ',']).collect();
+        playback.play(songs(&many), 0);
+        let last = many.len() - 1;
+        playback.play_index(last);
+        assert_eq!(playback.queue().len(), many.len() - (last - PLAYED_KEPT));
+        let before = playback.queue().len();
+        playback.play_index(0);
+        assert_eq!(playback.queue().len(), before);
+        assert_eq!(playback.current(), Some(0));
+    }
+
+    #[test]
+    fn removing_a_played_song_keeps_the_current_one_playing() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abcde"), 3);
+        playback.remove(1);
+        assert_eq!(order(playback.queue()), "acde");
+        assert_eq!(playing(&playback), "d");
+        playback.remove(2);
+        assert_eq!(order(playback.queue()), "acde");
+        assert_eq!(playing(&playback), "d");
     }
 }
