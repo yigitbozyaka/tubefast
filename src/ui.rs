@@ -2800,17 +2800,26 @@ fn queue_panel(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let haze = Rect::from_min_size(area.min, vec2(area.width(), AMBIENT_HEIGHT.min(area.height())));
     wash(ui.painter(), haze, glow, PANEL);
     ui.painter().vline(area.left() + 0.5, area.y_range(), Stroke::new(1.0, veil(0.06)));
-    Frame::new().inner_margin(Margin::same(20)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        let Some(item) = app.now_playing() else {
+    let Some(item) = app.now_playing() else {
+        Frame::new().inner_margin(Margin::same(20)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
             message(
                 ui,
                 icon::VINYL_RECORD,
                 "Nothing playing",
                 "Pick a song and the queue lines up here.",
             );
-            return;
-        };
+        });
+        return;
+    };
+    let header = Margin {
+        left: 20,
+        right: 20,
+        top: 20,
+        bottom: 0,
+    };
+    Frame::new().inner_margin(header).show(ui, |ui| {
+        ui.set_width(ui.available_width());
         eyebrow(ui, "Now playing", 0.0);
         let (head, cover) = ui.allocate_exact_size(vec2(ui.available_width(), QUEUE_ART), Sense::click());
         let art = Rect::from_min_size(head.min, Vec2::splat(QUEUE_ART));
@@ -2834,15 +2843,23 @@ fn queue_panel(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
         let below = pos2(left, top + title.size().y + 12.0);
         ui.painter().galley(pos2(left, top), title, TEXT);
         byline(ui, out, item, Id::new("queue-artist"), below, sans(13.0), head.right() - left);
-        ui.add_space(26.0);
-        egui::ScrollArea::vertical()
-            .id_salt("queue-rows")
-            .auto_shrink(false)
-            .show(ui, |ui| {
+    });
+    ui.add_space(26.0);
+    let rows = Margin {
+        left: 20,
+        right: 20,
+        top: 0,
+        bottom: 20,
+    };
+    egui::ScrollArea::vertical()
+        .id_salt("queue-rows")
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            Frame::new().inner_margin(rows).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 queue_rows(app, ui, true, out);
             });
-    });
+        });
 }
 
 fn tab(ui: &Ui, at: Pos2, text: &str, active: bool) -> Response {
@@ -3022,7 +3039,7 @@ fn queue_rows(app: &App, ui: &mut Ui, heading: bool, out: &mut Vec<Action>) -> b
         }
         let hover = hover_of(ui, response);
         let is_current = current == Some(index);
-        let mut row = ui.new_child(UiBuilder::new().max_rect(slot));
+        let mut row = ui.new_child(UiBuilder::new().id_salt(index).max_rect(slot));
         if index < upcoming && !is_current {
             row.set_opacity(0.55);
         }
