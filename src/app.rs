@@ -78,6 +78,7 @@ pub struct Saved {
     pub account: Option<Account>,
     pub covers: Covers,
     pub queue: Vec<Item>,
+    pub unshuffled: Vec<Item>,
     pub current: Option<usize>,
     pub position_ms: u64,
     pub lyrics_open: bool,
@@ -160,6 +161,7 @@ impl Default for Saved {
             account: None,
             covers: Covers::default(),
             queue: Vec::new(),
+            unshuffled: Vec::new(),
             current: None,
             position_ms: 0,
             lyrics_open: false,
@@ -721,6 +723,7 @@ impl App {
         if playback.version() != self.synced {
             self.synced = playback.version();
             self.saved.queue = playback.queue().to_vec();
+            self.saved.unshuffled = playback.unshuffled().to_vec();
             self.saved.current = playback.current();
             self.saved.repeat = playback.repeat();
             self.saved.shuffle = playback.shuffle();

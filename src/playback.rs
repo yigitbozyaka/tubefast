@@ -16,11 +16,12 @@ pub enum Signal {
     Radio(String, Vec<Item>),
 }
 
-pub type Replaced = (Vec<Item>, Option<usize>, u64);
+pub type Replaced = (Vec<Item>, Option<usize>, u64, Vec<Item>);
 
 pub struct Playback {
     pub player: Player,
     queue: Vec<Item>,
+    unshuffled: Vec<Item>,
     current: Option<usize>,
     repeat: Repeat,
     shuffle: bool,
@@ -58,6 +59,7 @@ impl Playback {
         Self {
             player,
             queue: saved.queue.clone(),
+            unshuffled: if saved.shuffle { saved.unshuffled.clone() } else { Vec::new() },
             current: saved.current,
             repeat: saved.repeat,
             shuffle: saved.shuffle,
@@ -78,6 +80,10 @@ impl Playback {
 
     pub fn queue(&self) -> &[Item] {
         &self.queue
+    }
+
+    pub fn unshuffled(&self) -> &[Item] {
+        &self.unshuffled
     }
 
     pub fn current(&self) -> Option<usize> {
@@ -146,16 +152,18 @@ impl Playback {
         let chosen = items.get(index).map(|item| item.video_id.clone()).unwrap_or_default();
         let songs: Vec<Item> = items.into_iter().filter(Item::is_song).collect();
         let before = std::mem::replace(&mut self.queue, songs);
+        let before_unshuffled = std::mem::take(&mut self.unshuffled);
         let upcoming = self.current.map_or(0, |current| current + 1);
         let same_list =
             before.len() == self.queue.len() && before.iter().all(|old| self.queue.iter().any(|new| new.video_id == old.video_id));
         let mut replaced = None;
         if self.curated && upcoming < before.len() && !same_list {
-            replaced = Some((before, self.current, self.position_ms()));
+            replaced = Some((before, self.current, self.position_ms(), before_unshuffled));
         }
         self.curated = self.queue.len() > 1;
         let mut at = self.queue.iter().position(|item| item.video_id == chosen).unwrap_or(0);
         if self.shuffle && !self.queue.is_empty() {
+            self.unshuffled = self.queue.clone();
             self.queue.swap(0, at);
             at = 0;
             shuffle(&mut self.queue[1..]);
@@ -205,6 +213,9 @@ impl Playback {
         let had_next = upcoming < self.queue.len();
         for item in items {
             if !self.queue.iter().any(|queued| queued.video_id == item.video_id) {
+                if !self.unshuffled.is_empty() {
+                    self.unshuffled.push(item.clone());
+                }
                 self.queue.push(item);
             }
         }
@@ -254,6 +265,13 @@ impl Playback {
     pub fn play_next(&mut self, item: Item) {
         let at = self.current.map_or(0, |current| current + 1).min(self.queue.len());
         self.curated = true;
+        if !self.unshuffled.is_empty() {
+            let playing = self.current.and_then(|current| self.queue.get(current));
+            let after = playing
+                .and_then(|playing| self.unshuffled.iter().position(|song| song.video_id == playing.video_id))
+                .map_or(self.unshuffled.len(), |position| position + 1);
+            self.unshuffled.insert(after, item.clone());
+        }
         self.queue.insert(at, item);
         self.changed();
         if self.current.is_none() {
@@ -263,6 +281,9 @@ impl Playback {
 
     pub fn enqueue(&mut self, item: Item) {
         self.curated = true;
+        if !self.unshuffled.is_empty() {
+            self.unshuffled.push(item.clone());
+        }
         self.queue.push(item);
         self.changed();
         if self.current.is_none() {
@@ -272,7 +293,10 @@ impl Playback {
 
     pub fn remove(&mut self, index: usize) {
         if index < self.queue.len() && self.current != Some(index) {
-            self.queue.remove(index);
+            let removed = self.queue.remove(index);
+            if let Some(at) = self.unshuffled.iter().position(|song| song.video_id == removed.video_id) {
+                self.unshuffled.remove(at);
+            }
             if let Some(current) = self.current.as_mut().filter(|current| index < **current) {
                 *current -= 1;
             }
@@ -281,6 +305,10 @@ impl Playback {
     }
 
     pub fn extend(&mut self, fresh: impl IntoIterator<Item = Item>) {
+        let fresh: Vec<Item> = fresh.into_iter().collect();
+        if !self.unshuffled.is_empty() {
+            self.unshuffled.extend(fresh.iter().cloned());
+        }
         self.queue.extend(fresh);
         if self.shuffle {
             let upcoming = self.current.map_or(0, |current| current + 1).min(self.queue.len());
@@ -289,8 +317,13 @@ impl Playback {
         self.changed();
     }
 
-    pub fn restore(&mut self, (queue, current, position): Replaced) {
+    pub fn restore(&mut self, (queue, current, position, unshuffled): Replaced) {
         self.queue = queue;
+        self.unshuffled = match (self.shuffle, unshuffled.is_empty()) {
+            (false, _) => Vec::new(),
+            (true, true) => self.queue.clone(),
+            (true, false) => unshuffled,
+        };
         self.curated = true;
         self.changed();
         if let Some(current) = current {
@@ -301,11 +334,35 @@ impl Playback {
 
     pub fn toggle_shuffle(&mut self) {
         self.shuffle ^= true;
-        let upcoming = self.current.map_or(0, |current| current + 1).min(self.queue.len());
         if self.shuffle {
+            self.unshuffled = self.queue.clone();
+            let upcoming = self.current.map_or(0, |current| current + 1).min(self.queue.len());
             shuffle(&mut self.queue[upcoming..]);
+        } else {
+            self.restore_order();
         }
+        self.preload_next();
         self.changed();
+    }
+
+    fn restore_order(&mut self) {
+        let order = std::mem::take(&mut self.unshuffled);
+        let playing = self
+            .current
+            .and_then(|current| self.queue.get(current))
+            .map(|item| item.video_id.clone());
+        let found = playing.map(|id| order.iter().position(|item| item.video_id == id));
+        if order.is_empty() || found == Some(None) {
+            return;
+        }
+        self.current = found.flatten().or(self.current);
+        self.queue = order;
+    }
+
+    fn preload_next(&self) {
+        if let Some(next) = self.current.and_then(|current| self.queue.get(current + 1)) {
+            self.player.preload(&next.video_id);
+        }
     }
 
     pub fn cycle_repeat(&mut self) {
@@ -396,6 +453,133 @@ mod tests {
             assert!(Instant::now() < deadline, "the ended song was never restarted");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    fn silent_playback(saved: &Saved) -> (Playback, mpsc::Receiver<Signal>) {
+        let yt = Arc::new(Client::new(String::new()));
+        let (signals, inbox) = mpsc::channel();
+        let wake = signals.clone();
+        let player = Player::new(yt.clone(), move || {
+            let _ = wake.send(Signal::Changed);
+        });
+        (Playback::new(player, yt, signals, saved), inbox)
+    }
+
+    fn songs(ids: &str) -> Vec<Item> {
+        ids.chars().map(|id| song(&id.to_string())).collect()
+    }
+
+    fn order(queue: &[Item]) -> String {
+        queue.iter().map(|item| item.video_id.as_str()).collect()
+    }
+
+    fn playing(playback: &Playback) -> &str {
+        &playback.queue()[playback.current().unwrap()].video_id
+    }
+
+    fn queue_position(playback: &Playback, id: &str) -> usize {
+        playback.queue().iter().position(|item| item.video_id == id).unwrap()
+    }
+
+    #[test]
+    fn turning_shuffle_off_brings_back_the_normal_order() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abcdef"), 2);
+        playback.toggle_shuffle();
+        assert_eq!(playing(&playback), "c");
+        playback.toggle_shuffle();
+        assert_eq!(order(playback.queue()), "abcdef");
+        assert_eq!(playback.current(), Some(2));
+        assert!(playback.unshuffled().is_empty());
+    }
+
+    #[test]
+    fn a_list_started_while_shuffled_returns_to_its_normal_order() {
+        let saved = Saved {
+            shuffle: true,
+            ..Saved::default()
+        };
+        let (mut playback, _inbox) = silent_playback(&saved);
+        playback.play(songs("abcdef"), 3);
+        assert_eq!(playing(&playback), "d");
+        assert_eq!(playback.queue().len(), 6);
+        playback.toggle_shuffle();
+        assert_eq!(order(playback.queue()), "abcdef");
+        assert_eq!(playback.current(), Some(3));
+    }
+
+    #[test]
+    fn edits_made_while_shuffled_survive_turning_shuffle_off() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abcdefgh"), 0);
+        playback.toggle_shuffle();
+        playback.remove(queue_position(&playback, "e"));
+        playback.enqueue(song("x"));
+        playback.play_next(song("y"));
+        assert_eq!(playback.queue()[1].video_id, "y");
+        playback.toggle_shuffle();
+        assert_eq!(order(playback.queue()), "aybcdfghx");
+        assert_eq!(playback.current(), Some(0));
+    }
+
+    #[test]
+    fn more_pages_arriving_while_shuffled_keep_their_original_order() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abcd"), 0);
+        playback.toggle_shuffle();
+        playback.extend(songs("efg"));
+        assert_eq!(playback.queue().len(), 7);
+        playback.toggle_shuffle();
+        assert_eq!(order(playback.queue()), "abcdefg");
+    }
+
+    #[test]
+    fn the_normal_order_survives_a_restart_while_shuffled() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abcdef"), 1);
+        playback.toggle_shuffle();
+        let saved = Saved {
+            queue: playback.queue().to_vec(),
+            unshuffled: playback.unshuffled().to_vec(),
+            current: playback.current(),
+            shuffle: playback.shuffle(),
+            ..Saved::default()
+        };
+        let (mut restarted, _restarted_inbox) = silent_playback(&saved);
+        restarted.toggle_shuffle();
+        assert_eq!(order(restarted.queue()), "abcdef");
+        assert_eq!(playing(&restarted), "b");
+    }
+
+    #[test]
+    fn a_shuffled_queue_without_a_saved_normal_order_stays_as_it_is() {
+        let saved = Saved {
+            queue: songs("cabd"),
+            current: Some(1),
+            shuffle: true,
+            ..Saved::default()
+        };
+        let (mut playback, _inbox) = silent_playback(&saved);
+        playback.enqueue(song("x"));
+        playback.toggle_shuffle();
+        assert_eq!(order(playback.queue()), "cabdx");
+        assert_eq!(playback.current(), Some(1));
+    }
+
+    #[test]
+    fn undoing_a_replaced_queue_while_shuffled_keeps_its_normal_order() {
+        let saved = Saved {
+            shuffle: true,
+            ..Saved::default()
+        };
+        let (mut playback, _inbox) = silent_playback(&saved);
+        playback.play(songs("abcdef"), 0);
+        let replaced = playback.play(songs("uvwxyz"), 0).expect("the first queue still had songs to play");
+        playback.restore(replaced);
+        assert_eq!(playback.queue().len(), 6);
+        assert_eq!(playing(&playback), "a");
+        playback.toggle_shuffle();
+        assert_eq!(order(playback.queue()), "abcdef");
     }
 
     #[test]
