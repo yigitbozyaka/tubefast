@@ -3,3 +3,4 @@
 - On Linux Wayland, closing the window to the tray now really hides it (it leaves the taskbar and Alt+Tab while the music plays on), Quit in the tray menu works even when the window is minimized, and a desktop with no tray makes the close button quit as usual
 - Turning shuffle off puts the queue back in its normal order
 - Album names on an artist page open the album, and the artist name on an album page opens the artist
+- The queue panel now shows the whole queue, including songs that already played, and you can click any song to jump to it
