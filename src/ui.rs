@@ -950,13 +950,24 @@ fn text_link(ui: &Ui, id: Id, rect: Rect, origin: Pos2, galley: &Arc<Galley>, hi
     response.clicked()
 }
 
+fn span_rect(galley: &Galley, origin: Pos2, chars: Range<usize>) -> Rect {
+    let edge = |at: usize| galley.pos_from_cursor(CCursor::new(at));
+    Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2() + galley.rect.min.to_vec2())
+}
+
+fn album_span(extra: &str, shown: usize) -> Option<Range<usize>> {
+    let total = extra.chars().count();
+    let start = extra.rfind(" • ").map_or(0, |at| extra[..at + " • ".len()].chars().count());
+    let visible = if shown < total { shown.saturating_sub(1) } else { total };
+    (start < visible).then_some(start..visible)
+}
+
 fn artist_links(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, origin: Pos2, galley: &Arc<Galley>, text: &str) {
     if item.is_artist {
         return;
     }
     for (index, (chars, browse_id)) in artist_spans(item, text).into_iter().enumerate() {
-        let edge = |at: usize| galley.pos_from_cursor(CCursor::new(at));
-        let rect = Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2() + galley.rect.min.to_vec2());
+        let rect = span_rect(galley, origin, chars);
         if rect.width() < 1.0 {
             continue;
         }
@@ -1293,9 +1304,13 @@ fn track_row(ui: &mut Ui, cx: &mut Cx, items: &[Item], index: usize, number: Opt
         let galley = fit(ui, &item.extra, sans(13.0), MUTED, column - 12.0, 1);
         let album = Align2::LEFT_CENTER.anchor_size(pos2(right - column, mid), galley.size());
         ui.painter().galley(album.min, galley.clone(), MUTED);
-        let linked = !item.album_id.is_empty() && !item.is_artist;
-        if linked && text_link(ui, response.id.with("album"), album, album.min, &galley, "Go to album") {
-            cx.out.push(Action::Go(Route::Browse(item.album_id.clone())));
+        let shown = galley.rows.iter().map(|row| row.char_count_excluding_newline()).sum();
+        let span = album_span(&item.extra, shown).filter(|_| !item.album_id.is_empty() && !item.is_artist);
+        if let Some(span) = span {
+            let name = span_rect(&galley, album.min, span);
+            if text_link(ui, response.id.with("album"), name, album.min, &galley, "Go to album") {
+                cx.out.push(Action::Go(Route::Browse(item.album_id.clone())));
+            }
         }
         right -= column + 20.0;
     }
@@ -3551,6 +3566,16 @@ mod tests {
         assert!(compact < no_controls && compact < no_queue);
         assert!(no_controls < full && no_queue < full);
         assert_eq!(compact, overlay_base_height(false));
+    }
+
+    #[test]
+    fn links_only_the_album_name_at_the_end_of_the_extra_column() {
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 24), Some(13..24));
+        assert_eq!(album_span("Adımı Kalbine Yaz", 17), Some(0..17));
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 18), Some(13..17));
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 13), None);
+        assert_eq!(album_span("458M plays • Ölürüm Sana", 8), None);
+        assert_eq!(album_span("", 0), None);
     }
 
     #[test]

@@ -1713,18 +1713,21 @@ mod tests {
         let plain = header(&json!({ "straplineTextOne": { "runs": [{ "text": "Various Artists" }] } }));
         assert!(plain.artist_id.is_empty() && plain.artists.is_empty());
 
+        let column = |runs: Value| json!({ "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": runs } } });
         let row = json!({
-            "playlistItemData": { "videoId": "abcdefghijk" },
+            "playlistItemData": { "videoId": "JJPlzNajdUs" },
             "flexColumns": [
-                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "Kuzu Kuzu" }] } } },
-                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{ "text": "1M plays" }] } } },
-                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
-                    { "text": "Karma", "navigationEndpoint": config("MUSIC_PAGE_TYPE_ALBUM", "MPREb_karma") }
-                ] } } }
+                column(json!([{ "text": "Sımarık" }])),
+                column(json!([{ "text": "Tarkan", "navigationEndpoint": config("MUSIC_PAGE_TYPE_ARTIST", "UCQm-Fc8TAF3c1hJffBPjxgw") }])),
+                column(json!([{ "text": "458M plays" }])),
+                column(json!([{ "text": "Ölürüm Sana", "navigationEndpoint": config("MUSIC_PAGE_TYPE_ALBUM", "MPREb_ZanW9lnZdSG") }]))
             ]
         });
         let song = item(&row).unwrap();
-        assert_eq!((song.extra.as_str(), song.album_id.as_str()), ("Karma", "MPREb_karma"));
+        assert_eq!(
+            (song.extra.as_str(), song.album_id.as_str()),
+            ("458M plays • Ölürüm Sana", "MPREb_ZanW9lnZdSG")
+        );
     }
 
     #[test]
