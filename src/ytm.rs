@@ -1249,13 +1249,15 @@ fn header(node: &Value) -> Item {
         text(&node["secondSubtitle"]),
         text(&node["monthlyListenerCount"]),
     ];
-    Item {
+    let mut header = Item {
         title: text(&node["title"]),
         subtitle: details.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" • "),
         extra: text(&node["straplineTextOne"]),
         thumb: thumb(&node["thumbnail"]),
         ..Item::default()
-    }
+    };
+    links(&node["straplineTextOne"], "", &mut header);
+    header
 }
 
 fn item(node: &Value) -> Option<Item> {
@@ -1701,6 +1703,34 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_artist_of_an_album_header_and_the_album_of_a_song_row() {
+        let config = |kind: &str, id: &str| json!({ "browseEndpoint": { "browseId": id, "browseEndpointContextSupportedConfigs": { "browseEndpointContextMusicConfig": { "pageType": kind } } } });
+        let node = json!({ "title": { "runs": [{ "text": "Karma" }] }, "straplineTextOne": { "runs": [
+            { "text": "Tarkan", "navigationEndpoint": config("MUSIC_PAGE_TYPE_ARTIST", "UCtarkan") }
+        ] } });
+        let parsed = header(&node);
+        assert_eq!((parsed.artist_id.as_str(), parsed.artists.len()), ("UCtarkan", 1));
+        let plain = header(&json!({ "straplineTextOne": { "runs": [{ "text": "Various Artists" }] } }));
+        assert!(plain.artist_id.is_empty() && plain.artists.is_empty());
+
+        let column = |runs: Value| json!({ "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": runs } } });
+        let row = json!({
+            "playlistItemData": { "videoId": "JJPlzNajdUs" },
+            "flexColumns": [
+                column(json!([{ "text": "Sımarık" }])),
+                column(json!([{ "text": "Tarkan", "navigationEndpoint": config("MUSIC_PAGE_TYPE_ARTIST", "UCQm-Fc8TAF3c1hJffBPjxgw") }])),
+                column(json!([{ "text": "458M plays" }])),
+                column(json!([{ "text": "Ölürüm Sana", "navigationEndpoint": config("MUSIC_PAGE_TYPE_ALBUM", "MPREb_ZanW9lnZdSG") }]))
+            ]
+        });
+        let song = item(&row).unwrap();
+        assert_eq!(
+            (song.extra.as_str(), song.album_id.as_str()),
+            ("458M plays • Ölürüm Sana", "MPREb_ZanW9lnZdSG")
+        );
+    }
+
+    #[test]
     fn parses_shelves_loose_results_and_headers() {
         let song = json!({ "musicResponsiveListItemRenderer": {
             "playlistItemData": { "videoId": "abcdefghijk" },
@@ -1728,6 +1758,7 @@ mod tests {
         ]});
         let page = parse_page(&response);
         assert_eq!(page.header.as_ref().unwrap().extra, "Tarkan");
+        assert!(page.header.as_ref().unwrap().artists.is_empty());
         assert_eq!(page.sections.len(), 2);
         assert_eq!(
             (page.sections[0].title.as_str(), page.sections[0].layout),
