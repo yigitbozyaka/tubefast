@@ -918,8 +918,7 @@ fn label(ui: &Ui, at: Pos2, anchor: Align2, text: &str, font: FontId, color: Col
     rect
 }
 
-fn artist_spans(item: &Item) -> Vec<(Range<usize>, &str)> {
-    let subtitle = item.subtitle.as_str();
+fn artist_spans<'a>(item: &'a Item, subtitle: &str) -> Vec<(Range<usize>, &'a str)> {
     if item.artists.is_empty() && !item.artist_id.is_empty() {
         return vec![(0..subtitle.chars().count(), &item.artist_id)];
     }
@@ -937,27 +936,31 @@ fn artist_spans(item: &Item) -> Vec<(Range<usize>, &str)> {
     spans
 }
 
-fn artist_links(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, origin: Pos2, galley: &Arc<Galley>) {
+fn text_link(ui: &Ui, id: Id, rect: Rect, origin: Pos2, galley: &Arc<Galley>, hint: &str) -> bool {
+    let response = ui.interact(rect, id, Sense::click());
+    let hover = hover_of(ui, &response);
+    if hover > 0.0 {
+        ui.painter()
+            .with_clip_rect(rect)
+            .galley_with_override_text_color(origin, galley.clone(), MUTED.lerp_to_gamma(TEXT, hover));
+        let line = Stroke::new(1.0, TEXT.gamma_multiply(hover));
+        ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, line);
+    }
+    describe(&response, hint);
+    response.clicked()
+}
+
+fn artist_links(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, origin: Pos2, galley: &Arc<Galley>, text: &str) {
     if item.is_artist {
         return;
     }
-    for (index, (chars, browse_id)) in artist_spans(item).into_iter().enumerate() {
+    for (index, (chars, browse_id)) in artist_spans(item, text).into_iter().enumerate() {
         let edge = |at: usize| galley.pos_from_cursor(CCursor::new(at));
         let rect = Rect::from_min_max(edge(chars.start).min, edge(chars.end).max).translate(origin.to_vec2() + galley.rect.min.to_vec2());
         if rect.width() < 1.0 {
             continue;
         }
-        let response = ui.interact(rect, id.with(index), Sense::click());
-        let hover = hover_of(ui, &response);
-        if hover > 0.0 {
-            ui.painter()
-                .with_clip_rect(rect)
-                .galley_with_override_text_color(origin, galley.clone(), MUTED.lerp_to_gamma(TEXT, hover));
-            let line = Stroke::new(1.0, TEXT.gamma_multiply(hover));
-            ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, line);
-        }
-        describe(&response, "Go to artist");
-        if response.clicked() {
+        if text_link(ui, id.with(index), rect, origin, galley, "Go to artist") {
             out.push(Action::Go(Route::Browse(browse_id.to_owned())));
         }
     }
@@ -967,7 +970,7 @@ fn byline(ui: &Ui, out: &mut Vec<Action>, item: &Item, id: Id, at: Pos2, font: F
     let galley = fit(ui, &item.subtitle, font, MUTED, width, 1);
     let rect = Align2::LEFT_CENTER.anchor_size(at, galley.size());
     ui.painter().galley(rect.min, galley.clone(), MUTED);
-    artist_links(ui, out, item, id, rect.min, &galley);
+    artist_links(ui, out, item, id, rect.min, &galley, &item.subtitle);
     rect
 }
 
@@ -1287,15 +1290,13 @@ fn track_row(ui: &mut Ui, cx: &mut Cx, items: &[Item], index: usize, number: Opt
     }
     if rect.width() > 700.0 && !item.extra.is_empty() {
         let column = rect.width() * 0.26;
-        label(
-            ui,
-            pos2(right - column, mid),
-            Align2::LEFT_CENTER,
-            &item.extra,
-            sans(13.0),
-            MUTED,
-            column - 12.0,
-        );
+        let galley = fit(ui, &item.extra, sans(13.0), MUTED, column - 12.0, 1);
+        let album = Align2::LEFT_CENTER.anchor_size(pos2(right - column, mid), galley.size());
+        ui.painter().galley(album.min, galley.clone(), MUTED);
+        let linked = !item.album_id.is_empty() && !item.is_artist;
+        if linked && text_link(ui, response.id.with("album"), album, album.min, &galley, "Go to album") {
+            cx.out.push(Action::Go(Route::Browse(item.album_id.clone())));
+        }
         right -= column + 20.0;
     }
 
@@ -1570,9 +1571,14 @@ fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: b
     }
     bottom -= 60.0;
 
-    for (text, font, color) in [(&item.subtitle, sans(14.0), MUTED), (&item.extra, medium(15.0), TEXT)] {
+    for (text, font, color, linked) in [(&item.subtitle, sans(14.0), MUTED, false), (&item.extra, medium(15.0), TEXT, true)] {
         if !text.is_empty() {
-            let line = label(ui, pos2(left, bottom), Align2::LEFT_BOTTOM, text, font, color, width);
+            let galley = fit(ui, text, font, color, width, 1);
+            let line = Align2::LEFT_BOTTOM.anchor_size(pos2(left, bottom), galley.size());
+            ui.painter().galley(line.min, galley.clone(), color);
+            if linked {
+                artist_links(ui, cx.out, item, ui.id().with("hero-artist"), line.min, &galley, text);
+            }
             bottom = line.top() - 5.0;
         }
     }
@@ -3106,7 +3112,7 @@ fn now_playing(app: &App, ui: &mut Ui, out: &mut Vec<Action>) -> Color32 {
     ui.painter().galley(pos2(stage.center().x, below), title, TEXT);
     let origin = pos2(stage.center().x, lower);
     ui.painter().galley(origin, artist.clone(), MUTED);
-    artist_links(ui, out, item, Id::new("stage-artist"), origin, &artist);
+    artist_links(ui, out, item, Id::new("stage-artist"), origin, &artist, &item.subtitle);
 
     let card = Rect::from_min_max(
         pos2(stage.right(), area.top() + 24.0),
@@ -3559,15 +3565,16 @@ mod tests {
             ],
             ..Item::default()
         };
-        assert_eq!(artist_spans(&song), [(0..11, "UC1"), (13..21, "UC2"), (24..38, "UC3")]);
+        let line = song.subtitle.clone();
+        assert_eq!(artist_spans(&song, &line), [(0..11, "UC1"), (13..21, "UC2"), (24..38, "UC3")]);
 
         song.artists = vec![credit("Çağrı Sinci Jr", "UC3"), credit("Şehinşah", "UC2"), credit("Nobody", "UC9")];
-        assert_eq!(artist_spans(&song), [(24..38, "UC3"), (13..21, "UC2")]);
+        assert_eq!(artist_spans(&song, &line), [(24..38, "UC3"), (13..21, "UC2")]);
 
         song.artists.clear();
-        assert!(artist_spans(&song).is_empty());
+        assert!(artist_spans(&song, &line).is_empty());
         song.artist_id = "UC1".to_owned();
-        assert_eq!(artist_spans(&song), [(0..51, "UC1")]);
+        assert_eq!(artist_spans(&song, &line), [(0..51, "UC1")]);
     }
 
     #[test]
