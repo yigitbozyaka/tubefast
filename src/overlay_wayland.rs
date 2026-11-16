@@ -91,7 +91,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub fn start(main: egui::Context, agent: ureq::Agent) -> Option<Self> {
+    pub fn start(agent: ureq::Agent) -> Option<Self> {
         let (commands, received) = mpsc::channel();
         let (reporter, reports) = mpsc::channel();
         let (wake, wake_read) = UnixStream::pair().ok()?;
@@ -101,7 +101,7 @@ impl Handle {
         let wake_for_egui = wake.try_clone().ok()?;
         let thread = std::thread::Builder::new()
             .name("overlay-wayland".to_owned())
-            .spawn(move || run(main, agent, received, reporter, wake_read, wake_for_egui, ready_sender))
+            .spawn(move || run(agent, received, reporter, wake_read, wake_for_egui, ready_sender))
             .ok()?;
         if ready.recv().unwrap_or(false) {
             Some(Self {
@@ -181,7 +181,6 @@ struct Overlay {
     painter: Option<egui_glow::Painter>,
     egui: egui::Context,
     art: Art,
-    main: egui::Context,
     reports: Sender<Report>,
     started: Instant,
     events: Vec<Event>,
@@ -202,7 +201,7 @@ struct Overlay {
 impl Overlay {
     fn report(&self, report: Report) {
         let _ = self.reports.send(report);
-        self.main.request_repaint();
+        crate::wake::wake();
     }
 
     fn follow_drag(&mut self) {
@@ -537,7 +536,6 @@ delegate_pointer!(Overlay);
 delegate_registry!(Overlay);
 
 fn run(
-    main: egui::Context,
     agent: ureq::Agent,
     commands: Receiver<Command>,
     reports: Sender<Report>,
@@ -545,7 +543,7 @@ fn run(
     wake_for_egui: UnixStream,
     ready: Sender<bool>,
 ) {
-    let setup = connect(main, agent, reports, wake_for_egui);
+    let setup = connect(agent, reports, wake_for_egui);
     let (mut queue, mut overlay) = match setup {
         Ok(setup) => setup,
         Err(error) => {
@@ -564,7 +562,7 @@ fn run(
 
 type Setup = (EventQueue<Overlay>, Overlay);
 
-fn connect(main: egui::Context, agent: ureq::Agent, reports: Sender<Report>, wake: UnixStream) -> Result<Setup, String> {
+fn connect(agent: ureq::Agent, reports: Sender<Report>, wake: UnixStream) -> Result<Setup, String> {
     let connection = Connection::connect_to_env().map_err(|error| format!("cannot reach the compositor: {error}"))?;
     let (globals, queue) = registry_queue_init::<Overlay>(&connection).map_err(|error| error.to_string())?;
     let qh = queue.handle();
@@ -591,7 +589,13 @@ fn connect(main: egui::Context, agent: ureq::Agent, reports: Sender<Report>, wak
             let _ = (&*waker).write(&[1]);
         }
     });
-    let art = Art::new(egui.clone(), agent);
+    let art = Art::new(
+        {
+            let egui = egui.clone();
+            move || egui.request_repaint()
+        },
+        agent,
+    );
     let overlay = Overlay {
         registry: RegistryState::new(&globals),
         seats: SeatState::new(&globals, &qh),
@@ -605,7 +609,6 @@ fn connect(main: egui::Context, agent: ureq::Agent, reports: Sender<Report>, wak
         painter: None,
         egui,
         art,
-        main,
         reports,
         started: Instant::now(),
         events: Vec::new(),

@@ -609,7 +609,7 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
     let open = app.saved.overlay && app.overlay_open;
     #[cfg(all(unix, not(target_os = "macos")))]
     if hotkeys::layer_overlay() {
-        return layer_overlay(app, ctx, open);
+        return layer_overlay(app, open);
     }
     if !open {
         forget_overlay_window();
@@ -654,16 +654,14 @@ pub fn overlay(app: &App, ctx: &egui::Context) -> Vec<Action> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn layer_overlay(app: &App, ctx: &egui::Context, open: bool) -> Vec<Action> {
+pub fn layer_overlay(app: &App, open: bool) -> Vec<Action> {
     if !open {
         if let Some(Some(handle)) = app.layer_overlay.get() {
             handle.hide();
         }
         return Vec::new();
     }
-    let started = app
-        .layer_overlay
-        .get_or_init(|| overlay_wayland::Handle::start(ctx.clone(), app.http_agent()));
+    let started = app.layer_overlay.get_or_init(|| overlay_wayland::Handle::start(app.http_agent()));
     let Some(handle) = started else {
         return vec![Action::ToggleOverlay];
     };

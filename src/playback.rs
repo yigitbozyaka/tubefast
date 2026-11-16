@@ -1,7 +1,6 @@
 use crate::app::{Action, Repeat, Saved};
 use crate::player::Player;
 use crate::ytm::{Client, Item};
-use eframe::egui;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +13,45 @@ pub enum Signal {
     Changed,
     Pressed(Box<Action>),
     Radio(String, Vec<Item>),
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Snapshot {
+    queue: Vec<Item>,
+    #[serde(default)]
+    unshuffled: Vec<Item>,
+    current: Option<usize>,
+    position_ms: u64,
+    shuffle: bool,
+    repeat: Repeat,
+    volume: f32,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl Snapshot {
+    #[cfg(test)]
+    pub fn for_test(queue: Vec<Item>, current: Option<usize>, position_ms: u64) -> Self {
+        Self {
+            queue,
+            unshuffled: Vec::new(),
+            current,
+            position_ms,
+            shuffle: false,
+            repeat: Repeat::Off,
+            volume: 0.5,
+        }
+    }
+
+    pub fn apply_to(self, saved: &mut Saved) {
+        saved.current = self.current.filter(|current| *current < self.queue.len());
+        saved.queue = self.queue;
+        saved.unshuffled = self.unshuffled;
+        saved.position_ms = self.position_ms;
+        saved.shuffle = self.shuffle;
+        saved.repeat = self.repeat;
+        saved.volume = self.volume;
+    }
 }
 
 pub type Replaced = (Vec<Item>, Option<usize>, u64, Vec<Item>);
@@ -35,7 +73,7 @@ pub struct Playback {
     signals: Sender<Signal>,
 }
 
-pub fn run(playback: Playback, signals: Receiver<Signal>, ctx: egui::Context) -> Arc<Mutex<Playback>> {
+pub fn run(playback: Playback, signals: Receiver<Signal>) -> Arc<Mutex<Playback>> {
     let shared = Arc::new(Mutex::new(playback));
     let worker = shared.clone();
     std::thread::spawn(move || {
@@ -48,7 +86,7 @@ pub fn run(playback: Playback, signals: Receiver<Signal>, ctx: egui::Context) ->
             }
             playback.follow_player();
             drop(playback);
-            ctx.request_repaint();
+            crate::wake::wake();
         }
     });
     shared
@@ -71,6 +109,19 @@ impl Playback {
             version: 0,
             yt,
             signals,
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            queue: self.queue.clone(),
+            unshuffled: self.unshuffled.clone(),
+            current: self.current,
+            position_ms: self.position_ms(),
+            shuffle: self.shuffle,
+            repeat: self.repeat,
+            volume: self.player.volume(),
         }
     }
 
@@ -446,7 +497,7 @@ mod tests {
             repeat: Repeat::One,
             ..Saved::default()
         };
-        let playback = run(Playback::new(player, yt, signals, &saved), inbox, egui::Context::default());
+        let playback = run(Playback::new(player, yt, signals, &saved), inbox);
         playback.lock().unwrap().player.end_at(90_000);
         let deadline = Instant::now() + Duration::from_secs(5);
         while playback.lock().unwrap().player.position_ms() != 0 {

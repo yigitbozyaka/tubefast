@@ -3,6 +3,7 @@ use eframe::egui::{self, Color32, ColorImage, TextureHandle, TextureId, TextureO
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -42,23 +43,39 @@ struct Cache {
     bytes: usize,
 }
 
+type Wake = Arc<dyn Fn() + Send + Sync>;
+
 pub struct Art {
     cache: RefCell<Cache>,
     jobs: Jobs,
+    closed: Arc<AtomicBool>,
     loaded: Receiver<Loaded>,
 }
 
 impl Art {
-    pub fn new(ctx: egui::Context, agent: ureq::Agent) -> Self {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static, agent: ureq::Agent) -> Self {
+        Self::start(Some((Arc::new(wake), agent)))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    pub fn idle() -> Self {
+        Self::start(None)
+    }
+
+    fn start(workers: Option<(Wake, ureq::Agent)>) -> Self {
         let jobs = Jobs::default();
+        let closed = Arc::new(AtomicBool::new(false));
         let (sender, loaded) = mpsc::channel();
-        for _ in 0..WORKERS {
-            let (ctx, agent, jobs, sender) = (ctx.clone(), agent.clone(), jobs.clone(), sender.clone());
-            std::thread::spawn(move || work(ctx, agent, jobs, sender));
+        if let Some((wake, agent)) = workers {
+            for _ in 0..WORKERS {
+                let (wake, agent, jobs, sender, closed) = (wake.clone(), agent.clone(), jobs.clone(), sender.clone(), closed.clone());
+                std::thread::spawn(move || work(wake, agent, jobs, sender, closed));
+            }
         }
         Self {
             cache: RefCell::default(),
             jobs,
+            closed,
             loaded,
         }
     }
@@ -131,11 +148,24 @@ impl Art {
     }
 }
 
-fn work(ctx: egui::Context, agent: ureq::Agent, jobs: Jobs, sender: Sender<Loaded>) {
+impl Drop for Art {
+    fn drop(&mut self) {
+        {
+            let _queue = self.jobs.0.lock().unwrap();
+            self.closed.store(true, Ordering::SeqCst);
+        }
+        self.jobs.1.notify_all();
+    }
+}
+
+fn work(wake: Wake, agent: ureq::Agent, jobs: Jobs, sender: Sender<Loaded>, closed: Arc<AtomicBool>) {
     loop {
         let key = {
             let mut queue = jobs.0.lock().unwrap();
             loop {
+                if closed.load(Ordering::SeqCst) {
+                    return;
+                }
                 match queue.pop() {
                     Some(job) => break job,
                     None => queue = jobs.1.wait(queue).unwrap(),
@@ -146,7 +176,7 @@ fn work(ctx: egui::Context, agent: ureq::Agent, jobs: Jobs, sender: Sender<Loade
         if sender.send((key, result)).is_err() {
             return;
         }
-        ctx.request_repaint();
+        wake();
     }
 }
 
