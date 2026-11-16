@@ -526,7 +526,9 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
         let queue_fits = queue_wanted && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
         let queue_instead = queue_wanted && !queue_fits;
         forget_scroll(false);
-        if !queue_wanted {
+        let beside = Id::new("queue-beside");
+        if !queue_wanted || ctx.data(|data| data.get_temp::<bool>(beside)) != Some(queue_fits) {
+            ctx.data_mut(|data| data.insert_temp(beside, queue_fits));
             forget_scroll(true);
         }
         egui::SidePanel::right("queue")
