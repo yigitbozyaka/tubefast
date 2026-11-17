@@ -21,12 +21,23 @@
 
 ![Tubefast playing a track, with the home feed in the middle and the queue on the right](docs/home.png)
 
+| Idle, 60 seconds after launch | Tubefast | YouTube Music in a Chrome tab |
+|---|---|---|
+| Memory, proportional (PSS) | **89 MB** | 357 MB |
+| Memory, resident (RSS) | **151 MB** | 1018 MB |
+| Processes | 1 | 10 |
+| Size on disk | **8.0 MB** AppImage, 10.2 MB Windows exe | 453 MB Chrome install |
+
+Measured on 2026-11-17 in an Ubuntu 24.04 virtual machine (Hyper-V, 4 vCPU, 6 GB, GNOME on Wayland, software rendering), release v0.11.0 against Google Chrome 157 with a fresh profile on music.youtube.com. Nothing was playing and nobody was signed in. Each figure is the median of 3 runs, summed over every process of the app (the Chrome tab includes its renderer, GPU and utility processes). PSS splits shared pages between the processes that use them, RSS counts them in full for each process. Numbers on your machine will differ.
+
+![Tubefast from cold start to synced lyrics: the home feed, a search, a song playing, and the lyrics following it](docs/demo.gif)
+
 Tubefast is a YouTube Music client written in Rust with [egui](https://github.com/emilk/egui). It talks to YouTube directly, decodes the audio itself and draws every pixel natively. There is no Chromium and no WebView underneath, which is why it starts instantly and stays small.
 
 | | Measured |
 |---|---|
 | Window on screen | 0.1 to 0.3 seconds |
-| Memory | about 100 MB while playing, about 60 MB of it private |
+| Memory on Windows | about 100 MB while playing, about 60 MB of it private |
 | CPU while playing | under 1 % |
 | Download | one `.exe`, about 10 MB |
 
@@ -40,7 +51,7 @@ Numbers are from the release build on Windows 11. Memory is the working set a fe
 | **A queue that keeps going** | Play an album or a single song. When the queue runs out, a radio based on the last track continues it. Shuffle and repeat included. |
 | **A queue you cannot lose** | Close the app and the queue, the track and the position are still there next time. Replace a queue you built by accident and **Undo** brings it back. Drag a row to reorder what plays next. |
 | **Now playing and lyrics** | Click the cover or the title in the bar for a full-window view of the track. Its lyrics tab follows the song line by line when YouTube Music has timed lyrics, looks for them on [lrclib.net](https://lrclib.net) when it does not, and shows plain text when neither has them. Korean and Russian lyrics can show an approximate romanized line under each line, with a switch in the lyrics panel. |
-| **Updates itself** | When a new version is out, Tubefast tells you and installs it with one click, then restarts with your queue where it was. On Linux this works for the AppImage and for a binary in a folder you can write to, on macOS for Tubefast.app in a folder you can write to. Installs from a package manager or a read-only folder show the download page instead. |
+| **Updates itself** | When a new version is out, Tubefast tells you and installs it with one click, then restarts with your queue where it was. It works on Windows, for the AppImage and for a binary in a folder you can write to on Linux, and for Tubefast.app in a folder you can write to on macOS. Installs from a package manager or a read-only folder show the download page instead. |
 | **Media keys** | Play, pause, next and previous keys work from any window, and the track shows up in the Windows media overlay in Now Playing on macOS and in the Linux desktop's media controls (MPRIS), with its cover and progress. |
 | **Global hotkeys** | Turn on **Global hotkeys** in Settings and play, pause, skip, change Tubefast's volume and open the media overlay while a game or any other app has focus. Every shortcut can be changed or cleared, and a shortcut another app already holds is marked. They go straight to Tubefast, so other media players do not get in the way. Off until you turn it on. On Linux they work on X11, and on Wayland through the desktop's global shortcuts portal (KDE Plasma has it), where the keys are chosen in the system settings; Settings says so if the portal is missing. |
 | **Media overlay** | With **Global hotkeys** turned on in Settings, press `Ctrl` + `Alt` + `O` (changeable there) to open an always on top overlay with the current song, playback controls and the next songs in the queue. It does not take focus from your game. Opacity, position, playback controls and next up can each be changed or hidden in Settings. It works over windowed and borderless games, not exclusive fullscreen. On Linux it works on X11 and on Wayland desktops that support the layer shell protocol (KDE Plasma, Hyprland and sway do), where the key is chosen in the system settings like the other hotkeys. GNOME does not support it, so Settings says it is not available there. |
@@ -103,7 +114,7 @@ gh attestation verify tubefast-windows-x64.zip --repo yigitbozyaka/tubefast
 
 Each release also lists the SHA-256 of every download in `SHA256SUMS.txt`.
 
-Windows and macOS are the platforms it is used on most. On macOS and Linux the session file is protected by file permissions instead of encryption, and a new version opens the download page instead of installing itself. Linux builds are new: the font fallback for non-Latin scripts is still missing there, and bug reports from Linux are very welcome. See [Contributing](CONTRIBUTING.md).
+Windows and macOS are the platforms it is used on most. On macOS and Linux the session file is protected by file permissions instead of encryption. Linux builds are new: the font fallback for non-Latin scripts is still missing there, and bug reports from Linux are very welcome. See [Contributing](CONTRIBUTING.md).
 
 ## Signing in
 
