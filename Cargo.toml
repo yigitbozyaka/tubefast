@@ -58,6 +58,7 @@ libc = "0.2"
 smithay-client-toolkit = { version = "0.20", default-features = false }
 
 [profile.release]
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = true
