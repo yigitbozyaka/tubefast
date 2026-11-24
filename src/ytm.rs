@@ -967,8 +967,21 @@ fn audio(response: &Value) -> Option<Stream> {
     let formats = response["streamingData"]["adaptiveFormats"]
         .as_array()
         .filter(|_| playable(response))?;
+    let preferred = formats
+        .iter()
+        .filter(|format| matches!(format["itag"].as_u64(), Some(OPUS_ITAG | AAC_ITAG)) && format["url"].is_string())
+        .max_by_key(|format| {
+            let track = &format["audioTrack"];
+            (
+                track["displayName"].as_str().is_some_and(|name| name.ends_with(" original")),
+                track["isAutoDubbed"] != true,
+                track["audioIsDefault"] == true,
+            )
+        })?;
     let find = |itag| {
-        let format = formats.iter().find(|f| f["itag"].as_u64() == Some(itag))?;
+        let format = formats
+            .iter()
+            .find(|format| format["itag"].as_u64() == Some(itag) && format["audioTrack"]["id"] == preferred["audioTrack"]["id"])?;
         let number = |key: &str| format[key].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         Some(Stream {
             url: format["url"].as_str()?.to_owned(),
@@ -1379,6 +1392,65 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_audio_wins_over_first_listed_and_default_dubs() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": OPUS_ITAG, "url": "dub-opus", "audioTrack": {
+                    "id": "bn.10", "displayName": "Bangla", "isAutoDubbed": true, "audioIsDefault": true,
+                } },
+                { "itag": AAC_ITAG, "url": "dub-aac", "audioTrack": {
+                    "id": "bn.10", "displayName": "Bangla", "isAutoDubbed": true, "audioIsDefault": true,
+                } },
+                { "itag": OPUS_ITAG, "url": "original-opus", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original",
+                } },
+                { "itag": AAC_ITAG, "url": "original-aac", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original",
+                } },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "original-opus");
+        assert_eq!(selected.fallback.unwrap().url, "original-aac");
+
+        let mut aac_only = response;
+        aac_only["streamingData"]["adaptiveFormats"].as_array_mut().unwrap().remove(2);
+        let selected = audio(&aac_only).unwrap();
+        assert_eq!(selected.url, "original-aac");
+        assert!(!selected.opus);
+        assert!(selected.fallback.is_none());
+    }
+
+    #[test]
+    fn audio_fallback_never_switches_language() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": AAC_ITAG, "url": "dub-aac", "audioTrack": { "id": "bn.10", "isAutoDubbed": true } },
+                { "itag": OPUS_ITAG, "url": "original-opus", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original", "audioIsDefault": true,
+                } },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "original-opus");
+        assert!(selected.fallback.is_none());
+    }
+
+    #[test]
+    fn audio_prefers_the_default_track_when_original_is_not_labeled() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": OPUS_ITAG, "url": "alternate", "audioTrack": { "id": "fr.1", "audioIsDefault": false } },
+                { "itag": OPUS_ITAG, "url": "default", "audioTrack": { "id": "en.1", "audioIsDefault": true } },
+            ] },
+        });
+        assert_eq!(audio(&response).unwrap().url, "default");
+    }
 
     #[test]
     fn the_credit_names_the_artists_without_the_view_count() {
