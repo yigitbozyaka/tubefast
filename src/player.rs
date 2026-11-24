@@ -962,6 +962,46 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires live YouTube Music browsing and streaming"]
+    fn podcast_catalog_show_and_audio_work_end_to_end() {
+        let yt = ytm::Client::new(String::new());
+        let catalog = yt.browse(ytm::PODCASTS, &|_| {}).expect("podcast catalog should load");
+        assert!(!catalog.songs().is_empty(), "podcast catalog should contain playable episodes");
+        let show = catalog
+            .sections
+            .iter()
+            .flat_map(|section| &section.items)
+            .find(|item| item.browse_id.starts_with("MPSP"))
+            .expect("podcast catalog should contain shows");
+        let page = yt.browse(&show.browse_id, &|_| {}).expect("podcast show should load");
+        let episodes = page.songs();
+        assert!(!episodes.is_empty(), "podcast show should contain playable episodes");
+        assert!(episodes.iter().all(|item| !item.duration.is_empty()));
+        let shared = Arc::new(Shared::default());
+        let mut track = Track::open(&yt, &Urls::default(), &episodes[0].video_id, 0, &shared).expect("episode audio should open");
+        let mut frames = 0;
+        let mut peak = 0f32;
+        while frames < 3 * 44_100 {
+            let chunk = track
+                .next_chunk(0)
+                .expect("episode audio should decode")
+                .expect("episode should not end early");
+            frames += chunk.samples.len() / chunk.channels.max(1) as usize;
+            peak = chunk.samples.iter().fold(peak, |peak, sample| peak.max(sample.abs()));
+        }
+        assert!(peak > 0.001, "decoded episode audio should not be silent");
+        let duration = shared.duration_ms.load(Relaxed);
+        assert!(duration > 60_000, "episode duration should be reported");
+        track.seek(60_000);
+        let landed = track
+            .next_chunk(0)
+            .expect("seek should decode")
+            .expect("seek should not end the episode")
+            .start_ms;
+        assert!(landed.abs_diff(60_000) <= 1000, "episode seek should land within one second");
+    }
+
+    #[test]
     fn retries_back_off_and_stop() {
         assert_eq!(retry_delay(0), None);
         assert_eq!(retry_delay(1), Some(Duration::from_secs(1)));

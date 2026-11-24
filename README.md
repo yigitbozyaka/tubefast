@@ -48,6 +48,7 @@ Numbers are from the release build on Windows 11. Memory is the working set a fe
 | | |
 |---|---|
 | **Search and browse** | Results appear as you type. Artist, album and playlist pages, with back and forward history. On an artist page, **Show all** loads the full list of top songs, albums and singles and EPs. |
+| **Podcasts** | Open **Podcasts** in the sidebar to browse YouTube Music shows and episodes. Open a show to play its episodes in the same queue as your music. |
 | **A queue that keeps going** | Play an album or a single song. When the queue runs out, a radio based on the last track continues it. Shuffle and repeat included. |
 | **A queue you cannot lose** | Close the app and the queue, the track and the position are still there next time. Replace a queue you built by accident and **Undo** brings it back. Drag a row to reorder what plays next. |
 | **Now playing and lyrics** | Click the cover or the title in the bar for a full-window view of the track. Its lyrics tab follows the song line by line when YouTube Music has timed lyrics, looks for them on [lrclib.net](https://lrclib.net) when it does not, and shows plain text when neither has them. Korean and Russian lyrics can show an approximate romanized line under each line, with a switch in the lyrics panel. |
