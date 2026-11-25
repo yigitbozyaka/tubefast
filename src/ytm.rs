@@ -1028,12 +1028,36 @@ fn playable(response: &Value) -> bool {
     response["playabilityStatus"]["status"] == "OK"
 }
 
+fn audio_content(format: &Value) -> Option<String> {
+    let query = format["url"].as_str()?.split_once('?')?.1;
+    let tags = query.split('&').find_map(|pair| pair.strip_prefix("xtags="))?;
+    let decoded = tags.replace("%3D", "=").replace("%3A", ":");
+    decoded.split(':').find_map(|tag| tag.strip_prefix("acont=")).map(str::to_owned)
+}
+
 fn audio(response: &Value) -> Option<Stream> {
     let formats = response["streamingData"]["adaptiveFormats"]
         .as_array()
         .filter(|_| playable(response))?;
+    let preferred = formats
+        .iter()
+        .filter(|format| matches!(format["itag"].as_u64(), Some(OPUS_ITAG | AAC_ITAG)) && format["url"].is_string())
+        .max_by_key(|format| {
+            let track = &format["audioTrack"];
+            let content = audio_content(format);
+            let named_original = track["displayName"]
+                .as_str()
+                .is_some_and(|name| name.to_lowercase().ends_with(" original"));
+            (
+                content.as_deref() == Some("original") || named_original,
+                !content.is_some_and(|kind| kind.starts_with("dubbed")),
+                track["audioIsDefault"] == true,
+            )
+        })?;
     let find = |itag| {
-        let format = formats.iter().find(|f| f["itag"].as_u64() == Some(itag))?;
+        let format = formats
+            .iter()
+            .find(|format| format["itag"].as_u64() == Some(itag) && format["audioTrack"]["id"] == preferred["audioTrack"]["id"])?;
         let number = |key: &str| format[key].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         Some(Stream {
             url: format["url"].as_str()?.to_owned(),
@@ -1444,6 +1468,104 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_audio_wins_over_first_listed_and_default_dubs() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": OPUS_ITAG, "url": "dub-opus", "audioTrack": {
+                    "id": "bn.10", "displayName": "Bangla", "audioIsDefault": true,
+                } },
+                { "itag": AAC_ITAG, "url": "dub-aac", "audioTrack": {
+                    "id": "bn.10", "displayName": "Bangla", "audioIsDefault": true,
+                } },
+                { "itag": OPUS_ITAG, "url": "original-opus", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original",
+                } },
+                { "itag": AAC_ITAG, "url": "original-aac", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original",
+                } },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "original-opus");
+        assert_eq!(selected.fallback.unwrap().url, "original-aac");
+
+        let mut aac_only = response;
+        aac_only["streamingData"]["adaptiveFormats"].as_array_mut().unwrap().remove(2);
+        let selected = audio(&aac_only).unwrap();
+        assert_eq!(selected.url, "original-aac");
+        assert!(!selected.opus);
+        assert!(selected.fallback.is_none());
+    }
+
+    #[test]
+    fn original_audio_is_found_by_its_content_tag_in_a_multi_track_response() {
+        let format = |itag: u64, url: &str, id: &str, name: &str, default: bool| {
+            json!({ "itag": itag, "url": url, "mimeType": "audio/mp4", "audioTrack": {
+                "audioIsDefault": default, "displayName": name, "id": id,
+            } })
+        };
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                format(OPUS_ITAG, "https://host/a?xtags=acont%3Ddubbed%3Alang%3Dar", "ar.3", "Arabic", false),
+                format(AAC_ITAG, "https://host/b?xtags=acont%3Ddubbed%3Alang%3Dar", "ar.3", "Arabic", false),
+                format(OPUS_ITAG, "https://host/c?xtags=acont%3Ddubbed%3Alang%3Dtr", "tr.3", "Turkish", true),
+                format(AAC_ITAG, "https://host/d?xtags=acont%3Ddubbed%3Alang%3Dtr", "tr.3", "Turkish", true),
+                format(OPUS_ITAG, "https://host/e?xtags=acont%3Doriginal%3Alang%3Den", "en.4", "Ingilizce", false),
+                format(AAC_ITAG, "https://host/f?xtags=acont%3Doriginal%3Alang%3Den", "en.4", "Ingilizce", false),
+                { "itag": OPUS_ITAG, "url": "https://host/g?xtags=drc%3D1", "mimeType": "audio/webm" },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "https://host/e?xtags=acont%3Doriginal%3Alang%3Den");
+        assert_eq!(selected.fallback.unwrap().url, "https://host/f?xtags=acont%3Doriginal%3Alang%3Den");
+    }
+
+    #[test]
+    fn single_track_audio_keeps_the_first_listed_format() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": AAC_ITAG, "url": "https://host/aac" },
+                { "itag": OPUS_ITAG, "url": "https://host/opus" },
+                { "itag": OPUS_ITAG, "url": "https://host/opus?xtags=drc%3D1" },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "https://host/opus");
+        assert_eq!(selected.fallback.unwrap().url, "https://host/aac");
+    }
+
+    #[test]
+    fn audio_fallback_never_switches_language() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": AAC_ITAG, "url": "dub-aac", "audioTrack": { "id": "bn.10" } },
+                { "itag": OPUS_ITAG, "url": "original-opus", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original", "audioIsDefault": true,
+                } },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "original-opus");
+        assert!(selected.fallback.is_none());
+    }
+
+    #[test]
+    fn audio_prefers_the_default_track_when_original_is_not_labeled() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": OPUS_ITAG, "url": "alternate", "audioTrack": { "id": "fr.1", "audioIsDefault": false } },
+                { "itag": OPUS_ITAG, "url": "default", "audioTrack": { "id": "en.1", "audioIsDefault": true } },
+            ] },
+        });
+        assert_eq!(audio(&response).unwrap().url, "default");
+    }
 
     #[test]
     fn only_explicitly_unavailable_videos_can_be_skipped() {

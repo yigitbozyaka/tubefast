@@ -4,4 +4,5 @@
 - Turning shuffle off puts the queue back in its normal order
 - Album names on an artist page open the album, and the artist name on an album page opens the artist
 - The queue panel now shows the whole queue, including songs that already played, and you can click any song to jump to it
+- Podcasts and videos play their original audio instead of an automatically dubbed language
 - Songs that are no longer available are skipped
