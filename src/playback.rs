@@ -599,6 +599,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_skipped_unavailable_song_never_reaches_the_recent_list() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abc"), 0);
+        playback.player.fail_unavailable("This video is unavailable");
+        playback.follow_player();
+        assert_eq!(playing(&playback), "b");
+        assert_eq!(order(&playback.take_started()), "b");
+    }
+
     fn silent_playback(saved: &Saved) -> (Playback, mpsc::Receiver<Signal>) {
         let yt = Arc::new(Client::new(String::new()));
         let (signals, inbox) = mpsc::channel();

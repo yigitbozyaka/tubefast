@@ -945,6 +945,15 @@ impl Player {
         (self.wake)();
     }
 
+    #[cfg(test)]
+    pub fn fail_unavailable(&self, message: &str) {
+        *self.shared.error.lock().unwrap() = Some(ytm::StreamError {
+            message: message.to_owned(),
+            unavailable: true,
+        });
+        (self.wake)();
+    }
+
     pub fn take_ended(&self) -> bool {
         self.shared.ended.swap(false, Relaxed)
     }
