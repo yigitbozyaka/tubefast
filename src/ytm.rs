@@ -1314,6 +1314,9 @@ fn item(node: &Value) -> Option<Item> {
     let episode = it.browse_id.starts_with("MPED")
         || find(node, "musicVideoType").and_then(Value::as_str) == Some("MUSIC_VIDEO_TYPE_PODCAST_EPISODE");
     if episode {
+        if let Some(rest) = it.subtitle.strip_prefix("Episode • ") {
+            it.subtitle = rest.to_owned();
+        }
         if it.duration.is_empty() {
             let duration = text(&node["playbackProgress"]["musicPlaybackProgressRenderer"]["durationText"]);
             it.duration = duration.trim().trim_start_matches('•').trim().to_owned();
@@ -1490,18 +1493,39 @@ mod tests {
 
     #[test]
     fn recognizes_episode_search_results_without_a_watch_navigation_endpoint() {
+        let run = |text: &str| json!({ "text": text });
         let result = json!({ "musicResponsiveListItemRenderer": {
-            "title": { "runs": [{
-                "text": "An interview (feat. a guest)",
-                "navigationEndpoint": { "browseEndpoint": { "browseId": "MPEDepisode" } },
-            }] },
-            "subtitle": { "runs": [{ "text": "Example podcast" }] },
-            "playlistItemData": { "videoId": "episode" },
+            "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [{
+                    "text": "An interview (feat. a guest)",
+                    "navigationEndpoint": { "browseEndpoint": { "browseId": "MPEDepisode" } },
+                }] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                    run("Episode"),
+                    run(" • "),
+                    run("Oct 25, 2024"),
+                    run(" • "),
+                    {
+                        "text": "Example podcast",
+                        "navigationEndpoint": { "browseEndpoint": { "browseId": "MPSPshow" } },
+                    },
+                ] } } },
+            ],
+            "overlay": { "musicItemThumbnailOverlayRenderer": { "content": { "musicPlayButtonRenderer": {
+                "playNavigationEndpoint": { "watchEndpoint": {
+                    "videoId": "episode",
+                    "watchEndpointMusicSupportedConfigs": {
+                        "watchEndpointMusicConfig": { "musicVideoType": "MUSIC_VIDEO_TYPE_PODCAST_EPISODE" },
+                    },
+                } },
+            } } } },
         } });
         let songs = parse_page(&result).songs();
         assert_eq!(songs.len(), 1);
         assert_eq!(songs[0].video_id, "episode");
+        assert_eq!(songs[0].browse_id, "MPEDepisode");
         assert_eq!(songs[0].title, "An interview (feat. a guest)");
+        assert_eq!(songs[0].subtitle, "Oct 25, 2024 • Example podcast");
     }
 
     #[test]
