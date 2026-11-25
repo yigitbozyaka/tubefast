@@ -281,12 +281,34 @@ struct Track {
 
 impl Track {
     fn open(yt: &ytm::Client, urls: &Urls, video_id: &str, generation: u64, shared: &Arc<Shared>) -> Result<Track, String> {
-        let mut stream = resolve(yt, urls, video_id)?;
+        Self::open_if(yt, urls, video_id, generation, shared, &|| true)?.ok_or_else(|| "Stream resolution was cancelled".to_owned())
+    }
+
+    fn open_if(
+        yt: &ytm::Client,
+        urls: &Urls,
+        video_id: &str,
+        generation: u64,
+        shared: &Arc<Shared>,
+        current: &impl Fn() -> bool,
+    ) -> Result<Option<Track>, String> {
+        let Some(mut stream) = resolve_if(yt, urls, video_id, current)? else {
+            return Ok(None);
+        };
+        if !current() {
+            return Ok(None);
+        }
         let fallback = stream.fallback.take();
-        Self::open_stream(yt, stream, video_id, generation, shared).or_else(|message| match fallback {
-            Some(aac) => Self::open_stream(yt, *aac, video_id, generation, shared),
-            None => Err(message),
-        })
+        match Self::open_stream(yt, stream, video_id, generation, shared) {
+            Ok(track) if current() => Ok(Some(track)),
+            Ok(_) => Ok(None),
+            Err(_) if !current() => Ok(None),
+            Err(message) => match fallback {
+                Some(aac) if current() => Self::open_stream(yt, *aac, video_id, generation, shared).map(Some),
+                Some(_) => Ok(None),
+                None => Err(message),
+            },
+        }
     }
 
     fn open_stream(yt: &ytm::Client, stream: ytm::Stream, video_id: &str, generation: u64, shared: &Arc<Shared>) -> Result<Track, String> {
@@ -407,19 +429,30 @@ impl Track {
     }
 }
 
-fn resolve(yt: &ytm::Client, urls: &Urls, video_id: &str) -> Result<ytm::Stream, String> {
+fn resolve_if(yt: &ytm::Client, urls: &Urls, video_id: &str, current: &impl Fn() -> bool) -> Result<Option<ytm::Stream>, String> {
+    if !current() {
+        return Ok(None);
+    }
     if let Some((at, stream)) = urls.lock().unwrap().get(video_id)
         && at.elapsed() < URL_LIFETIME
     {
-        return Ok(stream.clone());
+        return Ok(Some(stream.clone()));
     }
-    let stream = yt.stream(video_id)?;
+    let Some(stream) = yt.stream_if_current(video_id, current)? else {
+        return Ok(None);
+    };
+    if !current() {
+        return Ok(None);
+    }
     let mut urls = urls.lock().unwrap();
+    if !current() {
+        return Ok(None);
+    }
     if urls.len() >= URL_CACHE_ENTRIES {
         urls.clear();
     }
     urls.insert(video_id.to_owned(), (Instant::now(), stream.clone()));
-    Ok(stream)
+    Ok(Some(stream))
 }
 
 struct PcmSource {
@@ -569,6 +602,7 @@ fn decode_loop(
                 (track, pending, resume, epoch) = (None, None, resume_ms, started);
                 let (replies, shared, yt, urls) = (replies.clone(), shared.clone(), yt.clone(), urls.clone());
                 std::thread::spawn(move || {
+                    let is_current = || shared.generation.load(Relaxed) == generation;
                     let mut attempt = retry;
                     let opened = loop {
                         if shared.generation.load(Relaxed) != generation {
@@ -580,10 +614,10 @@ fn decode_loop(
                                 return;
                             }
                         }
-                        let opened = Track::open(&yt, &urls, &video_id, generation, &shared).or_else(|message| {
+                        let opened = Track::open_if(&yt, &urls, &video_id, generation, &shared, &is_current).or_else(|message| {
                             urls.lock().unwrap().remove(&video_id);
-                            if shared.generation.load(Relaxed) == generation && yt.refresh_clients() {
-                                Track::open(&yt, &urls, &video_id, generation, &shared)
+                            if is_current() && yt.refresh_clients() {
+                                Track::open_if(&yt, &urls, &video_id, generation, &shared, &is_current)
                             } else {
                                 Err(message)
                             }
@@ -597,7 +631,8 @@ fn decode_loop(
                         return;
                     }
                     let reply = match opened {
-                        Ok(track) => Cmd::Opened(track),
+                        Ok(Some(track)) => Cmd::Opened(track),
+                        Ok(None) => return,
                         Err(message) => {
                             urls.lock().unwrap().remove(&video_id);
                             Cmd::Failed { generation, message }
@@ -850,8 +885,9 @@ impl Player {
     }
 
     pub fn preload(&self, video_id: &str) {
-        let (yt, urls, video_id) = (self.yt.clone(), self.urls.clone(), video_id.to_owned());
-        std::thread::spawn(move || resolve(&yt, &urls, &video_id));
+        let (yt, urls, video_id, shared) = (self.yt.clone(), self.urls.clone(), video_id.to_owned(), self.shared.clone());
+        let generation = shared.generation.load(Relaxed);
+        std::thread::spawn(move || resolve_if(&yt, &urls, &video_id, &|| shared.generation.load(Relaxed) == generation));
     }
 
     pub fn seek(&self, ms: u64) {
@@ -960,6 +996,14 @@ pub fn selftest(query: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_preload_does_not_resolve_or_cache_a_stream() {
+        let yt = ytm::Client::new(String::new());
+        let urls = Urls::default();
+        assert!(resolve_if(&yt, &urls, "stale", &|| false).unwrap().is_none());
+        assert!(urls.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn retries_back_off_and_stop() {
