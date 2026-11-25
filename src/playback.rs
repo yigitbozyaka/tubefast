@@ -70,6 +70,7 @@ pub struct Playback {
     started: Vec<Item>,
     problem: Option<String>,
     unavailable: HashSet<String>,
+    backwards: bool,
     version: u64,
     yt: Arc<Client>,
     signals: Sender<Signal>,
@@ -109,6 +110,7 @@ impl Playback {
             started: Vec::new(),
             problem: None,
             unavailable: HashSet::new(),
+            backwards: false,
             version: 0,
             yt,
             signals,
@@ -174,16 +176,20 @@ impl Playback {
 
     fn follow_player(&mut self) {
         if let Some(error) = self.player.take_error() {
+            let backwards = self.backwards;
             let next = if error.unavailable {
                 self.current.and_then(|current| {
-                    self.unavailable.insert(self.queue[current].video_id.clone());
-                    next_available(&self.queue, current, self.repeat, &self.unavailable)
+                    let video_id = self.queue[current].video_id.clone();
+                    self.started.retain(|item| item.video_id != video_id);
+                    self.unavailable.insert(video_id);
+                    next_available(&self.queue, current, self.repeat, &self.unavailable, backwards)
                 })
             } else {
                 None
             };
             if let Some(next) = next {
                 self.play_index(next);
+                self.backwards = backwards;
             } else {
                 self.player.set_paused(true);
             }
@@ -260,6 +266,7 @@ impl Playback {
         let index = index - played;
         let item = self.queue[index].clone();
         self.resume_at = None;
+        self.backwards = false;
         self.current = Some(index);
         self.changed();
         self.player.load(&item.video_id);
@@ -312,7 +319,10 @@ impl Playback {
 
     fn previous(&mut self) {
         match self.current {
-            Some(current) if current > 0 && self.player.position_ms() < RESTART_AFTER_MS => self.play_index(current - 1),
+            Some(current) if current > 0 && self.player.position_ms() < RESTART_AFTER_MS => {
+                self.play_index(current - 1);
+                self.backwards = true;
+            }
             Some(_) => self.player.seek(0),
             None => {}
         }
@@ -459,14 +469,21 @@ impl Playback {
     }
 }
 
-fn next_available(queue: &[Item], current: usize, repeat: Repeat, unavailable: &HashSet<String>) -> Option<usize> {
-    let end = if repeat == Repeat::All {
-        queue.len() + current
-    } else {
-        queue.len()
+fn next_available(queue: &[Item], current: usize, repeat: Repeat, unavailable: &HashSet<String>, backwards: bool) -> Option<usize> {
+    let len = queue.len();
+    let steps = match (repeat, backwards) {
+        (Repeat::All, _) => len.saturating_sub(1),
+        (_, true) => current,
+        (_, false) => len.saturating_sub(current + 1),
     };
-    (current + 1..end)
-        .map(|index| index % queue.len())
+    (1..=steps)
+        .map(|step| {
+            if backwards {
+                (current + len - step) % len
+            } else {
+                (current + step) % len
+            }
+        })
         .find(|index| !unavailable.contains(&queue[*index].video_id))
 }
 
@@ -521,7 +538,7 @@ mod tests {
         let queue = vec![song("a"), song("b"), song("c")];
         let unavailable = HashSet::from(["a".to_owned(), "b".to_owned()]);
         for repeat in [Repeat::Off, Repeat::One, Repeat::All] {
-            assert_eq!(next_available(&queue, 0, repeat, &unavailable), Some(2));
+            assert_eq!(next_available(&queue, 0, repeat, &unavailable, false), Some(2));
         }
     }
 
@@ -529,9 +546,21 @@ mod tests {
     fn only_repeat_all_wraps_past_an_unavailable_last_track() {
         let queue = vec![song("a"), song("b"), song("c")];
         let unavailable = HashSet::from(["c".to_owned()]);
-        assert_eq!(next_available(&queue, 2, Repeat::All, &unavailable), Some(0));
-        assert_eq!(next_available(&queue, 2, Repeat::Off, &unavailable), None);
-        assert_eq!(next_available(&queue, 2, Repeat::One, &unavailable), None);
+        assert_eq!(next_available(&queue, 2, Repeat::All, &unavailable, false), Some(0));
+        assert_eq!(next_available(&queue, 2, Repeat::Off, &unavailable, false), None);
+        assert_eq!(next_available(&queue, 2, Repeat::One, &unavailable, false), None);
+    }
+
+    #[test]
+    fn unavailable_tracks_are_skipped_backwards_after_previous() {
+        let queue = vec![song("a"), song("b"), song("c")];
+        let unavailable = HashSet::from(["b".to_owned(), "c".to_owned()]);
+        assert_eq!(next_available(&queue, 2, Repeat::Off, &unavailable, true), Some(0));
+        assert_eq!(next_available(&queue, 0, Repeat::Off, &unavailable, true), None);
+        assert_eq!(next_available(&queue, 0, Repeat::All, &unavailable, true), None);
+        let unavailable = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        assert_eq!(next_available(&queue, 1, Repeat::All, &unavailable, true), Some(2));
+        assert_eq!(next_available(&queue, 1, Repeat::Off, &unavailable, true), None);
     }
 
     #[test]
@@ -540,9 +569,10 @@ mod tests {
         let unavailable = HashSet::from(["a".to_owned(), "b".to_owned()]);
         for repeat in [Repeat::Off, Repeat::One, Repeat::All] {
             for current in 0..queue.len() {
-                assert_eq!(next_available(&queue, current, repeat, &unavailable), None);
+                assert_eq!(next_available(&queue, current, repeat, &unavailable, false), None);
+                assert_eq!(next_available(&queue, current, repeat, &unavailable, true), None);
             }
-            assert_eq!(next_available(&queue[..1], 0, repeat, &unavailable), None);
+            assert_eq!(next_available(&queue[..1], 0, repeat, &unavailable, false), None);
         }
     }
 
