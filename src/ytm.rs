@@ -182,6 +182,45 @@ pub struct Account {
     pub page: String,
 }
 
+#[derive(Debug)]
+pub struct StreamError {
+    pub message: String,
+    pub unavailable: bool,
+}
+
+impl From<String> for StreamError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            unavailable: false,
+        }
+    }
+}
+
+fn stream_error(response: &Value) -> StreamError {
+    let status = &response["playabilityStatus"];
+    let reason = if playable(response) {
+        None
+    } else {
+        status["reason"].as_str().or(status["status"].as_str())
+    };
+    let message = reason.unwrap_or("No compatible audio stream for this track").to_owned();
+    let reason = message.trim_end_matches('.').to_ascii_lowercase();
+    let unavailable = matches!(status["status"].as_str(), Some("ERROR" | "UNPLAYABLE"))
+        && (matches!(
+            reason.as_str(),
+            "video unavailable"
+                | "this video is unavailable"
+                | "this video is private"
+                | "this is a private video"
+                | "this video has been removed"
+                | "this video is not available"
+                | "this video is not available in your country"
+                | "the uploader has not made this video available in your country"
+        ) || reason.starts_with("this video has been removed "));
+    StreamError { message, unavailable }
+}
+
 #[derive(Deserialize, PartialEq)]
 struct Clients {
     remix_version: String,
@@ -620,11 +659,12 @@ impl Client {
     }
 
     pub fn stream(&self, video_id: &str) -> Result<Stream, String> {
-        self.stream_if_current(video_id, || true)?
+        self.stream_if_current(video_id, || true)
+            .map_err(|error| error.message)?
             .ok_or_else(|| "Stream resolution was cancelled".to_owned())
     }
 
-    pub fn stream_if_current(&self, video_id: &str, current: impl Fn() -> bool) -> Result<Option<Stream>, String> {
+    pub fn stream_if_current(&self, video_id: &str, current: impl Fn() -> bool) -> Result<Option<Stream>, StreamError> {
         if !current() {
             return Ok(None);
         }
@@ -653,15 +693,7 @@ impl Client {
         if !current() {
             return Ok(None);
         }
-        audio(&response).map(Some).ok_or_else(|| {
-            let status = &response["playabilityStatus"];
-            let reason = if playable(&response) {
-                None
-            } else {
-                status["reason"].as_str().or(status["status"].as_str())
-            };
-            reason.unwrap_or("No compatible audio stream for this track").to_owned()
-        })
+        audio(&response).map(Some).ok_or_else(|| stream_error(&response))
     }
 
     fn player(&self, video_id: &str, current: &impl Fn() -> bool) -> Result<Option<Value>, String> {
@@ -1412,6 +1444,33 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicitly_unavailable_videos_can_be_skipped() {
+        for reason in [
+            "Video unavailable",
+            "This video is private.",
+            "This video has been removed by the uploader",
+            "The uploader has not made this video available in your country.",
+        ] {
+            let response = json!({ "playabilityStatus": { "status": "UNPLAYABLE", "reason": reason } });
+            let error = stream_error(&response);
+            assert!(error.unavailable, "{reason}");
+            assert_eq!(error.message, reason);
+        }
+        for (status, reason) in [
+            ("LOGIN_REQUIRED", "This video is private"),
+            ("LOGIN_REQUIRED", "Sign in to confirm your age"),
+            ("ERROR", "YouTube answered with HTTP 429"),
+            ("ERROR", "YouTube answered with HTTP 503"),
+            ("ERROR", "Could not reach YouTube. Check your connection."),
+            ("UNPLAYABLE", "Playback is temporarily unavailable"),
+            ("OK", "Video unavailable"),
+        ] {
+            let response = json!({ "playabilityStatus": { "status": status, "reason": reason } });
+            assert!(!stream_error(&response).unavailable, "{status}: {reason}");
+        }
+    }
 
     #[test]
     fn stale_stream_resolution_stops_before_network_requests() {

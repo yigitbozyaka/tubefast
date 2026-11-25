@@ -1,6 +1,7 @@
 use crate::app::{Action, Repeat, Saved};
 use crate::player::Player;
 use crate::ytm::{Client, Item};
+use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,6 +69,8 @@ pub struct Playback {
     radio_seed: String,
     started: Vec<Item>,
     problem: Option<String>,
+    unavailable: HashSet<String>,
+    backwards: bool,
     version: u64,
     yt: Arc<Client>,
     signals: Sender<Signal>,
@@ -106,6 +109,8 @@ impl Playback {
             radio_seed: String::new(),
             started: Vec::new(),
             problem: None,
+            unavailable: HashSet::new(),
+            backwards: false,
             version: 0,
             yt,
             signals,
@@ -170,9 +175,27 @@ impl Playback {
     }
 
     fn follow_player(&mut self) {
-        if let Some(message) = self.player.take_error() {
-            self.player.set_paused(true);
-            self.problem = Some(with_retry_hint(&message));
+        if let Some(error) = self.player.take_error() {
+            let backwards = self.backwards;
+            let next = if error.unavailable {
+                self.current.and_then(|current| {
+                    let video_id = self.queue[current].video_id.clone();
+                    self.started.retain(|item| item.video_id != video_id);
+                    self.unavailable.insert(video_id);
+                    next_available(&self.queue, current, self.repeat, &self.unavailable, backwards)
+                })
+            } else {
+                None
+            };
+            if let Some(next) = next {
+                self.play_index(next);
+                self.backwards = backwards;
+            } else {
+                self.player.set_paused(true);
+            }
+            self.problem = Some(with_retry_hint(&error.message));
+        } else if !self.player.loading() && !self.player.failed() {
+            self.unavailable.clear();
         }
         if self.player.take_ended() {
             if self.repeat == Repeat::One {
@@ -184,6 +207,9 @@ impl Playback {
     }
 
     pub fn press(&mut self, action: Action) {
+        if matches!(action, Action::Toggle | Action::Next | Action::Previous | Action::Pause(false)) {
+            self.unavailable.clear();
+        }
         match action {
             Action::Toggle => self.toggle(),
             Action::Pause(paused) => {
@@ -200,6 +226,7 @@ impl Playback {
     }
 
     pub fn play(&mut self, items: Vec<Item>, index: usize) -> Option<Replaced> {
+        self.unavailable.clear();
         let chosen = items.get(index).map(|item| item.video_id.clone()).unwrap_or_default();
         let songs: Vec<Item> = items.into_iter().filter(Item::is_song).collect();
         let before = std::mem::replace(&mut self.queue, songs);
@@ -239,6 +266,7 @@ impl Playback {
         let index = index - played;
         let item = self.queue[index].clone();
         self.resume_at = None;
+        self.backwards = false;
         self.current = Some(index);
         self.changed();
         self.player.load(&item.video_id);
@@ -291,7 +319,10 @@ impl Playback {
 
     fn previous(&mut self) {
         match self.current {
-            Some(current) if current > 0 && self.player.position_ms() < RESTART_AFTER_MS => self.play_index(current - 1),
+            Some(current) if current > 0 && self.player.position_ms() < RESTART_AFTER_MS => {
+                self.play_index(current - 1);
+                self.backwards = true;
+            }
             Some(_) => self.player.seek(0),
             None => {}
         }
@@ -438,6 +469,24 @@ impl Playback {
     }
 }
 
+fn next_available(queue: &[Item], current: usize, repeat: Repeat, unavailable: &HashSet<String>, backwards: bool) -> Option<usize> {
+    let len = queue.len();
+    let steps = match (repeat, backwards) {
+        (Repeat::All, _) => len.saturating_sub(1),
+        (_, true) => current,
+        (_, false) => len.saturating_sub(current + 1),
+    };
+    (1..=steps)
+        .map(|step| {
+            if backwards {
+                (current + len - step) % len
+            } else {
+                (current + step) % len
+            }
+        })
+        .find(|index| !unavailable.contains(&queue[*index].video_id))
+}
+
 fn with_retry_hint(message: &str) -> String {
     let transient = ["Could not reach", "connection was lost", "timed out", "HTTP 5", "HTTP 429"];
     let message = message.trim_end_matches('.');
@@ -485,6 +534,49 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_tracks_advance_even_with_repeat_one() {
+        let queue = vec![song("a"), song("b"), song("c")];
+        let unavailable = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        for repeat in [Repeat::Off, Repeat::One, Repeat::All] {
+            assert_eq!(next_available(&queue, 0, repeat, &unavailable, false), Some(2));
+        }
+    }
+
+    #[test]
+    fn only_repeat_all_wraps_past_an_unavailable_last_track() {
+        let queue = vec![song("a"), song("b"), song("c")];
+        let unavailable = HashSet::from(["c".to_owned()]);
+        assert_eq!(next_available(&queue, 2, Repeat::All, &unavailable, false), Some(0));
+        assert_eq!(next_available(&queue, 2, Repeat::Off, &unavailable, false), None);
+        assert_eq!(next_available(&queue, 2, Repeat::One, &unavailable, false), None);
+    }
+
+    #[test]
+    fn unavailable_tracks_are_skipped_backwards_after_previous() {
+        let queue = vec![song("a"), song("b"), song("c")];
+        let unavailable = HashSet::from(["b".to_owned(), "c".to_owned()]);
+        assert_eq!(next_available(&queue, 2, Repeat::Off, &unavailable, true), Some(0));
+        assert_eq!(next_available(&queue, 0, Repeat::Off, &unavailable, true), None);
+        assert_eq!(next_available(&queue, 0, Repeat::All, &unavailable, true), None);
+        let unavailable = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        assert_eq!(next_available(&queue, 1, Repeat::All, &unavailable, true), Some(2));
+        assert_eq!(next_available(&queue, 1, Repeat::Off, &unavailable, true), None);
+    }
+
+    #[test]
+    fn an_unavailable_queue_stops_instead_of_repeating_forever() {
+        let queue = vec![song("a"), song("b"), song("a")];
+        let unavailable = HashSet::from(["a".to_owned(), "b".to_owned()]);
+        for repeat in [Repeat::Off, Repeat::One, Repeat::All] {
+            for current in 0..queue.len() {
+                assert_eq!(next_available(&queue, current, repeat, &unavailable, false), None);
+                assert_eq!(next_available(&queue, current, repeat, &unavailable, true), None);
+            }
+            assert_eq!(next_available(&queue[..1], 0, repeat, &unavailable, false), None);
+        }
+    }
+
+    #[test]
     fn a_finished_song_repeats_while_the_window_draws_nothing() {
         let yt = Arc::new(Client::new(String::new()));
         let (signals, inbox) = mpsc::channel();
@@ -505,6 +597,16 @@ mod tests {
             assert!(Instant::now() < deadline, "the ended song was never restarted");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn a_skipped_unavailable_song_never_reaches_the_recent_list() {
+        let (mut playback, _inbox) = silent_playback(&Saved::default());
+        playback.play(songs("abc"), 0);
+        playback.player.fail_unavailable("This video is unavailable");
+        playback.follow_player();
+        assert_eq!(playing(&playback), "b");
+        assert_eq!(order(&playback.take_started()), "b");
     }
 
     fn silent_playback(saved: &Saved) -> (Playback, mpsc::Receiver<Signal>) {
