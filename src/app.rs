@@ -98,6 +98,7 @@ pub struct Saved {
     pub overlay_next_up: bool,
     pub notes_seen: String,
     pub browser: String,
+    pub ui_scale: Option<f32>,
 }
 
 pub enum Words {
@@ -180,6 +181,7 @@ impl Default for Saved {
             overlay_next_up: true,
             notes_seen: String::new(),
             browser: String::new(),
+            ui_scale: None,
         }
     }
 }
@@ -258,6 +260,8 @@ pub enum Action {
     VolumeBy(f32),
     GlobalHotkeys(bool),
     HideOnClose(bool),
+    UiScale(f32),
+    ScaleStep(i8),
     Record(Option<Command>),
     ResetHotkeys,
     ToggleOverlay,
@@ -309,6 +313,10 @@ pub struct App {
     tray: Option<Tray>,
     window: isize,
     fitted: Option<egui::Vec2>,
+    native_pixels: Option<f32>,
+    zoom_pending: Option<(f32, Instant)>,
+    zoom_immediate: bool,
+    monitor_fit: Option<f32>,
     replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
     playback: Arc<Mutex<Playback>>,
@@ -351,8 +359,12 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool, updated: bool) -> Self {
         ui::install(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         wake::point_at_window(cc.egui_ctx.clone());
         let mut saved = starting_state(cc);
+        saved.ui_scale = saved
+            .ui_scale
+            .map(|scale| scale.clamp(crate::scale::RELATIVE_MIN, crate::scale::RELATIVE_MAX));
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
         if !yt.signed_in() {
@@ -407,6 +419,10 @@ impl App {
             tray: None,
             window: tray::window_of(cc),
             fitted: None,
+            native_pixels: None,
+            zoom_pending: None,
+            zoom_immediate: false,
+            monitor_fit: None,
             replaced: None,
             growing: None,
             playback,
@@ -633,6 +649,44 @@ impl App {
 
     pub fn route(&self) -> &Route {
         &self.history[self.at]
+    }
+
+    pub fn ui_scale(&self) -> Option<f32> {
+        let native = self.native_pixels?;
+        Some(crate::scale::compose(
+            self.desktop_scale(native),
+            self.saved.ui_scale,
+            self.monitor_fit_or_unknown(),
+        ))
+    }
+
+    pub fn relative_fit(&self) -> f32 {
+        let absolute = crate::scale::largest_option_up_to(self.monitor_fit_or_unknown());
+        (absolute / self.desktop_scale(self.native_pixels.unwrap_or(1.0))).clamp(crate::scale::RELATIVE_MIN, crate::scale::RELATIVE_MAX)
+    }
+
+    fn desktop_scale(&self, native: f32) -> f32 {
+        if native > 1.0 { native } else { crate::scale::detected() }
+    }
+
+    fn monitor_fit_or_unknown(&self) -> f32 {
+        self.monitor_fit.unwrap_or(crate::scale::UNKNOWN_FIT)
+    }
+
+    fn step_scale(&mut self, direction: i8) {
+        let fit = self.relative_fit();
+        let options: Vec<f32> = crate::scale::RELATIVE.into_iter().filter(|scale| *scale <= fit + 0.01).collect();
+        let current = self.saved.ui_scale.unwrap_or(1.0);
+        let next = if direction > 0 {
+            options.into_iter().find(|scale| *scale > current + 0.01)
+        } else {
+            options.into_iter().rev().find(|scale| *scale < current - 0.01)
+        };
+        if let Some(scale) = next {
+            self.saved.ui_scale = Some(scale);
+            self.zoom_immediate = true;
+            self.notify(format!("Interface scale {}", crate::scale::label(scale)));
+        }
     }
 
     pub fn now_playing(&self) -> Option<&Item> {
@@ -1023,6 +1077,15 @@ impl App {
             if self.expanded && free && input.consume_key(Modifiers::NONE, Key::Escape) {
                 out.push(Action::Expand(false));
             }
+            if input.consume_key(Modifiers::COMMAND, Key::Equals) || input.consume_key(Modifiers::COMMAND, Key::Plus) {
+                out.push(Action::ScaleStep(1));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Minus) {
+                out.push(Action::ScaleStep(-1));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Num0) {
+                out.push(Action::UiScale(1.0));
+            }
         });
         out
     }
@@ -1081,6 +1144,13 @@ impl App {
                 self.saved.hide_on_close = enabled;
                 self.restart_tray();
             }
+            Action::UiScale(scale) => {
+                self.saved.ui_scale = Some(scale.clamp(crate::scale::RELATIVE_MIN, crate::scale::RELATIVE_MAX));
+                self.zoom_immediate = true;
+                let label = crate::scale::label(self.saved.ui_scale.unwrap_or(1.0));
+                self.notify(format!("Interface scale {label}"));
+            }
+            Action::ScaleStep(direction) => self.step_scale(direction),
             Action::Record(command) => self.set_recording(command),
             Action::ResetHotkeys => {
                 self.saved.hotkey_combos = hotkeys::standard_combos();
@@ -1256,6 +1326,7 @@ impl App {
 
     pub fn attach(&mut self, cc: &eframe::CreationContext<'_>) {
         ui::install(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         self.ctx = cc.egui_ctx.clone();
         wake::point_at_window(self.ctx.clone());
         self.art = Art::new(wake::wake, self.yt.agent.clone());
@@ -1332,15 +1403,40 @@ impl eframe::App for App {
         } else if cfg!(all(unix, not(target_os = "macos"))) && tray::quitting() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let (size, minimized, monitor, resizable) = ctx.input(|input| {
+        let (size, minimized, monitor, resizable, native) = ctx.input(|input| {
             let viewport = input.viewport();
             (
                 input.content_rect().size(),
                 viewport.minimized == Some(true),
                 viewport.monitor_size,
                 viewport.maximized != Some(true) && viewport.fullscreen != Some(true),
+                viewport.native_pixels_per_point,
             )
         });
+        self.native_pixels = native;
+        if let (Some(native), Some(monitor)) = (native, monitor) {
+            let pixels = ctx.pixels_per_point();
+            self.monitor_fit = Some(crate::scale::largest_fit((monitor.x * pixels, monitor.y * pixels), native));
+        }
+        let wanted_zoom = self.ui_scale().zip(native).map(|(absolute, native)| absolute / native);
+        if let Some(scale) = wanted_zoom
+            && ctx.zoom_factor() != scale
+        {
+            let since = self
+                .zoom_pending
+                .filter(|(held, _)| *held == scale)
+                .map_or(Instant::now(), |(_, since)| since);
+            if self.zoom_immediate || since.elapsed() > Duration::from_millis(300) {
+                self.zoom_immediate = false;
+                ctx.set_zoom_factor(scale);
+                self.zoom_pending = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(60));
+                self.zoom_pending = Some((scale, since));
+            }
+        } else {
+            self.zoom_pending = None;
+        }
         let fit = |target: [f32; 2]| match monitor {
             Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
             None => egui::vec2(target[0], target[1]),
