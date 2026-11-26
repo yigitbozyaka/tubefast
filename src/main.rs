@@ -5,6 +5,7 @@ mod art;
 mod auth;
 mod discord;
 mod hotkeys;
+mod library;
 mod media;
 mod opus;
 #[cfg(all(unix, not(target_os = "macos")))]
