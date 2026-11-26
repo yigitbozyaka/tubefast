@@ -31,7 +31,6 @@ const PAGES_KEPT_ON_TRIM: usize = 8;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
-const ALL_LIBRARY_SOURCES: [LibrarySource; 3] = [LibrarySource::Playlists, LibrarySource::Albums, LibrarySource::Artists];
 const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
 const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
@@ -432,17 +431,12 @@ impl App {
         saved.queue_width = usable_queue_width(saved.queue_width);
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
-        let mut library_loaded = Vec::new();
-        if !yt.signed_in() {
+        let signed_in = yt.signed_in();
+        if !signed_in {
             saved.leave_account();
-            library_loaded = ALL_LIBRARY_SOURCES.to_vec();
-            saved.sidebar.reconcile(&saved.pinned, &[], &library_loaded);
         }
-        let catalog = Arc::new(Catalog::with_cache(
-            &saved.pinned,
-            &[],
-            &saved.sidebar.cached_items(&library_loaded),
-        ));
+        let cached = if signed_in { saved.sidebar.cached_items(&[]) } else { Vec::new() };
+        let catalog = Arc::new(Catalog::with_cache(&saved.pinned, &[], &cached));
         yt.act_as(saved.account.as_ref().map_or("", |account| &account.page));
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
         let fresh_version = saved.notes_seen != VERSION && (updated || !saved.notes_seen.is_empty());
@@ -509,7 +503,7 @@ impl App {
             library_tag: None,
             library_folder: None,
             catalog,
-            library_loaded,
+            library_loaded: Vec::new(),
             library: Vec::new(),
             accounts: Vec::new(),
             player: status,
@@ -674,12 +668,7 @@ impl App {
     fn refresh(&mut self) {
         self.pages.clear();
         self.library.clear();
-        if self.yt.signed_in() {
-            self.library_loaded.clear();
-        } else {
-            self.library_loaded = ALL_LIBRARY_SOURCES.to_vec();
-            self.saved.sidebar.reconcile(&self.saved.pinned, &[], &self.library_loaded);
-        }
+        self.library_loaded.clear();
         self.rebuild_catalog();
         self.ensure(&self.route().clone());
         self.load_library();
@@ -757,7 +746,11 @@ impl App {
     }
 
     fn rebuild_catalog(&mut self) {
-        let cached = self.saved.sidebar.cached_items(&self.library_loaded);
+        let cached = if self.yt.signed_in() {
+            self.saved.sidebar.cached_items(&self.library_loaded)
+        } else {
+            Vec::new()
+        };
         self.catalog = Arc::new(Catalog::with_cache(&self.saved.pinned, &self.library, &cached));
     }
 

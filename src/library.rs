@@ -834,7 +834,7 @@ impl SidebarLayout {
     }
 
     pub fn resolve<'a>(&'a self, browse_id: &str, catalog: &'a Catalog) -> Option<&'a Item> {
-        catalog.get(browse_id).or_else(|| self.items.get(browse_id))
+        catalog.get(browse_id)
     }
 
     pub fn sidebar_ids(&self) -> HashSet<&str> {
@@ -1329,13 +1329,14 @@ mod tests {
     }
 
     #[test]
-    fn resolving_falls_back_to_the_stored_copy_of_an_item_the_library_no_longer_lists() {
+    fn an_item_missing_from_the_catalog_is_hidden_but_stays_in_the_layout() {
         let gone = item("VL7", "Remembered", "Playlist", false);
         let mut layout = SidebarLayout::default();
         layout.pin_item(&gone);
         let catalog = Catalog::default();
-        assert_eq!(layout.resolve("VL7", &catalog).unwrap().title, "Remembered");
-        assert!(layout.resolve("VL8", &catalog).is_none());
+        assert!(layout.resolve("VL7", &catalog).is_none());
+        assert!(layout.visible_slots(&catalog, "", None).is_empty());
+        assert_eq!(root_ids(&layout), ["VL7"]);
     }
 
     const EVERY_SOURCE: [LibrarySource; 3] = [LibrarySource::Playlists, LibrarySource::Albums, LibrarySource::Artists];
@@ -1398,13 +1399,11 @@ mod tests {
     }
 
     #[test]
-    fn signed_out_with_nothing_pinned_empties_the_sidebar_and_the_catalog() {
+    fn a_signed_out_start_hides_cached_items_but_keeps_the_layout() {
         let mut layout = cached_layout();
-        layout.reconcile(&[], &[], &EVERY_SOURCE);
-        assert_eq!(root_ids(&layout), ["folder-1"]);
-        assert!(layout.folders[0].items.is_empty());
-        assert!(layout.items.is_empty());
-        let catalog = Catalog::with_cache(&[], &[], &layout.cached_items(&EVERY_SOURCE));
+        layout.tags.insert("VL1".into(), vec!["calm".into()]);
+        let before = root_ids(&layout);
+        let catalog = Catalog::with_cache(&[], &[], &[]);
         assert!(catalog.is_empty());
         assert!(
             layout
@@ -1412,6 +1411,30 @@ mod tests {
                 .iter()
                 .all(|slot| matches!(slot, SidebarSlot::Folder { .. }))
         );
+        assert_eq!(root_ids(&layout), before);
+        assert_eq!(layout.folders[0].items, ["VL4"]);
+        assert!(layout.tags.contains_key("VL1"));
+    }
+
+    #[test]
+    fn signing_back_in_restores_order_folders_and_tags() {
+        let mut layout = cached_layout();
+        layout.tags.insert("VL1".into(), vec!["calm".into()]);
+        let before = root_ids(&layout);
+        let remote = [
+            item("VL1", "One", "Playlist", false),
+            item("VL2", "Two", "Playlist", false),
+            item("MPREb_3", "Three", "Album", false),
+            item("VL4", "Four", "Playlist", false),
+        ];
+        let loading = Catalog::with_cache(&[], &[], &layout.cached_items(&[]));
+        assert_eq!(loading.len(), 4);
+        layout.reconcile(&[], &remote, &EVERY_SOURCE);
+        assert_eq!(root_ids(&layout), before);
+        assert_eq!(layout.folders[0].items, ["VL4"]);
+        assert!(layout.tags.contains_key("VL1"));
+        let catalog = Catalog::build(&[], &remote);
+        assert!(layout.visible_slots(&catalog, "", None).len() >= 4);
     }
 
     #[test]
