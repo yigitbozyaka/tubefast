@@ -192,6 +192,45 @@ pub struct Account {
     pub page: String,
 }
 
+#[derive(Debug)]
+pub struct StreamError {
+    pub message: String,
+    pub unavailable: bool,
+}
+
+impl From<String> for StreamError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            unavailable: false,
+        }
+    }
+}
+
+fn stream_error(response: &Value) -> StreamError {
+    let status = &response["playabilityStatus"];
+    let reason = if playable(response) {
+        None
+    } else {
+        status["reason"].as_str().or(status["status"].as_str())
+    };
+    let message = reason.unwrap_or("No compatible audio stream for this track").to_owned();
+    let reason = message.trim_end_matches('.').to_ascii_lowercase();
+    let unavailable = matches!(status["status"].as_str(), Some("ERROR" | "UNPLAYABLE"))
+        && (matches!(
+            reason.as_str(),
+            "video unavailable"
+                | "this video is unavailable"
+                | "this video is private"
+                | "this is a private video"
+                | "this video has been removed"
+                | "this video is not available"
+                | "this video is not available in your country"
+                | "the uploader has not made this video available in your country"
+        ) || reason.starts_with("this video has been removed "));
+    StreamError { message, unavailable }
+}
+
 #[derive(Deserialize, PartialEq)]
 struct Clients {
     remix_version: String,
@@ -660,27 +699,51 @@ impl Client {
     }
 
     pub fn stream(&self, video_id: &str) -> Result<Stream, String> {
-        let mut response = self.player(video_id)?;
-        if audio(&response).is_none() {
-            self.visitor.lock().unwrap().clear();
-            response = self.player(video_id)?;
-        }
-        if audio(&response).is_none() && self.refresh_clients() {
-            response = self.player(video_id)?;
-        }
-        audio(&response).ok_or_else(|| {
-            let status = &response["playabilityStatus"];
-            let reason = if playable(&response) {
-                None
-            } else {
-                status["reason"].as_str().or(status["status"].as_str())
-            };
-            reason.unwrap_or("No compatible audio stream for this track").to_owned()
-        })
+        self.stream_if_current(video_id, || true)
+            .map_err(|error| error.message)?
+            .ok_or_else(|| "Stream resolution was cancelled".to_owned())
     }
 
-    fn player(&self, video_id: &str) -> Result<Value, String> {
+    pub fn stream_if_current(&self, video_id: &str, current: impl Fn() -> bool) -> Result<Option<Stream>, StreamError> {
+        if !current() {
+            return Ok(None);
+        }
+        let Some(mut response) = self.player(video_id, &current)? else {
+            return Ok(None);
+        };
+        if audio(&response).is_none() {
+            if !current() {
+                return Ok(None);
+            }
+            self.visitor.lock().unwrap().clear();
+            let Some(retried) = self.player(video_id, &current)? else {
+                return Ok(None);
+            };
+            response = retried;
+        }
+        if audio(&response).is_none() && current() && self.refresh_clients() {
+            if !current() {
+                return Ok(None);
+            }
+            let Some(refreshed) = self.player(video_id, &current)? else {
+                return Ok(None);
+            };
+            response = refreshed;
+        }
+        if !current() {
+            return Ok(None);
+        }
+        audio(&response).map(Some).ok_or_else(|| stream_error(&response))
+    }
+
+    fn player(&self, video_id: &str, current: &impl Fn() -> bool) -> Result<Option<Value>, String> {
+        if !current() {
+            return Ok(None);
+        }
         let visitor = self.ensure_visitor()?;
+        if !current() {
+            return Ok(None);
+        }
         let (mut client, id, user_agent) = {
             let player = &self.clients.lock().unwrap().player;
             (player.client.clone(), player.id.clone(), player.user_agent.clone())
@@ -702,10 +765,12 @@ impl Client {
             .set("X-YouTube-Client-Version", &version)
             .set("X-Goog-Visitor-Id", &visitor);
         match request.send_json(body) {
-            Ok(response) => read(response),
-            Err(ureq::Error::Status(code, _)) => {
-                Ok(json!({ "playabilityStatus": { "reason": format!("YouTube answered with HTTP {code}") } }))
-            }
+            Ok(response) if current() => read(response).map(Some),
+            Ok(_) => Ok(None),
+            Err(_) if !current() => Ok(None),
+            Err(ureq::Error::Status(code, _)) => Ok(Some(
+                json!({ "playabilityStatus": { "reason": format!("YouTube answered with HTTP {code}") } }),
+            )),
             Err(error) => Err(describe(error)),
         }
     }
@@ -1003,12 +1068,36 @@ fn playable(response: &Value) -> bool {
     response["playabilityStatus"]["status"] == "OK"
 }
 
+fn audio_content(format: &Value) -> Option<String> {
+    let query = format["url"].as_str()?.split_once('?')?.1;
+    let tags = query.split('&').find_map(|pair| pair.strip_prefix("xtags="))?;
+    let decoded = tags.replace("%3D", "=").replace("%3A", ":");
+    decoded.split(':').find_map(|tag| tag.strip_prefix("acont=")).map(str::to_owned)
+}
+
 fn audio(response: &Value) -> Option<Stream> {
     let formats = response["streamingData"]["adaptiveFormats"]
         .as_array()
         .filter(|_| playable(response))?;
+    let preferred = formats
+        .iter()
+        .filter(|format| matches!(format["itag"].as_u64(), Some(OPUS_ITAG | AAC_ITAG)) && format["url"].is_string())
+        .max_by_key(|format| {
+            let track = &format["audioTrack"];
+            let content = audio_content(format);
+            let named_original = track["displayName"]
+                .as_str()
+                .is_some_and(|name| name.to_lowercase().ends_with(" original"));
+            (
+                content.as_deref() == Some("original") || named_original,
+                !content.is_some_and(|kind| kind.starts_with("dubbed")),
+                track["audioIsDefault"] == true,
+            )
+        })?;
     let find = |itag| {
-        let format = formats.iter().find(|f| f["itag"].as_u64() == Some(itag))?;
+        let format = formats
+            .iter()
+            .find(|format| format["itag"].as_u64() == Some(itag) && format["audioTrack"]["id"] == preferred["audioTrack"]["id"])?;
         let number = |key: &str| format[key].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         Some(Stream {
             url: format["url"].as_str()?.to_owned(),
@@ -1440,6 +1529,137 @@ fn thumb(node: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_audio_wins_over_first_listed_and_default_dubs() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": OPUS_ITAG, "url": "dub-opus", "audioTrack": {
+                    "id": "bn.10", "displayName": "Bangla", "audioIsDefault": true,
+                } },
+                { "itag": AAC_ITAG, "url": "dub-aac", "audioTrack": {
+                    "id": "bn.10", "displayName": "Bangla", "audioIsDefault": true,
+                } },
+                { "itag": OPUS_ITAG, "url": "original-opus", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original",
+                } },
+                { "itag": AAC_ITAG, "url": "original-aac", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original",
+                } },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "original-opus");
+        assert_eq!(selected.fallback.unwrap().url, "original-aac");
+
+        let mut aac_only = response;
+        aac_only["streamingData"]["adaptiveFormats"].as_array_mut().unwrap().remove(2);
+        let selected = audio(&aac_only).unwrap();
+        assert_eq!(selected.url, "original-aac");
+        assert!(!selected.opus);
+        assert!(selected.fallback.is_none());
+    }
+
+    #[test]
+    fn original_audio_is_found_by_its_content_tag_in_a_multi_track_response() {
+        let format = |itag: u64, url: &str, id: &str, name: &str, default: bool| {
+            json!({ "itag": itag, "url": url, "mimeType": "audio/mp4", "audioTrack": {
+                "audioIsDefault": default, "displayName": name, "id": id,
+            } })
+        };
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                format(OPUS_ITAG, "https://host/a?xtags=acont%3Ddubbed%3Alang%3Dar", "ar.3", "Arabic", false),
+                format(AAC_ITAG, "https://host/b?xtags=acont%3Ddubbed%3Alang%3Dar", "ar.3", "Arabic", false),
+                format(OPUS_ITAG, "https://host/c?xtags=acont%3Ddubbed%3Alang%3Dtr", "tr.3", "Turkish", true),
+                format(AAC_ITAG, "https://host/d?xtags=acont%3Ddubbed%3Alang%3Dtr", "tr.3", "Turkish", true),
+                format(OPUS_ITAG, "https://host/e?xtags=acont%3Doriginal%3Alang%3Den", "en.4", "Ingilizce", false),
+                format(AAC_ITAG, "https://host/f?xtags=acont%3Doriginal%3Alang%3Den", "en.4", "Ingilizce", false),
+                { "itag": OPUS_ITAG, "url": "https://host/g?xtags=drc%3D1", "mimeType": "audio/webm" },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "https://host/e?xtags=acont%3Doriginal%3Alang%3Den");
+        assert_eq!(selected.fallback.unwrap().url, "https://host/f?xtags=acont%3Doriginal%3Alang%3Den");
+    }
+
+    #[test]
+    fn single_track_audio_keeps_the_first_listed_format() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": AAC_ITAG, "url": "https://host/aac" },
+                { "itag": OPUS_ITAG, "url": "https://host/opus" },
+                { "itag": OPUS_ITAG, "url": "https://host/opus?xtags=drc%3D1" },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "https://host/opus");
+        assert_eq!(selected.fallback.unwrap().url, "https://host/aac");
+    }
+
+    #[test]
+    fn audio_fallback_never_switches_language() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": AAC_ITAG, "url": "dub-aac", "audioTrack": { "id": "bn.10" } },
+                { "itag": OPUS_ITAG, "url": "original-opus", "audioTrack": {
+                    "id": "en-US.4", "displayName": "English (US) original", "audioIsDefault": true,
+                } },
+            ] },
+        });
+        let selected = audio(&response).unwrap();
+        assert_eq!(selected.url, "original-opus");
+        assert!(selected.fallback.is_none());
+    }
+
+    #[test]
+    fn audio_prefers_the_default_track_when_original_is_not_labeled() {
+        let response = json!({
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": OPUS_ITAG, "url": "alternate", "audioTrack": { "id": "fr.1", "audioIsDefault": false } },
+                { "itag": OPUS_ITAG, "url": "default", "audioTrack": { "id": "en.1", "audioIsDefault": true } },
+            ] },
+        });
+        assert_eq!(audio(&response).unwrap().url, "default");
+    }
+
+    #[test]
+    fn only_explicitly_unavailable_videos_can_be_skipped() {
+        for reason in [
+            "Video unavailable",
+            "This video is private.",
+            "This video has been removed by the uploader",
+            "The uploader has not made this video available in your country.",
+        ] {
+            let response = json!({ "playabilityStatus": { "status": "UNPLAYABLE", "reason": reason } });
+            let error = stream_error(&response);
+            assert!(error.unavailable, "{reason}");
+            assert_eq!(error.message, reason);
+        }
+        for (status, reason) in [
+            ("LOGIN_REQUIRED", "This video is private"),
+            ("LOGIN_REQUIRED", "Sign in to confirm your age"),
+            ("ERROR", "YouTube answered with HTTP 429"),
+            ("ERROR", "YouTube answered with HTTP 503"),
+            ("ERROR", "Could not reach YouTube. Check your connection."),
+            ("UNPLAYABLE", "Playback is temporarily unavailable"),
+            ("OK", "Video unavailable"),
+        ] {
+            let response = json!({ "playabilityStatus": { "status": status, "reason": reason } });
+            assert!(!stream_error(&response).unavailable, "{status}: {reason}");
+        }
+    }
+
+    #[test]
+    fn stale_stream_resolution_stops_before_network_requests() {
+        let client = Client::new(String::new());
+        assert!(client.stream_if_current("stale", || false).unwrap().is_none());
+    }
 
     #[test]
     fn the_credit_names_the_artists_without_the_view_count() {
