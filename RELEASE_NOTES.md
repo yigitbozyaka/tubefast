@@ -4,7 +4,7 @@
 - Turning shuffle off puts the queue back in its normal order
 - Album names on an artist page open the album, and the artist name on an album page opens the artist
 - The queue panel now shows the whole queue, including songs that already played, and you can click any song to jump to it
-- The sidebar is now fully customizable with pinned items, drag-and-drop reordering, color-coded folders, compact or collapsed rail view, and a dedicated Library page for browsing playlists, albums, artists, liked songs, and tags
+- New Library page for your playlists, albums, artists, liked songs and folders, and a sidebar you can pin, reorder, group into folders and shrink to an icon rail
 - The collapsed sidebar now has a visible button to open it again, and the now playing panel on the right can be hidden, shown and resized
 - Podcasts and videos play their original audio instead of an automatically dubbed language
 - Songs that are no longer available are skipped
