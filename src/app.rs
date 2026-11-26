@@ -13,7 +13,7 @@ use crate::tray::{self, Closing, Tray};
 use crate::ui;
 use crate::update::{self, Plan};
 use crate::wake;
-use crate::ytm::{Account, Client, Item, LibraryParts, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
+use crate::ytm::{Account, Client, Item, LibraryParts, LibrarySource, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ const PAGES_KEPT_ON_TRIM: usize = 8;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
+const ALL_LIBRARY_SOURCES: [LibrarySource; 3] = [LibrarySource::Playlists, LibrarySource::Albums, LibrarySource::Artists];
 const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
 const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
@@ -386,6 +387,7 @@ pub struct App {
     pub library_tag: Option<String>,
     pub library_folder: Option<String>,
     catalog: Arc<Catalog>,
+    library_loaded: Vec<LibrarySource>,
     pub library: Vec<Item>,
     pub accounts: Vec<Account>,
     pub player: Status,
@@ -426,14 +428,21 @@ impl App {
         let mut saved = starting_state(cc);
         let returning_user = saved.account.is_some() || !saved.pinned.is_empty() || !saved.recent.is_empty() || !saved.liked.is_empty();
         saved.sidebar.migrate(&saved.pinned, returning_user);
-        let catalog = Arc::new(Catalog::build(&saved.pinned, &[]));
         saved.sidebar.width = usable_sidebar_width(saved.sidebar.width);
         saved.queue_width = usable_queue_width(saved.queue_width);
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
+        let mut library_loaded = Vec::new();
         if !yt.signed_in() {
             saved.leave_account();
+            library_loaded = ALL_LIBRARY_SOURCES.to_vec();
+            saved.sidebar.reconcile(&saved.pinned, &[], &library_loaded);
         }
+        let catalog = Arc::new(Catalog::with_cache(
+            &saved.pinned,
+            &[],
+            &saved.sidebar.cached_items(&library_loaded),
+        ));
         yt.act_as(saved.account.as_ref().map_or("", |account| &account.page));
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
         let fresh_version = saved.notes_seen != VERSION && (updated || !saved.notes_seen.is_empty());
@@ -500,6 +509,7 @@ impl App {
             library_tag: None,
             library_folder: None,
             catalog,
+            library_loaded,
             library: Vec::new(),
             accounts: Vec::new(),
             player: status,
@@ -664,6 +674,12 @@ impl App {
     fn refresh(&mut self) {
         self.pages.clear();
         self.library.clear();
+        if self.yt.signed_in() {
+            self.library_loaded.clear();
+        } else {
+            self.library_loaded = ALL_LIBRARY_SOURCES.to_vec();
+            self.saved.sidebar.reconcile(&self.saved.pinned, &[], &self.library_loaded);
+        }
         self.rebuild_catalog();
         self.ensure(&self.route().clone());
         self.load_library();
@@ -741,7 +757,8 @@ impl App {
     }
 
     fn rebuild_catalog(&mut self) {
-        self.catalog = Arc::new(Catalog::build(&self.saved.pinned, &self.library));
+        let cached = self.saved.sidebar.cached_items(&self.library_loaded);
+        self.catalog = Arc::new(Catalog::with_cache(&self.saved.pinned, &self.library, &cached));
     }
 
     fn ensure(&mut self, route: &Route) {
@@ -897,10 +914,16 @@ impl App {
                 }
                 Event::Page(route, Err(message)) => drop(self.pages.insert(route, Load::Failed(message))),
                 Event::Library(parts) => {
+                    for (source, items) in &parts {
+                        if items.is_some() && !self.library_loaded.contains(source) {
+                            self.library_loaded.push(*source);
+                        }
+                    }
                     self.library = library::merge_library(&self.library, parts);
+                    self.saved
+                        .sidebar
+                        .reconcile(&self.saved.pinned, &self.library, &self.library_loaded);
                     self.rebuild_catalog();
-                    self.saved.sidebar.refresh_metadata(&self.catalog);
-                    self.saved.sidebar.forget_missing(&self.catalog);
                 }
                 Event::Accounts(accounts) if self.yt.signed_in() => self.accounts = accounts,
                 Event::Accounts(_) => {}
@@ -1252,6 +1275,10 @@ impl App {
                 }
             }
             Action::ToggleSidebarPin(item) => {
+                if self.catalog.get(&item.browse_id).is_none() && !item.is_song() && !item.browse_id.is_empty() {
+                    self.saved.pinned.push(item.clone());
+                    self.rebuild_catalog();
+                }
                 let pinned = self.saved.sidebar.toggle_sidebar_item(&item);
                 self.notify(if pinned { "Added to sidebar" } else { "Removed from sidebar" });
             }

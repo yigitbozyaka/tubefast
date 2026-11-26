@@ -326,10 +326,15 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    #[cfg(test)]
     pub fn build(pinned: &[Item], remote: &[Item]) -> Self {
+        Self::with_cache(pinned, remote, &[])
+    }
+
+    pub fn with_cache(pinned: &[Item], remote: &[Item], cached: &[Item]) -> Self {
         let mut index = HashMap::new();
         let mut items = Vec::new();
-        for item in pinned.iter().chain(remote) {
+        for item in pinned.iter().chain(remote).chain(cached) {
             if item.browse_id.is_empty() || item.browse_id == "VLLM" || item.is_song() {
                 continue;
             }
@@ -401,6 +406,36 @@ impl SidebarLayout {
             self.items.insert(item.browse_id.clone(), item.clone());
         }
         self.migrated = true;
+    }
+
+    pub fn cached_items(&self, loaded: &[LibrarySource]) -> Vec<Item> {
+        self.sidebar_ids()
+            .into_iter()
+            .filter_map(|id| self.items.get(id))
+            .filter(|item| !loaded.contains(&source_of(ItemKind::of(item))))
+            .cloned()
+            .collect()
+    }
+
+    pub fn reconcile(&mut self, pinned: &[Item], remote: &[Item], loaded: &[LibrarySource]) {
+        let known: HashSet<&str> = pinned.iter().chain(remote).map(|item| item.browse_id.as_str()).collect();
+        let stale: Vec<String> = self
+            .sidebar_ids()
+            .into_iter()
+            .filter(|id| !known.contains(id))
+            .filter(|id| {
+                self.items
+                    .get(*id)
+                    .is_none_or(|item| loaded.contains(&source_of(ItemKind::of(item))))
+            })
+            .map(str::to_owned)
+            .collect();
+        for id in &stale {
+            self.unpin_item(id);
+        }
+        let catalog = Catalog::with_cache(pinned, remote, &self.cached_items(loaded));
+        self.refresh_metadata(&catalog);
+        self.forget_missing(&catalog);
     }
 
     pub fn refresh_metadata(&mut self, source: &[Item]) {
@@ -1301,6 +1336,92 @@ mod tests {
         let catalog = Catalog::default();
         assert_eq!(layout.resolve("VL7", &catalog).unwrap().title, "Remembered");
         assert!(layout.resolve("VL8", &catalog).is_none());
+    }
+
+    const EVERY_SOURCE: [LibrarySource; 3] = [LibrarySource::Playlists, LibrarySource::Albums, LibrarySource::Artists];
+
+    fn cached_layout() -> SidebarLayout {
+        let mut layout = SidebarLayout::default();
+        layout.pin_item(&item("VL1", "One", "Playlist", false));
+        layout.pin_item(&item("VL2", "Two", "Playlist", false));
+        layout.pin_item(&item("MPREb_3", "Three", "Album", false));
+        let folder = layout.create_folder("Mine");
+        layout.add_to_folder(&folder, &item("VL4", "Four", "Playlist", false));
+        layout
+    }
+
+    #[test]
+    fn reconciling_drops_cached_items_the_library_no_longer_lists() {
+        let mut layout = cached_layout();
+        let remote = [item("VL1", "One", "Playlist", false), item("MPREb_3", "Three", "Album", false)];
+        layout.reconcile(&[], &remote, &EVERY_SOURCE);
+        assert_eq!(root_ids(&layout), ["folder-1", "VL1", "MPREb_3"]);
+        assert!(layout.folders[0].items.is_empty());
+        assert!(!layout.items.contains_key("VL2"));
+        assert!(!layout.items.contains_key("VL4"));
+    }
+
+    #[test]
+    fn reconciling_keeps_locally_pinned_items_and_refreshes_titles() {
+        let mut layout = cached_layout();
+        let pinned = [item("VL2", "Two", "Playlist", false)];
+        let remote = [item("VL1", "Renamed", "Playlist", false)];
+        layout.reconcile(&pinned, &remote, &EVERY_SOURCE);
+        assert_eq!(root_ids(&layout), ["folder-1", "VL1", "VL2"]);
+        assert_eq!(layout.items["VL1"].title, "Renamed");
+    }
+
+    #[test]
+    fn reconciling_keeps_order_folders_and_tags_of_survivors_and_lists_new_items() {
+        let mut layout = cached_layout();
+        layout.mode = SidebarMode::All;
+        layout.tags.insert("VL4".into(), vec!["calm".into()]);
+        layout.tags.insert("VL2".into(), vec!["gone".into()]);
+        let remote = [
+            item("MPREb_3", "Three", "Album", false),
+            item("VL4", "Four", "Playlist", false),
+            item("VL1", "One", "Playlist", false),
+            item("VL9", "New", "Playlist", false),
+        ];
+        layout.reconcile(&[], &remote, &EVERY_SOURCE);
+        assert_eq!(root_ids(&layout), ["folder-1", "VL1", "MPREb_3"]);
+        assert_eq!(layout.folders[0].items, ["VL4"]);
+        assert!(layout.tags.contains_key("VL4"));
+        assert!(!layout.tags.contains_key("VL2"));
+        let catalog = Catalog::build(&[], &remote);
+        let shown = layout.visible_slots(&catalog, "", None);
+        assert!(
+            shown
+                .iter()
+                .any(|slot| matches!(slot, SidebarSlot::RootItem { browse_id, .. } if browse_id == "VL9"))
+        );
+    }
+
+    #[test]
+    fn signed_out_with_nothing_pinned_empties_the_sidebar_and_the_catalog() {
+        let mut layout = cached_layout();
+        layout.reconcile(&[], &[], &EVERY_SOURCE);
+        assert_eq!(root_ids(&layout), ["folder-1"]);
+        assert!(layout.folders[0].items.is_empty());
+        assert!(layout.items.is_empty());
+        let catalog = Catalog::with_cache(&[], &[], &layout.cached_items(&EVERY_SOURCE));
+        assert!(catalog.is_empty());
+        assert!(
+            layout
+                .visible_slots(&catalog, "", None)
+                .iter()
+                .all(|slot| matches!(slot, SidebarSlot::Folder { .. }))
+        );
+    }
+
+    #[test]
+    fn until_a_source_loads_its_cached_items_stay_in_the_catalog() {
+        let mut layout = cached_layout();
+        layout.reconcile(&[], &[], &[LibrarySource::Albums]);
+        assert_eq!(root_ids(&layout), ["folder-1", "VL1", "VL2"]);
+        let cached = layout.cached_items(&[LibrarySource::Albums]);
+        assert_eq!(cached.len(), 3);
+        assert_eq!(Catalog::with_cache(&[], &[], &cached).len(), 3);
     }
 
     #[test]
