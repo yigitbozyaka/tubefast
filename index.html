@@ -236,6 +236,10 @@ code{font-family:var(--mono);font-size:.92em}
       <p class="text">Line by line when YouTube Music has timed lyrics. When it has none, Tubefast looks for them on <a href="https://lrclib.net">lrclib.net</a>, and shows plain text when neither has them.</p>
     </li>
     <li>
+      <h3 class="name">Lyrics translation</h3>
+      <p class="text">Add your own <a href="https://www.deepl.com/pro-api">DeepL</a> API key (the free one works) in Settings, pick a language and turn on Show translation. Each translated line shows under the original, so it stays in time. It is off until you turn it on.</p>
+    </li>
+    <li>
       <h3 class="name">Media keys</h3>
       <p class="text">Play, pause, next and previous work from any window, and the track shows up in the Windows media overlay, in Now Playing on macOS and in the media controls of Linux desktops.</p>
     </li>
@@ -248,12 +252,24 @@ code{font-family:var(--mono);font-size:.92em}
       <p class="text">One click installs a new version and restarts with your queue where it was.</p>
     </li>
     <li>
+      <h3 class="name">Beta updates</h3>
+      <p class="text">Turn on Beta updates in Settings and Tubefast also offers early builds, checked against the same SHA-256 list. Turning it off again can take you back to the latest stable release. Off until you turn it on.</p>
+    </li>
+    <li>
+      <h3 class="name">Scale</h3>
+      <p class="text">Scale in Settings makes everything larger or smaller, and Ctrl + and Ctrl - change it too. On Linux the interface also follows your desktop's own scaling, such as Xfce's 2x.</p>
+    </li>
+    <li>
       <h3 class="name">Works signed out</h3>
       <p class="text">Everything except your personal feed and your playlists works without an account. Sign in and you get your own YouTube Music feed.</p>
     </li>
     <li>
       <h3 class="name">Your library, kept locally</h3>
       <p class="text">Liked songs, listening history and saved albums, playlists and artists live on your computer.</p>
+    </li>
+    <li>
+      <h3 class="name">A library page and a sidebar you arrange</h3>
+      <p class="text">Library lists your playlists, albums, artists, liked songs and folders as a grid or a list, with search, sorting and your own tags. The sidebar shows everything you saved or only what you pin to it, which you can reorder, group into colored folders and shrink to an icon rail.</p>
     </li>
     <li>
       <h3 class="name">Real covers</h3>
@@ -358,8 +374,8 @@ cargo run --release</code></pre>
       <p class="text">YouTube changes its internal API without notice. The settings that usually need changing live in one small file, <a href="https://github.com/yigitbozyaka/tubefast/blob/master/clients.json"><code>clients.json</code></a>. When playback fails, Tubefast fetches the current copy from the repository and tries again, so most breakages are fixed for everyone with one commit and no new download.</p>
     </li>
     <li>
-      <h3 class="name">It talks to YouTube, GitHub and lrclib.net</h3>
-      <p class="text">At start it reads <code>clients.json</code> and checks whether a newer release exists. When you open the lyrics of a song that YouTube Music has no timed lyrics for, its title, its first artist and its length are sent to lrclib.net to look for them there. With Show on Discord turned on, the title, artist, cover and position of the playing song are also handed to the Discord app on your computer. Nothing else about you is sent, and there is no telemetry.</p>
+      <h3 class="name">It talks to YouTube, GitHub, lrclib.net and DeepL</h3>
+      <p class="text">At start it reads <code>clients.json</code> and checks whether a newer release exists. When you open the lyrics of a song that YouTube Music has no timed lyrics for, its title, its first artist and its length are sent to lrclib.net to look for them there. With Show on Discord turned on, the title, artist, cover and position of the playing song are also handed to the Discord app on your computer. With Show translation turned on, the lines of the lyrics you open are sent to DeepL, with the key you entered, to be translated. Nothing else about you is sent, and there is no telemetry.</p>
     </li>
     <li>
       <h3 class="name">Linux builds are new</h3>
