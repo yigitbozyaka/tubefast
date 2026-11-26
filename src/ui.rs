@@ -1,7 +1,13 @@
-use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, Words, usable_opacity};
+use crate::app::{
+    Action, App, Covers, Load, OVERLAY_OPACITY_MIN, QUEUE_WIDTH_DEFAULT, Repeat, Route, Words, usable_opacity, usable_queue_width,
+};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
+use crate::library::{
+    Catalog, DropTarget, FOLDER_COLORS, Folder, ItemKind, LibrarySort, LibraryTab, LibraryView, SIDEBAR_COLLAPSED_WIDTH,
+    SIDEBAR_WIDTH_DEFAULT, SidebarMode, SidebarSlot, usable_sidebar_width,
+};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::overlay_wayland;
 use crate::ytm::{Item, Layout, Section};
@@ -28,10 +34,26 @@ const FAINT: Color32 = Color32::from_rgba_premultiplied(122, 122, 122, 122);
 const ACCENT: Color32 = rgb(0xF4623F);
 const ON_ACCENT: Color32 = rgb(0x1A0A05);
 const FLOATING: Color32 = rgb(0x1B1C21);
+const FOLDER_PALETTE: [Color32; FOLDER_COLORS] = [MUTED, ACCENT, rgb(0xE8B949), rgb(0x4EC286), rgb(0x5A9CF8), rgb(0xB383F5)];
 
-const SIDEBAR_WIDTH: f32 = 244.0;
-const QUEUE_WIDTH: f32 = 336.0;
-const QUEUE_MIN_WINDOW: f32 = 1140.0;
+const HEADING_GAP: f32 = 5.0;
+const TEXT_OPTICAL_LIFT: f32 = 0.04;
+const SIDEBAR_CHIP_INSET: f32 = 14.0;
+const SIDEBAR_CHIP_PAD: f32 = 7.0;
+const SIDEBAR_CHIP_GAP: f32 = 5.0;
+const SIDEBAR_CHIP_PAD_TIGHT: f32 = 4.0;
+const SIDEBAR_CHIP_GAP_TIGHT: f32 = 3.0;
+const LIBRARY_TAB_PADDING: f32 = 13.0;
+const SIDEBAR_ITEM_ROW: f32 = 52.0;
+const SIDEBAR_COMPACT_ROW: f32 = 36.0;
+const SIDEBAR_FOLDER_ROW: f32 = 38.0;
+const SIDEBAR_FOLDER_COMPACT_ROW: f32 = 34.0;
+const QUEUE_ROOM: f32 = 804.0;
+const PANEL_TOGGLE_TOP: f32 = 39.0;
+const PANEL_TOGGLE_INSET: f32 = 30.0;
+const PANEL_TOGGLE_SIDE: f32 = 40.0;
+const RAIL_BRAND_HEIGHT: f32 = 66.0;
+const RAIL_GROUP_GAP: f32 = 18.0;
 const BAR_HEIGHT: f32 = 84.0;
 const ACCOUNT_HEIGHT: f32 = 68.0;
 const UPDATE_HEIGHT: f32 = 50.0;
@@ -516,14 +538,26 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
             .show(ctx, |ui| now_playing(app, ui, &mut out))
             .inner;
     } else {
+        let target_width = if app.saved.sidebar.collapsed {
+            SIDEBAR_COLLAPSED_WIDTH
+        } else {
+            usable_sidebar_width(app.saved.sidebar.width)
+        };
+        let resizing = ctx.data(|data| data.get_temp::<bool>(Id::new("sidebar-resizing")).unwrap_or(false));
+        let sidebar_width = if resizing {
+            ctx.animate_value_with_time(Id::new("sidebar-width"), target_width, 0.0)
+        } else {
+            ctx.animate_value_with_time(Id::new("sidebar-width"), target_width, 0.14)
+        };
         egui::SidePanel::left("sidebar")
-            .exact_width(SIDEBAR_WIDTH)
+            .exact_width(sidebar_width)
             .resizable(false)
             .show_separator_line(false)
             .frame(plain(PANEL))
             .show(ctx, |ui| sidebar(app, ui, &mut out));
         let queue_wanted = app.saved.queue_open;
-        let queue_fits = queue_wanted && ctx.content_rect().width() >= QUEUE_MIN_WINDOW;
+        let queue_width = usable_queue_width(app.saved.queue_width);
+        let queue_fits = queue_wanted && ctx.content_rect().width() >= QUEUE_ROOM + queue_width;
         let queue_instead = queue_wanted && !queue_fits;
         forget_scroll(false);
         let beside = Id::new("queue-beside");
@@ -532,22 +566,31 @@ pub fn draw(app: &mut App, ctx: &egui::Context) -> Vec<Action> {
             forget_scroll(true);
         }
         egui::SidePanel::right("queue")
-            .exact_width(QUEUE_WIDTH)
+            .exact_width(queue_width)
             .resizable(false)
             .show_separator_line(false)
             .frame(plain(PANEL))
-            .show_animated(ctx, queue_fits, |ui| queue_panel(app, ui, &mut out));
+            .show_animated(ctx, queue_fits, |ui| queue_panel(app, ui, true, &mut out));
+        let window_right = ctx.content_rect().right();
         egui::CentralPanel::default().frame(plain(BASE)).show(ctx, |ui| {
             if queue_instead {
-                queue_panel(app, ui, &mut out);
+                queue_panel(app, ui, false, &mut out);
             } else {
                 content(app, ui, &mut out);
+            }
+            if !queue_wanted {
+                let slot = panel_toggle_slot(ui.max_rect().top(), window_right);
+                if panel_toggle(ui, slot, Id::new("queue-expand"), icon::CARET_LINE_LEFT, "Show now playing panel").clicked() {
+                    out.push(Action::ToggleQueue);
+                }
             }
         });
     }
     app.title_bar.paint(frame);
     paint_scrubber(ctx, &scrub);
     sign_in_dialog(app, ctx, &mut out);
+    folder_dialog(app, ctx, &mut out);
+    tag_dialog(app, ctx, &mut out);
     notice(app, ctx, &mut out);
     release_notes(app, ctx, &mut out);
     out
@@ -927,6 +970,16 @@ fn label(ui: &Ui, at: Pos2, anchor: Align2, text: &str, font: FontId, color: Col
     let rect = anchor.anchor_size(at, galley.size());
     ui.painter().galley(rect.min, galley, color);
     rect
+}
+
+fn centered_text_origin(center: Pos2, size: Vec2, scale: f32) -> Pos2 {
+    let at = center - size / 2.0 - vec2(0.0, size.y * TEXT_OPTICAL_LIFT);
+    pos2((at.x * scale).round() / scale, (at.y * scale).round() / scale)
+}
+
+fn centered_galley(ui: &Ui, rect: Rect, galley: Arc<Galley>, color: Color32) {
+    let origin = centered_text_origin(rect.center(), galley.size(), ui.ctx().pixels_per_point());
+    ui.painter().galley_with_override_text_color(origin, galley, color);
 }
 
 fn artist_spans<'a>(item: &'a Item, subtitle: &str) -> Vec<(Range<usize>, &'a str)> {
@@ -1547,7 +1600,7 @@ fn top_result(ui: &mut Ui, cx: &mut Cx, items: &[Item], id: Id) {
     ui.add_space(8.0);
 }
 
-fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: bool, pinned: Option<bool>) -> bool {
+fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: bool, saved: Option<(bool, bool)>) -> bool {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), HERO_ART), Sense::hover());
     let art = Rect::from_min_size(rect.min, Vec2::splat(HERO_ART));
     match symbol {
@@ -1568,9 +1621,9 @@ fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: b
         at.x = play.rect.right() + 10.0;
         play_clicked = play.clicked();
     }
-    if let Some(pinned) = pinned {
+    if let Some((in_library, in_sidebar)) = saved {
         let slot = Rect::from_min_size(at, Vec2::splat(42.0));
-        let (font, color, hint) = if pinned {
+        let (font, color, hint) = if in_library {
             (solid(19.0), ACCENT, "Remove from library")
         } else {
             (glyph(19.0), MUTED, "Save to library")
@@ -1579,6 +1632,26 @@ fn hero(ui: &mut Ui, cx: &mut Cx, item: &Item, symbol: Option<&str>, playable: b
             cx.out.push(Action::Pin(item.clone()));
         }
         at.x = slot.right() + 10.0;
+        let pin_slot = Rect::from_min_size(at, Vec2::splat(42.0));
+        let (pin_font, pin_color, pin_hint) = if in_sidebar {
+            (solid(18.0), ACCENT, "Remove from sidebar")
+        } else {
+            (glyph(18.0), MUTED, "Add to sidebar")
+        };
+        if icon_button(
+            ui,
+            pin_slot,
+            ui.id().with("hero-sidebar-pin"),
+            icon::PUSH_PIN,
+            pin_font,
+            pin_color,
+            pin_hint,
+        )
+        .clicked()
+        {
+            cx.out.push(Action::ToggleSidebarPin(item.clone()));
+        }
+        at.x = pin_slot.right() + 10.0;
     }
     let share = Rect::from_min_size(at, Vec2::splat(42.0));
     if symbol.is_none()
@@ -1707,13 +1780,14 @@ fn local(ui: &mut Ui, cx: &mut Cx, title: &str, symbol: &str, items: &[Item], em
     }
 }
 
-fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], query: Option<&str>) {
+fn page(ui: &mut Ui, cx: &mut Cx, load: Option<&Load>, pinned: &[Item], sidebar: &crate::library::SidebarLayout, query: Option<&str>) {
     match load {
         Some(Load::Ready(page)) => {
             if let Some(header) = &page.header {
                 let saved = pinned.iter().any(|item| item.browse_id == header.browse_id);
+                let in_sidebar = sidebar.shows_in_sidebar(&header.browse_id);
                 let playable = page.sections.iter().flat_map(|section| &section.items).any(Item::is_song);
-                if hero(ui, cx, header, None, playable, Some(saved)) {
+                if hero(ui, cx, header, None, playable, Some((saved, in_sidebar))) {
                     cx.out.push(Action::Play(page.songs(), 0));
                 }
                 ui.add_space(8.0);
@@ -1960,28 +2034,13 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
     let loading = matches!(app.pages.get(&route), Some(Load::Loading));
     let shown = entrance(ui, Id::new((&route, loading)));
     let headline = match (&route, app.pages.get(&route)) {
-        (Route::Liked, _) => Some(("Liked songs", !app.saved.liked.is_empty())),
-        (Route::Recent, _) => Some(("Recently played", !app.saved.recent.is_empty())),
+        (Route::Liked, _) => Some(("Liked songs".to_owned(), !app.saved.liked.is_empty())),
+        (Route::Recent, _) => Some(("Recently played".to_owned(), !app.saved.recent.is_empty())),
         (Route::Browse(_), Some(Load::Ready(page))) => page.header.as_ref().map(|header| {
             let playable = page.sections.iter().flat_map(|section| &section.items).any(Item::is_song);
-            (header.title.as_str(), playable)
+            (header.title.clone(), playable)
         }),
         _ => None,
-    };
-    let mut cx = Cx {
-        art: &app.art,
-        covers: &app.saved.covers,
-        playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
-        paused: app.player.paused(),
-        liked: &app.saved.liked,
-        single: matches!(route, Route::Search(_) | Route::Home),
-        loading_sections: app
-            .fetching_all
-            .iter()
-            .filter(|(fetching, _)| *fetching == route)
-            .map(|(_, at)| *at)
-            .collect(),
-        out: &mut *out,
     };
     let margin = Margin {
         left: PAGE_MARGIN,
@@ -1993,7 +2052,27 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
         Frame::new().inner_margin(margin).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.set_opacity(shown);
+            if route == Route::Library {
+                library_page(app, ui, out);
+                return;
+            }
+            let mut cx = Cx {
+                art: &app.art,
+                covers: &app.saved.covers,
+                playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
+                paused: app.player.paused(),
+                liked: &app.saved.liked,
+                single: matches!(route, Route::Search(_) | Route::Home),
+                loading_sections: app
+                    .fetching_all
+                    .iter()
+                    .filter(|(fetching, _)| *fetching == route)
+                    .map(|(_, at)| *at)
+                    .collect(),
+                out: &mut *out,
+            };
             match &route {
+                Route::Library => {}
                 Route::Liked => {
                     let empty = ["No liked songs yet", "Tap the heart on any track to keep it here."];
                     local(ui, &mut cx, "Liked songs", icon::HEART, &app.saved.liked, empty, false);
@@ -2011,8 +2090,17 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
                     );
                 }
                 Route::Settings => settings(ui, app, cx.out),
-                Route::Search(query) => page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, Some(query)),
-                Route::Home | Route::Browse(_) => page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, None),
+                Route::Search(query) => page(
+                    ui,
+                    &mut cx,
+                    app.pages.get(&route),
+                    &app.saved.pinned,
+                    &app.saved.sidebar,
+                    Some(query),
+                ),
+                Route::Home | Route::Browse(_) => {
+                    page(ui, &mut cx, app.pages.get(&route), &app.saved.pinned, &app.saved.sidebar, None);
+                }
             }
         });
     });
@@ -2034,7 +2122,7 @@ fn content(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
     pane.set_opacity(stuck);
     pane.painter().rect_filled(strip, 0.0, BASE);
     wash(pane.painter(), haze, glow, BASE);
-    if sticky(&pane, strip, title, playable) {
+    if sticky(&pane, strip, &title, playable) {
         let songs = match (&route, app.pages.get(&route)) {
             (Route::Liked, _) => app.saved.liked.clone(),
             (Route::Recent, _) => app.saved.recent.clone(),
@@ -2340,6 +2428,1172 @@ fn overlay_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
 }
 
+fn library_card(ui: &Ui, app: &App, item: &Item, cell: Rect, id: Id, out: &mut Vec<Action>) {
+    let art = Rect::from_min_size(cell.min, Vec2::splat(cell.width()));
+    let radius = if item.is_artist { art.width() / 2.0 } else { ART_RADIUS };
+    let pinned = app.saved.sidebar.shows_in_sidebar(&item.browse_id);
+    let pin_rect = Rect::from_center_size(pos2(art.right() - 22.0, art.top() + 22.0), Vec2::splat(32.0));
+    let response = ui.interact(cell, id, Sense::click());
+    let pin_hover = ui.rect_contains_pointer(pin_rect);
+    let hover = ui.ctx().animate_bool_with_time(
+        id,
+        response.hovered() || response.has_focus() || response.context_menu_opened() || pin_hover,
+        0.14,
+    );
+
+    artwork(ui, &app.art, &item.thumb, art, radius);
+    if hover > 0.0 {
+        ui.painter().rect_filled(art, radius, shade(0.24 * hover));
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(art, radius, Stroke::new(1.5, TEXT), StrokeKind::Inside);
+    }
+
+    let badge_alpha = if pinned { 1.0 } else { hover };
+    let mut pin_clicked = false;
+    if badge_alpha > 0.01 {
+        let pin_resp = ui.interact(pin_rect, id.with("pin"), Sense::click());
+        let p_hover = hover_of(ui, &pin_resp);
+        let bg = if pinned {
+            ACCENT.lerp_to_gamma(Color32::WHITE, 0.12 * p_hover)
+        } else {
+            shade(0.68).lerp_to_gamma(FLOATING, 0.25 * p_hover)
+        };
+        ui.painter().circle_filled(pin_rect.center(), 15.0, bg.gamma_multiply(badge_alpha));
+        let (font, ink, hint) = if pinned {
+            (solid(14.0), ON_ACCENT, "Remove from sidebar")
+        } else {
+            (glyph(14.0), TEXT, "Add to sidebar")
+        };
+        ui.painter().text(
+            pin_rect.center(),
+            Align2::CENTER_CENTER,
+            icon::PUSH_PIN,
+            font,
+            ink.gamma_multiply(badge_alpha),
+        );
+        describe(&pin_resp, hint);
+        if pin_resp.on_hover_text(hint).clicked() {
+            pin_clicked = true;
+            out.push(Action::ToggleSidebarPin(item.clone()));
+        }
+    }
+
+    label(
+        ui,
+        pos2(cell.left(), art.bottom() + 20.0),
+        Align2::LEFT_CENTER,
+        &item.title,
+        medium(14.0),
+        TEXT,
+        cell.width(),
+    );
+    let kind_text = if item.is_artist {
+        "Artist"
+    } else if item.subtitle.is_empty() {
+        ItemKind::of(item).label()
+    } else {
+        item.subtitle.as_str()
+    };
+    let tags = app.saved.sidebar.tags_of(&item.browse_id);
+    let sub_line = if tags.is_empty() {
+        kind_text.to_owned()
+    } else {
+        let joined: Vec<String> = tags.iter().take(2).map(|tag| format!("#{tag}")).collect();
+        format!("{kind_text} · {}", joined.join(" "))
+    };
+    label(
+        ui,
+        pos2(cell.left(), art.bottom() + 40.0),
+        Align2::LEFT_CENTER,
+        &sub_line,
+        sans(12.5),
+        MUTED,
+        cell.width(),
+    );
+    describe(&response, &item.title);
+    if response.clicked() && !pin_clicked {
+        out.push(Action::Go(Route::Browse(item.browse_id.clone())));
+    }
+    response.context_menu(|ui| sidebar_item_menu(ui, app, item, None, out));
+}
+
+fn library_row(ui: &mut Ui, app: &App, item: &Item, id: Id, out: &mut Vec<Action>) {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let pin_slot = Rect::from_center_size(pos2(rect.right() - 22.0, rect.center().y), Vec2::splat(32.0));
+    let tag_slot = Rect::from_center_size(pos2(rect.right() - 58.0, rect.center().y), Vec2::splat(32.0));
+    let buttons_hot = ui.rect_contains_pointer(pin_slot) || ui.rect_contains_pointer(tag_slot);
+    let hover = ui.ctx().animate_bool_with_time(
+        id,
+        response.hovered() || response.has_focus() || response.context_menu_opened() || buttons_hot,
+        HOVER_TIME,
+    );
+    ui.painter().rect_filled(rect, ROW_RADIUS, veil(0.055 * hover));
+    let art = Rect::from_min_size(pos2(rect.left() + 10.0, rect.center().y - 20.0), Vec2::splat(40.0));
+    artwork(ui, &app.art, &item.thumb, art, if item.is_artist { 20.0 } else { 5.0 });
+
+    let mut right_bound = tag_slot.left() - 10.0;
+    let tags = app.saved.sidebar.tags_of(&item.browse_id);
+    for tag in tags.iter().rev().take(3) {
+        let text = format!("#{tag}");
+        let galley = fit(ui, &text, sans(11.5), MUTED, 100.0, 1);
+        let pill_w = galley.size().x + 14.0;
+        if right_bound - pill_w < art.right() + 180.0 {
+            break;
+        }
+        let pill_rect = Rect::from_min_size(pos2(right_bound - pill_w, rect.center().y - 11.0), vec2(pill_w, 22.0));
+        ui.painter().rect_filled(pill_rect, 11.0, veil(0.07));
+        centered_galley(ui, pill_rect, galley, MUTED);
+        right_bound = pill_rect.left() - 6.0;
+    }
+    if let Some(folder_id) = app.saved.sidebar.folder_of(&item.browse_id)
+        && let Some(folder) = app.saved.sidebar.folder(folder_id)
+    {
+        let tint = folder_color(folder.color);
+        let galley = fit(ui, &folder.name, medium(11.5), tint, 110.0, 1);
+        let pill_w = galley.size().x + 26.0;
+        if right_bound - pill_w >= art.right() + 140.0 {
+            let pill_rect = Rect::from_min_size(pos2(right_bound - pill_w, rect.center().y - 11.0), vec2(pill_w, 22.0));
+            ui.painter().rect_filled(pill_rect, 11.0, tint.gamma_multiply(0.14));
+            ui.painter().text(
+                pos2(pill_rect.left() + 11.0, pill_rect.center().y),
+                Align2::CENTER_CENTER,
+                icon::FOLDER_SIMPLE,
+                solid(11.0),
+                tint,
+            );
+            ui.painter().galley(
+                pos2(pill_rect.left() + 20.0, pill_rect.center().y - galley.size().y / 2.0),
+                galley,
+                tint,
+            );
+            right_bound = pill_rect.left() - 8.0;
+        }
+    }
+
+    let left = art.right() + 14.0;
+    let width = (right_bound - left).max(60.0);
+    label(
+        ui,
+        pos2(left, rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        &item.title,
+        medium(14.0),
+        TEXT,
+        width,
+    );
+    let kind = ItemKind::of(item).label();
+    let sub = if item.subtitle.is_empty() || item.subtitle.eq_ignore_ascii_case(kind) {
+        kind.to_owned()
+    } else {
+        format!("{kind} · {}", item.subtitle)
+    };
+    label(
+        ui,
+        pos2(left, rect.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        &sub,
+        sans(12.5),
+        MUTED,
+        width,
+    );
+
+    let mut action_clicked = false;
+    if hover > 0.05 || !tags.is_empty() {
+        let tag_alpha = if tags.is_empty() { hover } else { 0.65 + 0.35 * hover };
+        let tag_tone = if tags.is_empty() { MUTED } else { TEXT }.gamma_multiply(tag_alpha);
+        if icon_button(ui, tag_slot, id.with("tag"), icon::TAG, glyph(15.0), tag_tone, "Edit tags").clicked() {
+            action_clicked = true;
+            out.push(Action::OpenTagEditor(item.clone()));
+        }
+    }
+    let pinned = app.saved.sidebar.shows_in_sidebar(&item.browse_id);
+    if pinned || hover > 0.05 {
+        let (font, tone, hint) = if pinned {
+            (solid(16.0), ACCENT, "Remove from sidebar")
+        } else {
+            (glyph(16.0), MUTED.gamma_multiply(hover), "Add to sidebar")
+        };
+        if icon_button(ui, pin_slot, id.with("pin"), icon::PUSH_PIN, font, tone, hint).clicked() {
+            action_clicked = true;
+            out.push(Action::ToggleSidebarPin(item.clone()));
+        }
+    }
+
+    describe(&response, &item.title);
+    if response.clicked() && !action_clicked {
+        out.push(Action::Go(Route::Browse(item.browse_id.clone())));
+    }
+    response.context_menu(|ui| sidebar_item_menu(ui, app, item, None, out));
+}
+
+fn library_items_view(ui: &mut Ui, app: &App, items: &[&Item], salt: &str, out: &mut Vec<Action>) {
+    match app.saved.sidebar.library_view {
+        LibraryView::Grid => {
+            let (cols, card_w) = columns(ui.available_width(), CARD_MIN, CARD_GAP);
+            grid(
+                ui,
+                items.len(),
+                cols,
+                vec2(card_w, card_w + CARD_TEXT),
+                vec2(CARD_GAP, 26.0),
+                |ui, index, cell| {
+                    library_card(
+                        ui,
+                        app,
+                        items[index],
+                        cell,
+                        Id::new(("lib-card", salt, index, &items[index].browse_id)),
+                        out,
+                    );
+                },
+            );
+        }
+        LibraryView::List => {
+            for (index, item) in items.iter().copied().enumerate() {
+                library_row(ui, app, item, Id::new(("lib-row", salt, index, &item.browse_id)), out);
+            }
+        }
+    }
+}
+
+fn library_section_header(ui: &mut Ui, title: &str, count: usize, action_text: Option<&str>, id: Id) -> bool {
+    let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+    let title_galley = fit(ui, title, bold(21.0), TEXT, row.width() - 120.0, 1);
+    let title_width = title_galley.size().x;
+    ui.painter()
+        .galley(pos2(row.left(), row.center().y - title_galley.size().y / 2.0), title_galley, TEXT);
+    label(
+        ui,
+        pos2(row.left() + title_width + 10.0, row.center().y + 1.0),
+        Align2::LEFT_CENTER,
+        &count.to_string(),
+        sans(14.0),
+        FAINT,
+        48.0,
+    );
+    action_text.is_some_and(|text| text_button(ui, row.right_center(), id, text).clicked())
+}
+
+fn quick_tile(ui: &Ui, rect: Rect, id: Id, symbol: &str, tint: Color32, title: &str, subtitle: &str) -> Response {
+    let response = ui.interact(rect, id, Sense::click());
+    let hover = hover_of(ui, &response);
+    ui.painter().rect_filled(rect, 10.0, veil(0.05 + 0.04 * hover));
+    ui.painter()
+        .rect_stroke(rect, 10.0, Stroke::new(1.0, veil(0.06 + 0.06 * hover)), StrokeKind::Inside);
+    let badge = Rect::from_min_size(pos2(rect.left() + 12.0, rect.center().y - 20.0), Vec2::splat(40.0));
+    ui.painter().rect_filled(badge, 8.0, tint.gamma_multiply(0.16));
+    ui.painter().text(badge.center(), Align2::CENTER_CENTER, symbol, solid(19.0), tint);
+    let (left, width) = (badge.right() + 12.0, (rect.right() - badge.right() - 22.0).max(40.0));
+    label(
+        ui,
+        pos2(left, rect.center().y - 9.0),
+        Align2::LEFT_CENTER,
+        title,
+        medium(14.0),
+        TEXT,
+        width,
+    );
+    label(
+        ui,
+        pos2(left, rect.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        subtitle,
+        sans(12.5),
+        MUTED,
+        width,
+    );
+    describe(&response, title);
+    response
+}
+
+fn library_page(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
+    let catalog = app.catalog();
+    let filter = app.library_filter.clone();
+    let active_tag = app.library_tag.clone();
+    let mut playlists: Vec<&Item> = Vec::new();
+    let mut albums: Vec<&Item> = Vec::new();
+    let mut artists: Vec<&Item> = Vec::new();
+    for item in catalog.iter() {
+        if !app.saved.sidebar.matches_item(item, &filter, None, active_tag.as_deref()) {
+            continue;
+        }
+        match ItemKind::of(item) {
+            ItemKind::Playlist => playlists.push(item),
+            ItemKind::Album => albums.push(item),
+            ItemKind::Artist => artists.push(item),
+        }
+    }
+    app.saved.sidebar.sort_items(&mut playlists);
+    app.saved.sidebar.sort_items(&mut albums);
+    app.saved.sidebar.sort_items(&mut artists);
+
+    let total_playlists = catalog.iter().filter(|item| ItemKind::of(item) == ItemKind::Playlist).count();
+    let total_albums = catalog.iter().filter(|item| ItemKind::of(item) == ItemKind::Album).count();
+    let total_artists = catalog.iter().filter(|item| ItemKind::of(item) == ItemKind::Artist).count();
+
+    ui.add_space(6.0);
+    let stats = format!(
+        "{total_playlists} playlists · {total_albums} albums · {total_artists} artists · {} liked",
+        app.saved.liked.len()
+    );
+    let title_galley = fit(ui, "Library", display(44.0), TEXT, 240.0, 1);
+    let stats_galley = fit(ui, &stats, sans(13.5), MUTED, (ui.available_width() - 320.0).max(120.0), 1);
+    let head_height = title_galley.size().y + HEADING_GAP + stats_galley.size().y;
+    let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), head_height), Sense::hover());
+    let stats_top = head.top() + title_galley.size().y + HEADING_GAP;
+    ui.painter().galley(head.left_top(), title_galley, TEXT);
+    ui.painter().galley(pos2(head.left(), stats_top), stats_galley, MUTED);
+
+    let mut right = head.right();
+    let toggle_rect = Rect::from_min_size(pos2(right - 72.0, head.center().y - 18.0), vec2(72.0, 36.0));
+    ui.painter().rect_filled(toggle_rect, 18.0, veil(0.06));
+    let views = [
+        (LibraryView::Grid, icon::SQUARES_FOUR, "Grid view", toggle_rect.left() + 18.0),
+        (LibraryView::List, icon::LIST_BULLETS, "List view", toggle_rect.right() - 18.0),
+    ];
+    for (view, symbol, hint, cx_pos) in views {
+        let active = app.saved.sidebar.library_view == view;
+        let slot = Rect::from_center_size(pos2(cx_pos, toggle_rect.center().y), Vec2::splat(30.0));
+        if active {
+            ui.painter().circle_filled(slot.center(), 14.0, veil(0.14));
+        }
+        let tone = if active { TEXT } else { MUTED };
+        if icon_button(ui, slot, Id::new(("lib-view", hint)), symbol, glyph(16.0), tone, hint).clicked() {
+            out.push(Action::LibraryView(view));
+        }
+    }
+    right = toggle_rect.left() - 10.0;
+
+    let sort_label = app.saved.sidebar.library_sort.label();
+    let sort_galley = fit(ui, sort_label, medium(13.0), TEXT, 140.0, 1);
+    let sort_w = sort_galley.size().x + 42.0;
+    let sort_rect = Rect::from_min_size(pos2(right - sort_w, head.center().y - 18.0), vec2(sort_w, 36.0));
+    let sort_btn = ui.interact(sort_rect, Id::new("lib-sort"), Sense::click());
+    let sort_hover = hover_of(ui, &sort_btn);
+    ui.painter().rect_filled(sort_rect, 18.0, veil(0.06 + 0.05 * sort_hover));
+    ui.painter().text(
+        pos2(sort_rect.left() + 18.0, sort_rect.center().y),
+        Align2::CENTER_CENTER,
+        icon::ARROWS_DOWN_UP,
+        glyph(14.0),
+        MUTED.lerp_to_gamma(TEXT, sort_hover),
+    );
+    ui.painter().galley(
+        pos2(sort_rect.left() + 30.0, sort_rect.center().y - sort_galley.size().y / 2.0),
+        sort_galley,
+        TEXT,
+    );
+    describe(&sort_btn, "Sort library");
+    egui::Popup::menu(&sort_btn).gap(4.0).align(egui::RectAlign::BOTTOM_END).show(|ui| {
+        ui.set_width(MENU_WIDTH);
+        for option in LibrarySort::EVERY {
+            let active = app.saved.sidebar.library_sort == option;
+            if menu_row(ui, if active { icon::CHECK } else { "" }, glyph(15.0), ACCENT, option.label()).clicked() {
+                out.push(Action::LibrarySort(option));
+                ui.close();
+            }
+        }
+    });
+    right = sort_rect.left() - 10.0;
+
+    let folder_galley = fit(ui, "New folder", medium(13.0), TEXT, 110.0, 1);
+    let folder_w = folder_galley.size().x + 42.0;
+    let folder_rect = Rect::from_min_size(pos2(right - folder_w, head.center().y - 18.0), vec2(folder_w, 36.0));
+    let folder_btn = ui.interact(folder_rect, Id::new("lib-new-folder"), Sense::click());
+    let folder_hover = hover_of(ui, &folder_btn);
+    ui.painter().rect_filled(folder_rect, 18.0, veil(0.08 + 0.05 * folder_hover));
+    ui.painter().text(
+        pos2(folder_rect.left() + 18.0, folder_rect.center().y),
+        Align2::CENTER_CENTER,
+        icon::FOLDER_SIMPLE_PLUS,
+        glyph(15.0),
+        ACCENT,
+    );
+    ui.painter().galley(
+        pos2(folder_rect.left() + 30.0, folder_rect.center().y - folder_galley.size().y / 2.0),
+        folder_galley,
+        TEXT,
+    );
+    describe(&folder_btn, "New folder");
+    if folder_btn.clicked() {
+        out.push(Action::OpenFolderEditor(None));
+    }
+
+    ui.add_space(16.0);
+    let (tabs_row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+    let mut tx = tabs_row.left() - LIBRARY_TAB_PADDING;
+    let captions: Vec<(LibraryTab, String)> = LibraryTab::EVERY
+        .into_iter()
+        .map(|kind| {
+            let badge = match kind {
+                LibraryTab::All => None,
+                LibraryTab::Playlists => Some(total_playlists),
+                LibraryTab::Albums => Some(total_albums),
+                LibraryTab::Artists => Some(total_artists),
+                LibraryTab::Liked => Some(app.saved.liked.len()),
+                LibraryTab::Folders => Some(app.saved.sidebar.folders.len()),
+            };
+            let caption = match badge {
+                Some(n) if n > 0 => format!("{}  {n}", kind.label()),
+                _ => kind.label().to_owned(),
+            };
+            (kind, caption)
+        })
+        .collect();
+    let galleys: Vec<_> = captions
+        .iter()
+        .map(|(_, caption)| fit(ui, caption, medium(13.5), TEXT, 170.0, 1))
+        .collect();
+    let tabs_width: f32 = galleys.iter().map(|galley| galley.size().x + 2.0 * LIBRARY_TAB_PADDING + 6.0).sum();
+    let wanted_filter_w = 210.0_f32.min((tabs_row.width() * 0.28).max(140.0));
+    let filter_beside = tabs_row.width() - tabs_width - 14.0 >= wanted_filter_w.min(160.0);
+    let field = if filter_beside {
+        let filter_w = wanted_filter_w.min(tabs_row.width() - tabs_width - 14.0);
+        Rect::from_min_size(pos2(tabs_row.right() - filter_w, tabs_row.center().y - 17.0), vec2(filter_w, 34.0))
+    } else {
+        ui.add_space(8.0);
+        let (filter_row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+        Rect::from_min_size(
+            pos2(filter_row.left(), filter_row.center().y - 17.0),
+            vec2(260.0_f32.min(filter_row.width()), 34.0),
+        )
+    };
+    for ((kind, caption), galley) in captions.iter().zip(galleys) {
+        let kind = *kind;
+        let active = app.library_tab == kind;
+        let pill_w = galley.size().x + 2.0 * LIBRARY_TAB_PADDING;
+        let rect = Rect::from_min_size(pos2(tx, tabs_row.center().y - 16.0), vec2(pill_w, 32.0));
+        let response = ui.interact(rect, Id::new(("lib-tab", kind)), Sense::click());
+        let hover = hover_of(ui, &response);
+        let fill = if active { ACCENT.gamma_multiply(0.18) } else { veil(0.06 * hover) };
+        let ink = if active { ACCENT } else { MUTED.lerp_to_gamma(TEXT, hover) };
+        ui.painter().rect_filled(rect, 16.0, fill);
+        centered_galley(ui, rect, galley, ink);
+        describe(&response, caption);
+        if response.clicked() {
+            out.push(Action::LibraryTab(kind));
+        }
+        tx += pill_w + 6.0;
+    }
+
+    let bg = ui.painter().add(Shape::Noop);
+    ui.painter().text(
+        pos2(field.left() + 16.0, field.center().y),
+        Align2::CENTER_CENTER,
+        icon::MAGNIFYING_GLASS,
+        glyph(14.0),
+        FAINT,
+    );
+    let input = Rect::from_min_max(pos2(field.left() + 32.0, field.top()), pos2(field.right() - 28.0, field.bottom()));
+    let filter_resp = ui
+        .scope_builder(
+            UiBuilder::new().max_rect(input).layout(egui::Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.library_filter)
+                        .id(Id::new("library-filter"))
+                        .frame(false)
+                        .margin(Margin::ZERO)
+                        .desired_width(input.width())
+                        .font(sans(13.5))
+                        .text_color(TEXT)
+                        .hint_text(RichText::new("Filter library...").color(FAINT)),
+                )
+            },
+        )
+        .inner;
+    let focus = ui
+        .ctx()
+        .animate_bool_with_time(Id::new("library-filter-focus"), filter_resp.has_focus(), 0.12);
+    ui.painter().set(
+        bg,
+        RectShape::new(
+            field,
+            17.0,
+            veil(0.06 + 0.02 * focus),
+            Stroke::new(1.0, veil(0.08 + 0.32 * focus)),
+            StrokeKind::Inside,
+        ),
+    );
+    if !app.library_filter.is_empty() {
+        let clear = Rect::from_center_size(pos2(field.right() - 14.0, field.center().y), Vec2::splat(24.0));
+        if icon_button(
+            ui,
+            clear,
+            Id::new("library-filter-clear"),
+            icon::X,
+            glyph(12.0),
+            MUTED,
+            "Clear filter",
+        )
+        .clicked()
+        {
+            app.library_filter.clear();
+        }
+    }
+
+    let all_tags = app.saved.sidebar.all_tags();
+    if !all_tags.is_empty() && app.library_tab != LibraryTab::Liked {
+        ui.add_space(10.0);
+        let mut chips: Vec<(String, bool, Action, String)> = vec![(
+            "All tags".to_owned(),
+            app.library_tag.is_none(),
+            Action::LibraryTag(None),
+            "all".to_owned(),
+        )];
+        for tag in &all_tags {
+            let selected = app.library_tag.as_deref().is_some_and(|current| current.eq_ignore_ascii_case(tag));
+            let next = if selected { None } else { Some(tag.clone()) };
+            chips.push((format!("#{tag}"), selected, Action::LibraryTag(next), tag.clone()));
+        }
+        let galleys: Vec<_> = chips.iter().map(|(text, ..)| fit(ui, text, medium(12.0), TEXT, 140.0, 1)).collect();
+        let bar_width = ui.available_width();
+        let (mut x, mut line) = (0.0_f32, 0_usize);
+        let mut places = Vec::with_capacity(chips.len());
+        for galley in &galleys {
+            let w = galley.size().x + 20.0;
+            if x > 0.0 && x + w > bar_width {
+                x = 0.0;
+                line += 1;
+            }
+            places.push((x, line, w));
+            x += w + 6.0;
+        }
+        let (tag_bar, _) = ui.allocate_exact_size(vec2(bar_width, 30.0 * (line + 1) as f32 - 2.0), Sense::hover());
+        for (((text, selected, action, key), galley), (x, line, w)) in chips.into_iter().zip(galleys).zip(places) {
+            let rect = Rect::from_min_size(pos2(tag_bar.left() + x, tag_bar.top() + 30.0 * line as f32 + 2.0), vec2(w, 24.0));
+            let resp = ui.interact(rect, Id::new(("lib-tag-chip", key)), Sense::click());
+            let hover = hover_of(ui, &resp);
+            let fill = if selected {
+                ACCENT.gamma_multiply(0.2)
+            } else {
+                veil(0.05 + 0.04 * hover)
+            };
+            let ink = if selected { ACCENT } else { MUTED.lerp_to_gamma(TEXT, hover) };
+            ui.painter().rect_filled(rect, 12.0, fill);
+            centered_galley(ui, rect, galley, ink);
+            describe(&resp, &text);
+            if resp.clicked() {
+                out.push(action);
+            }
+        }
+    }
+
+    ui.add_space(16.0);
+    match app.library_tab {
+        LibraryTab::All => {
+            let shortcut_count = 2 + app.saved.sidebar.folders.len();
+            let (cols, tile_w) = columns(ui.available_width(), 220.0, 14.0);
+            grid(ui, shortcut_count, cols, vec2(tile_w, 64.0), vec2(14.0, 12.0), |ui, index, cell| {
+                if index == 0 {
+                    let sub = format!("{} songs", app.saved.liked.len());
+                    if quick_tile(ui, cell, Id::new("lib-quick-liked"), icon::HEART, ACCENT, "Liked songs", &sub).clicked() {
+                        out.push(Action::Go(Route::Liked));
+                    }
+                } else if index == 1 {
+                    let sub = format!("{} tracks", app.saved.recent.len());
+                    if quick_tile(
+                        ui,
+                        cell,
+                        Id::new("lib-quick-recent"),
+                        icon::CLOCK_COUNTER_CLOCKWISE,
+                        MUTED,
+                        "Recently played",
+                        &sub,
+                    )
+                    .clicked()
+                    {
+                        out.push(Action::Go(Route::Recent));
+                    }
+                } else if let Some(folder) = app.saved.sidebar.folders.get(index - 2) {
+                    let sub = if folder.items.len() == 1 {
+                        "1 item".to_owned()
+                    } else {
+                        format!("{} items", folder.items.len())
+                    };
+                    let resp = quick_tile(
+                        ui,
+                        cell,
+                        Id::new(("lib-quick-folder", &folder.id)),
+                        icon::FOLDER_SIMPLE,
+                        folder_color(folder.color),
+                        &folder.name,
+                        &sub,
+                    );
+                    if resp.clicked() {
+                        out.push(Action::LibraryFolder(Some(folder.id.clone())));
+                    }
+                    resp.context_menu(|ui| folder_menu(ui, folder, None, out));
+                }
+            });
+
+            if playlists.is_empty() && albums.is_empty() && artists.is_empty() {
+                ui.add_space(32.0);
+                if filter.trim().is_empty() && active_tag.is_none() {
+                    let hint = if app.saved.account.is_some() {
+                        "Bookmark any playlist, album, or artist to save it here, then pin your favorites to the sidebar."
+                    } else {
+                        "Sign in to sync your YouTube Music library, or bookmark albums, playlists, and artists locally."
+                    };
+                    message(ui, icon::BOOKS, "No saved collections yet", hint);
+                } else {
+                    message(
+                        ui,
+                        icon::MAGNIFYING_GLASS,
+                        "Nothing matches this filter",
+                        "Try another keyword or clear active tags.",
+                    );
+                }
+                return;
+            }
+
+            let sections = [
+                ("Playlists", &playlists, LibraryTab::Playlists, "playlists"),
+                ("Albums", &albums, LibraryTab::Albums, "albums"),
+                ("Artists", &artists, LibraryTab::Artists, "artists"),
+            ];
+            for (title, items, target_tab, salt) in sections {
+                if items.is_empty() {
+                    continue;
+                }
+                ui.add_space(28.0);
+                let show_more = (items.len() > 12).then_some("See all");
+                if library_section_header(ui, title, items.len(), show_more, Id::new(("lib-more", salt))) {
+                    out.push(Action::LibraryTab(target_tab));
+                }
+                ui.add_space(10.0);
+                let preview = &items[..items.len().min(12)];
+                library_items_view(ui, app, preview, salt, out);
+            }
+        }
+        LibraryTab::Playlists => {
+            if playlists.is_empty() {
+                message(
+                    ui,
+                    icon::PLAYLIST,
+                    "No playlists here",
+                    "Save playlists or adjust your filters to see them.",
+                );
+            } else {
+                library_items_view(ui, app, &playlists, "tab-playlists", out);
+            }
+        }
+        LibraryTab::Albums => {
+            if albums.is_empty() {
+                message(
+                    ui,
+                    icon::VINYL_RECORD,
+                    "No albums here",
+                    "Save albums or adjust your filters to see them.",
+                );
+            } else {
+                library_items_view(ui, app, &albums, "tab-albums", out);
+            }
+        }
+        LibraryTab::Artists => {
+            if artists.is_empty() {
+                message(
+                    ui,
+                    icon::MICROPHONE_STAGE,
+                    "No artists here",
+                    "Save artists or adjust your filters to see them.",
+                );
+            } else {
+                library_items_view(ui, app, &artists, "tab-artists", out);
+            }
+        }
+        LibraryTab::Liked => {
+            let q = filter.trim().to_ascii_lowercase();
+            let songs: Vec<Item> = app
+                .saved
+                .liked
+                .iter()
+                .filter(|song| {
+                    q.is_empty() || song.title.to_ascii_lowercase().contains(&q) || song.subtitle.to_ascii_lowercase().contains(&q)
+                })
+                .cloned()
+                .collect();
+            if songs.is_empty() {
+                let (title, hint) = if app.saved.liked.is_empty() {
+                    ("No liked songs yet", "Tap the heart on any track to keep it here.")
+                } else {
+                    ("No matching liked songs", "Try another search word.")
+                };
+                message(ui, icon::HEART, title, hint);
+            } else {
+                let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+                if pill(ui, bar.min, Id::new("lib-liked-play"), icon::PLAY, "Play", true).clicked() {
+                    out.push(Action::Play(songs.clone(), 0));
+                }
+                label(
+                    ui,
+                    pos2(bar.left() + 124.0, bar.center().y),
+                    Align2::LEFT_CENTER,
+                    &format!("{} songs", songs.len()),
+                    sans(13.5),
+                    MUTED,
+                    160.0,
+                );
+                ui.add_space(12.0);
+                let mut cx = Cx {
+                    art: &app.art,
+                    covers: &app.saved.covers,
+                    playing: app.now_playing().map_or("", |item| item.video_id.as_str()),
+                    paused: app.player.paused(),
+                    liked: &app.saved.liked,
+                    single: false,
+                    loading_sections: Vec::new(),
+                    out,
+                };
+                for index in 0..songs.len() {
+                    track_row(ui, &mut cx, &songs, index, None);
+                }
+            }
+        }
+        LibraryTab::Folders => {
+            if let Some(folder_id) = app.library_folder.clone()
+                && let Some(folder) = app.saved.sidebar.folder(&folder_id).cloned()
+            {
+                let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::hover());
+                let back_rect = Rect::from_min_size(pos2(bar.left(), bar.center().y - 16.0), vec2(118.0, 32.0));
+                let back = ui.interact(back_rect, Id::new("folder-back"), Sense::click());
+                let back_hover = hover_of(ui, &back);
+                ui.painter().rect_filled(back_rect, 16.0, veil(0.06 * back_hover));
+                ui.painter().text(
+                    pos2(back_rect.left() + 14.0, back_rect.center().y),
+                    Align2::CENTER_CENTER,
+                    icon::CARET_LEFT,
+                    glyph(14.0),
+                    MUTED.lerp_to_gamma(TEXT, back_hover),
+                );
+                label(
+                    ui,
+                    pos2(back_rect.left() + 26.0, back_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "All folders",
+                    medium(13.0),
+                    MUTED.lerp_to_gamma(TEXT, back_hover),
+                    88.0,
+                );
+                describe(&back, "All folders");
+                if back.clicked() {
+                    out.push(Action::LibraryFolder(None));
+                }
+
+                ui.add_space(8.0);
+                let (fhead, _) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
+                let tint = folder_color(folder.color);
+                let badge = Rect::from_min_size(pos2(fhead.left(), fhead.center().y - 24.0), Vec2::splat(48.0));
+                ui.painter().rect_filled(badge, 10.0, tint.gamma_multiply(0.16));
+                ui.painter()
+                    .text(badge.center(), Align2::CENTER_CENTER, icon::FOLDER_OPEN, solid(24.0), tint);
+                label(
+                    ui,
+                    pos2(badge.right() + 16.0, fhead.center().y - 9.0),
+                    Align2::LEFT_CENTER,
+                    &folder.name,
+                    bold(22.0),
+                    TEXT,
+                    (fhead.width() - 320.0).max(120.0),
+                );
+                label(
+                    ui,
+                    pos2(badge.right() + 16.0, fhead.center().y + 12.0),
+                    Align2::LEFT_CENTER,
+                    &format!("{} items in this folder", folder.items.len()),
+                    sans(13.0),
+                    MUTED,
+                    240.0,
+                );
+
+                let del_slot = Rect::from_center_size(pos2(fhead.right() - 18.0, fhead.center().y), Vec2::splat(34.0));
+                if icon_button(
+                    ui,
+                    del_slot,
+                    Id::new("folder-del"),
+                    icon::TRASH,
+                    glyph(16.0),
+                    MUTED,
+                    "Delete folder",
+                )
+                .clicked()
+                {
+                    out.push(Action::DeleteFolder(folder.id.clone()));
+                }
+                let edit_slot = Rect::from_center_size(pos2(del_slot.left() - 22.0, fhead.center().y), Vec2::splat(34.0));
+                if icon_button(
+                    ui,
+                    edit_slot,
+                    Id::new("folder-edit"),
+                    icon::PENCIL_SIMPLE,
+                    glyph(16.0),
+                    MUTED,
+                    "Rename / color",
+                )
+                .clicked()
+                {
+                    out.push(Action::OpenFolderEditor(Some(folder.id.clone())));
+                }
+                let add_rect = Rect::from_min_size(pos2(edit_slot.left() - 122.0, fhead.center().y - 17.0), vec2(110.0, 34.0));
+                let add_btn = ui.interact(add_rect, Id::new("folder-add-item"), Sense::click());
+                let add_hover = hover_of(ui, &add_btn);
+                ui.painter()
+                    .rect_filled(add_rect, 17.0, ACCENT.gamma_multiply(0.16 + 0.08 * add_hover));
+                ui.painter().text(
+                    pos2(add_rect.left() + 18.0, add_rect.center().y),
+                    Align2::CENTER_CENTER,
+                    icon::PLUS,
+                    glyph(14.0),
+                    ACCENT,
+                );
+                label(
+                    ui,
+                    pos2(add_rect.left() + 30.0, add_rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "Add item",
+                    medium(13.0),
+                    ACCENT,
+                    72.0,
+                );
+                describe(&add_btn, "Add item to folder");
+                egui::Popup::menu(&add_btn).gap(4.0).align(egui::RectAlign::BOTTOM_END).show(|ui| {
+                    ui.set_width(MENU_WIDTH);
+                    let available: Vec<&Item> = catalog
+                        .iter()
+                        .filter(|item| !folder.items.iter().any(|id| id == &item.browse_id))
+                        .collect();
+                    if available.is_empty() {
+                        Frame::new().inner_margin(Margin::same(10)).show(ui, |ui| {
+                            paragraph(ui, "Every library item is already in this folder.", sans(12.5), FAINT, 2);
+                        });
+                        return;
+                    }
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        for candidate in available {
+                            let symbol = match ItemKind::of(candidate) {
+                                ItemKind::Playlist => icon::PLAYLIST,
+                                ItemKind::Album => icon::VINYL_RECORD,
+                                ItemKind::Artist => icon::MICROPHONE_STAGE,
+                            };
+                            if menu_row(ui, symbol, glyph(15.0), MUTED, &candidate.title).clicked() {
+                                out.push(Action::AddToFolder(folder.id.clone(), candidate.clone()));
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(18.0);
+                let mut folder_items: Vec<&Item> = folder
+                    .items
+                    .iter()
+                    .filter_map(|id| app.saved.sidebar.resolve(id, &catalog))
+                    .filter(|item| app.saved.sidebar.matches_item(item, &filter, None, active_tag.as_deref()))
+                    .collect();
+                app.saved.sidebar.sort_items(&mut folder_items);
+                if folder_items.is_empty() {
+                    message(
+                        ui,
+                        icon::FOLDER_SIMPLE,
+                        "This folder is empty",
+                        "Drag items onto it in the sidebar or click Add item above.",
+                    );
+                } else {
+                    library_items_view(ui, app, &folder_items, &folder.id, out);
+                }
+                return;
+            }
+
+            if app.saved.sidebar.folders.is_empty() {
+                message(
+                    ui,
+                    icon::FOLDER_SIMPLE_PLUS,
+                    "No folders yet",
+                    "Group playlists, albums, and artists into folders to keep your sidebar organized.",
+                );
+            } else {
+                let folders = app.saved.sidebar.folders.clone();
+                let (cols, tile_w) = columns(ui.available_width(), 240.0, 16.0);
+                grid(
+                    ui,
+                    folders.len() + 1,
+                    cols,
+                    vec2(tile_w, 76.0),
+                    vec2(16.0, 14.0),
+                    |ui, index, cell| {
+                        if let Some(folder) = folders.get(index) {
+                            let sub = if folder.items.len() == 1 {
+                                "1 item".to_owned()
+                            } else {
+                                format!("{} items", folder.items.len())
+                            };
+                            let resp = quick_tile(
+                                ui,
+                                cell,
+                                Id::new(("lib-folder-card", &folder.id)),
+                                icon::FOLDER_SIMPLE,
+                                folder_color(folder.color),
+                                &folder.name,
+                                &sub,
+                            );
+                            if resp.clicked() {
+                                out.push(Action::LibraryFolder(Some(folder.id.clone())));
+                            }
+                            resp.context_menu(|ui| folder_menu(ui, folder, None, out));
+                        } else if quick_tile(
+                            ui,
+                            cell,
+                            Id::new("lib-folder-create-tile"),
+                            icon::FOLDER_SIMPLE_PLUS,
+                            ACCENT,
+                            "New folder",
+                            "Create a sidebar group",
+                        )
+                        .clicked()
+                        {
+                            out.push(Action::OpenFolderEditor(None));
+                        }
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn folder_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
+    let Some(editor) = &mut app.folder_editor else { return };
+    let frame = Frame::new()
+        .fill(rgb(0x15161A))
+        .stroke(Stroke::new(1.0, veil(0.08)))
+        .corner_radius(18)
+        .inner_margin(Margin::same(28));
+    let title = if editor.id.is_some() { "Edit folder" } else { "New folder" };
+    let modal = egui::Modal::new(Id::new("folder-dialog"))
+        .frame(frame)
+        .backdrop_color(shade(0.6))
+        .show(ctx, |ui| {
+            ui.set_width(360.0);
+            let width = ui.available_width();
+            let (head, _) = ui.allocate_exact_size(vec2(width, 36.0), Sense::hover());
+            ui.painter().text(head.left_center(), Align2::LEFT_CENTER, title, bold(20.0), TEXT);
+            let close_slot = Rect::from_center_size(pos2(head.right() - 14.0, head.center().y), Vec2::splat(30.0));
+            let closed = icon_button(ui, close_slot, Id::new("folder-close"), icon::X, glyph(15.0), MUTED, "Close").clicked();
+            ui.add_space(16.0);
+
+            let (field_rect, _) = ui.allocate_exact_size(vec2(width, 40.0), Sense::hover());
+            let bg = ui.painter().add(Shape::Noop);
+            let input_rect = field_rect.shrink2(vec2(14.0, 0.0));
+            let response = ui
+                .scope_builder(
+                    UiBuilder::new()
+                        .max_rect(input_rect)
+                        .layout(egui::Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.name)
+                                .id(Id::new("folder-name-input"))
+                                .frame(false)
+                                .margin(Margin::ZERO)
+                                .desired_width(input_rect.width())
+                                .font(sans(14.0))
+                                .text_color(TEXT)
+                                .hint_text(RichText::new("Folder name (e.g. Chill, Workout)").color(FAINT)),
+                        )
+                    },
+                )
+                .inner;
+            if std::mem::take(&mut editor.focus) {
+                response.request_focus();
+            }
+            let focus = ui
+                .ctx()
+                .animate_bool_with_time(Id::new("folder-input-focus"), response.has_focus(), 0.12);
+            ui.painter().set(
+                bg,
+                RectShape::new(
+                    field_rect,
+                    10.0,
+                    veil(0.06),
+                    Stroke::new(1.0, veil(0.08 + 0.35 * focus)),
+                    StrokeKind::Inside,
+                ),
+            );
+            let submitted = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+
+            ui.add_space(16.0);
+            eyebrow(ui, "Color", 0.0);
+            if let Some(color) = color_swatches(ui, width, editor.color, Id::new("folder-dialog-color")) {
+                editor.color = color;
+            }
+            ui.add_space(20.0);
+            let (actions, _) = ui.allocate_exact_size(vec2(width, 42.0), Sense::hover());
+            let save = pill(ui, actions.min, Id::new("folder-save"), icon::CHECK, "Save", true);
+            let cancel = pill(
+                ui,
+                pos2(save.rect.right() + 10.0, actions.top()),
+                Id::new("folder-cancel"),
+                icon::X,
+                "Cancel",
+                false,
+            );
+            (closed || cancel.clicked(), save.clicked() || submitted)
+        });
+    let (closed, saved) = modal.inner;
+    if saved {
+        out.push(Action::SaveFolder {
+            id: editor.id.clone(),
+            name: editor.name.clone(),
+            color: editor.color,
+        });
+    } else if closed || modal.should_close() {
+        out.push(Action::CloseFolderEditor);
+    }
+}
+
+fn tag_dialog(app: &mut App, ctx: &egui::Context, out: &mut Vec<Action>) {
+    let Some(editor) = &mut app.tag_editor else { return };
+    let browse_id = editor.item.browse_id.clone();
+    let title = editor.item.title.clone();
+    let current_tags = app.saved.sidebar.tags_of(&browse_id).to_vec();
+    let suggestions: Vec<String> = app
+        .saved
+        .sidebar
+        .all_tags()
+        .into_iter()
+        .filter(|tag| !current_tags.iter().any(|existing| existing.eq_ignore_ascii_case(tag)))
+        .collect();
+
+    let frame = Frame::new()
+        .fill(rgb(0x15161A))
+        .stroke(Stroke::new(1.0, veil(0.08)))
+        .corner_radius(18)
+        .inner_margin(Margin::same(28));
+    let modal = egui::Modal::new(Id::new("tag-dialog"))
+        .frame(frame)
+        .backdrop_color(shade(0.6))
+        .show(ctx, |ui| {
+            ui.set_width(380.0);
+            let width = ui.available_width();
+            let (head, _) = ui.allocate_exact_size(vec2(width, 36.0), Sense::hover());
+            ui.painter().text(head.left_center(), Align2::LEFT_CENTER, "Tags", bold(20.0), TEXT);
+            let close_slot = Rect::from_center_size(pos2(head.right() - 14.0, head.center().y), Vec2::splat(30.0));
+            let closed = icon_button(ui, close_slot, Id::new("tag-close"), icon::X, glyph(15.0), MUTED, "Close").clicked();
+            paragraph(ui, &title, sans(13.5), MUTED, 1);
+            ui.add_space(14.0);
+
+            let (row, _) = ui.allocate_exact_size(vec2(width, 38.0), Sense::hover());
+            let field = Rect::from_min_max(row.min, pos2(row.right() - 78.0, row.bottom()));
+            let bg = ui.painter().add(Shape::Noop);
+            let input_rect = field.shrink2(vec2(12.0, 0.0));
+            let response = ui
+                .scope_builder(
+                    UiBuilder::new()
+                        .max_rect(input_rect)
+                        .layout(egui::Layout::left_to_right(Align::Center)),
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.draft)
+                                .id(Id::new("tag-input"))
+                                .frame(false)
+                                .margin(Margin::ZERO)
+                                .desired_width(input_rect.width())
+                                .font(sans(13.5))
+                                .text_color(TEXT)
+                                .hint_text(RichText::new("Add a tag (e.g. focus, chill)").color(FAINT)),
+                        )
+                    },
+                )
+                .inner;
+            if std::mem::take(&mut editor.focus) {
+                response.request_focus();
+            }
+            let focus = ui
+                .ctx()
+                .animate_bool_with_time(Id::new("tag-input-focus"), response.has_focus(), 0.12);
+            ui.painter().set(
+                bg,
+                RectShape::new(
+                    field,
+                    10.0,
+                    veil(0.06),
+                    Stroke::new(1.0, veil(0.08 + 0.35 * focus)),
+                    StrokeKind::Inside,
+                ),
+            );
+            let add_rect = Rect::from_min_max(pos2(field.right() + 8.0, row.top()), row.max);
+            let add_btn = ui.interact(add_rect, Id::new("tag-add-btn"), Sense::click());
+            let add_hover = hover_of(ui, &add_btn);
+            ui.painter()
+                .rect_filled(add_rect, 10.0, ACCENT.lerp_to_gamma(Color32::WHITE, 0.12 * add_hover));
+            label(
+                ui,
+                add_rect.center(),
+                Align2::CENTER_CENTER,
+                "Add",
+                bold(13.0),
+                ON_ACCENT,
+                add_rect.width(),
+            );
+            describe(&add_btn, "Add tag");
+            let enter = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            let has_draft = !editor.draft.trim().is_empty();
+            if enter && !has_draft {
+                response.request_focus();
+            }
+            if (add_btn.clicked() || enter) && has_draft {
+                out.push(Action::AddTag(browse_id.clone(), editor.draft.clone()));
+            }
+
+            if !current_tags.is_empty() {
+                ui.add_space(16.0);
+                eyebrow(ui, "Applied tags", 0.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for tag in &current_tags {
+                        let text = format!("#{tag}  ×");
+                        let galley = fit(ui, &text, medium(12.5), ACCENT, 160.0, 1);
+                        let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 20.0, 28.0), Sense::click());
+                        let hover = hover_of(ui, &resp);
+                        ui.painter().rect_filled(rect, 14.0, ACCENT.gamma_multiply(0.16 + 0.08 * hover));
+                        centered_galley(ui, rect, galley, ACCENT);
+                        describe(&resp, &format!("Remove tag {tag}"));
+                        if resp.clicked() {
+                            out.push(Action::RemoveTag(browse_id.clone(), tag.clone()));
+                        }
+                    }
+                });
+            }
+
+            if !suggestions.is_empty() {
+                ui.add_space(14.0);
+                eyebrow(ui, "Quick add", 0.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                    for tag in suggestions.iter().take(12) {
+                        let text = format!("+ #{tag}");
+                        let galley = fit(ui, &text, sans(12.0), MUTED, 150.0, 1);
+                        let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 18.0, 26.0), Sense::click());
+                        let hover = hover_of(ui, &resp);
+                        ui.painter().rect_filled(rect, 13.0, veil(0.06 + 0.05 * hover));
+                        centered_galley(ui, rect, galley, MUTED.lerp_to_gamma(TEXT, hover));
+                        describe(&resp, &format!("Add tag {tag}"));
+                        if resp.clicked() {
+                            out.push(Action::AddTag(browse_id.clone(), tag.clone()));
+                        }
+                    }
+                });
+            }
+            closed
+        });
+    if modal.inner || modal.should_close() {
+        out.push(Action::CloseTagEditor);
+    }
+}
+
 fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     let full = ui.available_width();
     let width = full.min(SETTINGS_WIDTH);
@@ -2396,88 +3650,1175 @@ fn mark(ui: &Ui, center: Pos2, radius: f32) {
     ui.painter().circle_filled(center, radius * 0.18, PANEL);
 }
 
-fn sidebar(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
+fn folder_color(index: u8) -> Color32 {
+    FOLDER_PALETTE[(index as usize) % FOLDER_PALETTE.len()]
+}
+
+fn sidebar_drop_target(
+    slots: &[SidebarSlot],
+    rects: &[Rect],
+    from: usize,
+    pointer_y: f32,
+) -> (DropTarget, Option<(f32, bool)>, Option<usize>) {
+    let dragging_folder = slots[from].is_folder();
+    if !dragging_folder {
+        for (index, slot) in slots.iter().enumerate() {
+            if let SidebarSlot::Folder { folder_id, .. } = slot {
+                let rect = rects[index];
+                let pad = rect.height() * 0.22;
+                if pointer_y >= rect.top() + pad && pointer_y <= rect.bottom() - pad {
+                    return (DropTarget::IntoFolder(folder_id.clone()), None, Some(index));
+                }
+            }
+        }
+    }
+    let gap = rects.iter().position(|rect| pointer_y < rect.center().y).unwrap_or(slots.len());
+    let line_y = if gap == 0 {
+        rects[0].top()
+    } else if gap == slots.len() {
+        rects[slots.len() - 1].bottom()
+    } else {
+        (rects[gap - 1].bottom() + rects[gap].top()) / 2.0
+    };
+    if !dragging_folder {
+        if let Some(SidebarSlot::FolderItem { folder_id, item_index, .. }) = slots.get(gap) {
+            return (DropTarget::InFolder(folder_id.clone(), *item_index), Some((line_y, true)), None);
+        }
+        if gap > 0
+            && let SidebarSlot::FolderItem { folder_id, item_index, .. } = &slots[gap - 1]
+            && pointer_y <= rects[gap - 1].bottom() - 2.0
+        {
+            return (DropTarget::InFolder(folder_id.clone(), item_index + 1), Some((line_y, true)), None);
+        }
+    }
+    let next_root = slots[gap..].iter().enumerate().find_map(|(offset, slot)| match slot {
+        SidebarSlot::Folder { root_index, .. } | SidebarSlot::RootItem { root_index, .. } => Some((gap + offset, *root_index)),
+        SidebarSlot::FolderItem { .. } => None,
+    });
+    let dest = next_root.map(|(_, root)| root).unwrap_or_else(|| {
+        slots[..gap]
+            .iter()
+            .rev()
+            .find_map(|slot| match slot {
+                SidebarSlot::Folder { root_index, .. } | SidebarSlot::RootItem { root_index, .. } => Some(*root_index + 1),
+                SidebarSlot::FolderItem { .. } => None,
+            })
+            .unwrap_or(0)
+    });
+    let root_line_y = if dragging_folder && matches!(slots.get(gap), Some(SidebarSlot::FolderItem { .. })) {
+        match next_root {
+            Some((slot_idx, _)) => (rects[slot_idx - 1].bottom() + rects[slot_idx].top()) / 2.0,
+            None => rects[slots.len() - 1].bottom(),
+        }
+    } else {
+        line_y
+    };
+    (DropTarget::Root(dest), Some((root_line_y, false)), None)
+}
+
+fn panel_toggle_slot(top: f32, right: f32) -> Rect {
+    Rect::from_center_size(
+        pos2(right - PANEL_TOGGLE_INSET, top + PANEL_TOGGLE_TOP),
+        Vec2::splat(PANEL_TOGGLE_SIDE),
+    )
+}
+
+fn panel_toggle(ui: &Ui, rect: Rect, id: Id, symbol: &str, hint: &str) -> Response {
+    let response = ui.interact(rect, id, Sense::click());
+    let hover = hover_of(ui, &response);
+    ui.painter().rect_filled(rect, 10.0, veil(0.06 * hover));
+    let tone = MUTED.lerp_to_gamma(TEXT, hover);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, symbol, glyph(20.0), tone);
+    describe(&response, hint);
+    response.on_hover_text(hint)
+}
+
+fn nav_rail_item(ui: &mut Ui, symbol: &str, text: &str, active: bool) -> Response {
+    let (slot, response) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
+    let rect = Rect::from_center_size(slot.center(), Vec2::splat(40.0));
+    let hover = hover_of(ui, &response);
+    ui.painter().rect_filled(rect, 10.0, veil(if active { 0.1 } else { 0.06 * hover }));
+    let tone = if active { ACCENT } else { MUTED.lerp_to_gamma(TEXT, hover) };
+    let font = if active { solid(20.0) } else { glyph(20.0) };
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, symbol, font, tone);
+    describe(&response, text);
+    response.on_hover_text(text)
+}
+
+fn sidebar_item_menu(ui: &mut Ui, app: &App, item: &Item, slot: Option<&SidebarSlot>, out: &mut Vec<Action>) {
+    ui.set_width(MENU_WIDTH);
+    let (head, _) = ui.allocate_exact_size(vec2(MENU_WIDTH, 52.0), Sense::hover());
+    let art = Rect::from_min_size(pos2(head.left() + 8.0, head.center().y - 18.0), Vec2::splat(36.0));
+    artwork(ui, &app.art, &item.thumb, art, if item.is_artist { 18.0 } else { 5.0 });
+    let (left, width) = (art.right() + 10.0, head.right() - art.right() - 18.0);
+    label(
+        ui,
+        pos2(left, head.center().y - 8.0),
+        Align2::LEFT_CENTER,
+        &item.title,
+        medium(13.5),
+        TEXT,
+        width,
+    );
+    let kind = ItemKind::of(item).label();
+    label(
+        ui,
+        pos2(left, head.center().y + 9.0),
+        Align2::LEFT_CENTER,
+        if item.subtitle.is_empty() { kind } else { &item.subtitle },
+        sans(12.0),
+        MUTED,
+        width,
+    );
+    menu_divider(ui);
+
+    let mut action = None;
+    if menu_row(ui, icon::ARROW_UP_RIGHT, glyph(16.0), MUTED, "Open").clicked() {
+        action = Some(Action::Go(Route::Browse(item.browse_id.clone())));
+    }
+    let in_sidebar = app.saved.sidebar.shows_in_sidebar(&item.browse_id);
+    let (pin_symbol, pin_tint, pin_text) = if in_sidebar {
+        (icon::PUSH_PIN_SLASH, ACCENT, "Remove from sidebar")
+    } else {
+        (icon::PUSH_PIN, MUTED, "Add to sidebar")
+    };
+    if menu_row(ui, pin_symbol, glyph(16.0), pin_tint, pin_text).clicked() {
+        action = Some(Action::ToggleSidebarPin(item.clone()));
+    }
+    if let Some(slot) = slot {
+        if menu_row(ui, icon::ARROW_UP, glyph(16.0), MUTED, "Move up").clicked() {
+            action = Some(Action::SidebarMoveStep(slot.clone(), -1));
+        }
+        if menu_row(ui, icon::ARROW_DOWN, glyph(16.0), MUTED, "Move down").clicked() {
+            action = Some(Action::SidebarMoveStep(slot.clone(), 1));
+        }
+    }
+    let current_folder = app.saved.sidebar.folder_of(&item.browse_id);
+    if let Some(folder_id) = current_folder
+        && menu_row(ui, icon::FOLDER_SIMPLE_MINUS, glyph(16.0), MUTED, "Remove from folder").clicked()
+    {
+        action = Some(Action::RemoveFromFolder(folder_id.to_owned(), item.browse_id.clone()));
+    }
+    if !app.saved.sidebar.folders.is_empty() {
+        menu_divider(ui);
+        for folder in &app.saved.sidebar.folders {
+            let inside = current_folder == Some(folder.id.as_str());
+            let symbol = if inside { icon::CHECK } else { icon::FOLDER_SIMPLE };
+            let tint = if inside { ACCENT } else { folder_color(folder.color) };
+            let text = format!("Folder: {}", folder.name);
+            if menu_row(ui, symbol, glyph(16.0), tint, &text).clicked() && !inside {
+                action = Some(Action::AddToFolder(folder.id.clone(), item.clone()));
+            }
+        }
+    }
+    menu_divider(ui);
+    if menu_row(ui, icon::TAG, glyph(16.0), MUTED, "Edit tags").clicked() {
+        action = Some(Action::OpenTagEditor(item.clone()));
+    }
+    if menu_row(ui, icon::SHARE_NETWORK, glyph(16.0), MUTED, "Share").clicked() {
+        action = Some(Action::Share(item.clone()));
+    }
+    let saved_locally = app.saved.pinned.iter().any(|saved| saved.browse_id == item.browse_id);
+    if saved_locally && menu_row(ui, icon::BOOKMARK_SIMPLE, solid(16.0), ACCENT, "Remove from library").clicked() {
+        action = Some(Action::Pin(item.clone()));
+    }
+    if let Some(chosen) = action {
+        out.push(chosen);
+        ui.close();
+    }
+}
+
+fn color_swatches(ui: &mut Ui, width: f32, active: u8, id: Id) -> Option<u8> {
+    let (row, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
+    let mut picked = None;
+    let step = 30.0;
+    let start = row.left() + 20.0;
+    for index in 0..FOLDER_COLORS {
+        let center = pos2(start + index as f32 * step, row.center().y);
+        let hit = Rect::from_center_size(center, Vec2::splat(24.0));
+        let response = ui.interact(hit, id.with(index), Sense::click());
+        let hover = hover_of(ui, &response);
+        let swatch = folder_color(index as u8);
+        if active as usize == index {
+            ui.painter().circle_stroke(center, 10.5, Stroke::new(1.5, TEXT));
+        }
+        ui.painter().circle_filled(center, 7.0 + 1.0 * hover, swatch);
+        point_at(&response);
+        if response.clicked() {
+            picked = Some(index as u8);
+        }
+    }
+    picked
+}
+
+fn folder_menu(ui: &mut Ui, folder: &Folder, slot: Option<&SidebarSlot>, out: &mut Vec<Action>) {
+    ui.set_width(MENU_WIDTH);
+    let mut action = None;
+    let toggle_text = if folder.open { "Collapse folder" } else { "Expand folder" };
+    let toggle_icon = if folder.open { icon::CARET_UP } else { icon::CARET_DOWN };
+    if menu_row(ui, toggle_icon, glyph(16.0), MUTED, toggle_text).clicked() {
+        action = Some(Action::ToggleFolder(folder.id.clone()));
+    }
+    if menu_row(ui, icon::FOLDER_OPEN, glyph(16.0), folder_color(folder.color), "Open in Library").clicked() {
+        out.push(Action::LibraryFolder(Some(folder.id.clone())));
+        action = Some(Action::Go(Route::Library));
+    }
+    if menu_row(ui, icon::PENCIL_SIMPLE, glyph(16.0), MUTED, "Rename / customize").clicked() {
+        action = Some(Action::OpenFolderEditor(Some(folder.id.clone())));
+    }
+    if let Some(slot) = slot {
+        if menu_row(ui, icon::ARROW_UP, glyph(16.0), MUTED, "Move up").clicked() {
+            action = Some(Action::SidebarMoveStep(slot.clone(), -1));
+        }
+        if menu_row(ui, icon::ARROW_DOWN, glyph(16.0), MUTED, "Move down").clicked() {
+            action = Some(Action::SidebarMoveStep(slot.clone(), 1));
+        }
+    }
+    menu_divider(ui);
+    if let Some(color) = color_swatches(ui, MENU_WIDTH, folder.color, Id::new(("folder-color", &folder.id))) {
+        action = Some(Action::SetFolderColor(folder.id.clone(), color));
+    }
+    menu_divider(ui);
+    if menu_row(ui, icon::TRASH, glyph(16.0), ACCENT, "Delete folder").clicked() {
+        action = Some(Action::DeleteFolder(folder.id.clone()));
+    }
+    if let Some(chosen) = action {
+        out.push(chosen);
+        ui.close();
+    }
+}
+
+struct SidebarRowStyle {
+    active: bool,
+    compact: bool,
+    indented: bool,
+    hover: f32,
+    folder_tint: Option<Color32>,
+    ghost: bool,
+}
+
+fn paint_sidebar_row(ui: &Ui, art: &Art, rect: Rect, item: &Item, style: SidebarRowStyle) {
+    let shift = if style.indented { 14.0 } else { 0.0 };
+    if style.indented
+        && let Some(tint) = style.folder_tint
+    {
+        ui.painter()
+            .vline(rect.left() + 10.0, rect.y_range(), Stroke::new(1.5, tint.gamma_multiply(0.35)));
+    }
+    let body = Rect::from_min_max(pos2(rect.left() + shift, rect.top()), rect.max);
+    if !style.ghost {
+        ui.painter()
+            .rect_filled(body, ROW_RADIUS, veil(if style.active { 0.09 } else { 0.05 * style.hover }));
+    }
+    let art_side = if style.compact { 24.0 } else { 38.0 };
+    let frame = Rect::from_min_size(pos2(body.left() + 8.0, body.center().y - art_side / 2.0), Vec2::splat(art_side));
+    let radius = if item.is_artist {
+        art_side / 2.0
+    } else if style.compact {
+        4.0
+    } else {
+        5.0
+    };
+    artwork(ui, art, &item.thumb, frame, radius);
+    let grip_space = if style.hover > 0.05 && !style.ghost { 22.0 } else { 10.0 };
+    let (left, width) = (frame.right() + 10.0, (body.right() - frame.right() - 10.0 - grip_space).max(20.0));
+    let title_color = if style.active { ACCENT } else { TEXT };
+    if style.compact {
+        label(
+            ui,
+            pos2(left, body.center().y),
+            Align2::LEFT_CENTER,
+            &item.title,
+            medium(13.0),
+            title_color,
+            width,
+        );
+    } else {
+        label(
+            ui,
+            pos2(left, body.center().y - 8.5),
+            Align2::LEFT_CENTER,
+            &item.title,
+            medium(13.5),
+            title_color,
+            width,
+        );
+        let subtitle = if item.is_artist {
+            "Artist"
+        } else if item.subtitle.is_empty() {
+            ItemKind::of(item).label()
+        } else {
+            item.subtitle.as_str()
+        };
+        label(
+            ui,
+            pos2(left, body.center().y + 8.5),
+            Align2::LEFT_CENTER,
+            subtitle,
+            sans(12.0),
+            MUTED,
+            width,
+        );
+    }
+    if style.hover > 0.05 && !style.ghost {
+        ui.painter().text(
+            pos2(body.right() - 12.0, body.center().y),
+            Align2::CENTER_CENTER,
+            icon::DOTS_SIX_VERTICAL,
+            glyph(13.0),
+            FAINT.gamma_multiply(style.hover),
+        );
+    }
+}
+
+fn paint_sidebar_folder(ui: &Ui, rect: Rect, folder: &Folder, hover: f32, drop_highlight: bool, ghost: bool) {
+    let tint = folder_color(folder.color);
+    if !ghost {
+        let fill = if drop_highlight {
+            ACCENT.gamma_multiply(0.16)
+        } else {
+            veil(0.05 * hover)
+        };
+        ui.painter().rect_filled(rect, ROW_RADIUS, fill);
+        if drop_highlight {
+            ui.painter()
+                .rect_stroke(rect, ROW_RADIUS, Stroke::new(1.5, ACCENT), StrokeKind::Inside);
+        }
+    }
+    let caret = if folder.open { icon::CARET_DOWN } else { icon::CARET_RIGHT };
+    ui.painter().text(
+        pos2(rect.left() + 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        caret,
+        glyph(12.0),
+        FAINT.lerp_to_gamma(TEXT, hover),
+    );
+    let icon_glyph = if folder.open { icon::FOLDER_OPEN } else { icon::FOLDER_SIMPLE };
+    ui.painter().text(
+        pos2(rect.left() + 30.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        icon_glyph,
+        solid(17.0),
+        tint,
+    );
+    let right_space = if drop_highlight { 56.0 } else { 36.0 };
+    let (left, width) = (rect.left() + 46.0, (rect.right() - rect.left() - 46.0 - right_space).max(20.0));
+    label(
+        ui,
+        pos2(left, rect.center().y),
+        Align2::LEFT_CENTER,
+        &folder.name,
+        medium(13.5),
+        TEXT,
+        width,
+    );
+    if drop_highlight {
+        label(
+            ui,
+            pos2(rect.right() - 10.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            "Drop in",
+            bold(11.0),
+            ACCENT,
+            48.0,
+        );
+    } else if hover > 0.35 && !ghost {
+        ui.painter().text(
+            pos2(rect.right() - 12.0, rect.center().y),
+            Align2::CENTER_CENTER,
+            icon::DOTS_SIX_VERTICAL,
+            glyph(13.0),
+            FAINT.gamma_multiply(hover),
+        );
+    } else if !folder.items.is_empty() {
+        label(
+            ui,
+            pos2(rect.right() - 12.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            &folder.items.len().to_string(),
+            sans(12.0),
+            FAINT,
+            26.0,
+        );
+    }
+}
+
+fn sidebar_collapsed(app: &App, ui: &mut Ui, area: Rect, catalog: &Catalog, out: &mut Vec<Action>) {
+    let (brand, _) = ui.allocate_exact_size(vec2(area.width(), RAIL_BRAND_HEIGHT), Sense::hover());
+    mark(ui, pos2(brand.center().x, brand.top() + PANEL_TOGGLE_TOP), 13.0);
+    if nav_rail_item(ui, icon::SIDEBAR_SIMPLE, "Expand sidebar (Ctrl+B)", false).clicked() {
+        out.push(Action::SidebarCollapsed(false));
+    }
+    ui.add_space(RAIL_GROUP_GAP);
+
+    let mut links = vec![(icon::HOUSE, "Home", Route::Home), (icon::BOOKS, "Library", Route::Library)];
+    if app.saved.sidebar.show_liked {
+        links.push((icon::HEART, "Liked songs", Route::Liked));
+    }
+    if app.saved.sidebar.show_recent {
+        links.push((icon::CLOCK_COUNTER_CLOCKWISE, "Recently played", Route::Recent));
+    }
+    for (symbol, text, route) in links {
+        if nav_rail_item(ui, symbol, text, *app.route() == route).clicked() {
+            out.push(Action::Go(route));
+        }
+    }
+
+    let (sep, _) = ui.allocate_exact_size(vec2(area.width(), 14.0), Sense::hover());
+    ui.painter().hline(
+        (sep.left() + 18.0)..=(sep.right() - 18.0),
+        sep.center().y,
+        Stroke::new(1.0, veil(0.08)),
+    );
+
+    let foot_height = 96.0;
+    let foot = Rect::from_min_max(pos2(area.left(), area.bottom() - foot_height), area.max);
+    ui.painter().hline(foot.x_range(), foot.top(), Stroke::new(1.0, veil(0.06)));
+    let avatar_slot = Rect::from_center_size(pos2(foot.center().x, foot.top() + 26.0), Vec2::splat(36.0));
+    match &app.saved.account {
+        Some(account) => {
+            let response = ui.interact(avatar_slot, Id::new("rail-account"), Sense::click());
+            artwork(
+                ui,
+                &app.art,
+                &account.photo,
+                Rect::from_center_size(avatar_slot.center(), Vec2::splat(30.0)),
+                15.0,
+            );
+            describe(&response, &account.name);
+            let response = response.on_hover_text(&account.name);
+            egui::Popup::menu(&response).gap(4.0).align(egui::RectAlign::TOP_START).show(|ui| {
+                ui.set_width(MENU_WIDTH);
+                if app.accounts.len() > 1 {
+                    for channel in &app.accounts {
+                        let chosen = channel.page == account.page;
+                        let symbol = if chosen { icon::CHECK } else { "" };
+                        let row = menu_row(ui, symbol, glyph(15.0), ACCENT, &channel.name);
+                        row.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, chosen, &channel.name));
+                        if row.clicked() && !chosen {
+                            out.push(Action::SwitchAccount(channel.clone()));
+                            ui.close();
+                        }
+                    }
+                    menu_divider(ui);
+                }
+                if menu_row(ui, icon::SIGN_OUT, glyph(16.0), MUTED, "Sign out").clicked() {
+                    out.push(Action::SignOut);
+                    ui.close();
+                }
+            });
+        }
+        None => {
+            if icon_button(
+                ui,
+                avatar_slot,
+                Id::new("rail-sign-in"),
+                icon::USER_CIRCLE,
+                glyph(24.0),
+                MUTED,
+                "Sign in",
+            )
+            .clicked()
+            {
+                out.push(Action::OpenSignIn);
+            }
+        }
+    }
+    let settings_slot = Rect::from_center_size(pos2(foot.center().x, foot.bottom() - 26.0), Vec2::splat(36.0));
+    let settings_tone = if *app.route() == Route::Settings { ACCENT } else { MUTED };
+    if icon_button(
+        ui,
+        settings_slot,
+        Id::new("rail-settings"),
+        icon::GEAR_SIX,
+        glyph(18.0),
+        settings_tone,
+        "Settings",
+    )
+    .clicked()
+    {
+        out.push(Action::Go(Route::Settings));
+    }
+
+    let lift = if app.update.is_some() { 42.0 } else { 0.0 };
+    if let Some(version) = &app.update {
+        let slot = Rect::from_center_size(pos2(area.center().x, foot.top() - 21.0), Vec2::splat(34.0));
+        if icon_button(
+            ui,
+            slot,
+            Id::new("rail-update"),
+            icon::ARROW_CIRCLE_UP,
+            solid(20.0),
+            ACCENT,
+            &format!("Update to {version}"),
+        )
+        .clicked()
+        {
+            out.push(Action::GetUpdate);
+        }
+    }
+
+    let slots = app.saved.sidebar.visible_slots(catalog, "", None);
+    let height = (foot.top() - lift - ui.cursor().top()).max(0.0);
+    egui::ScrollArea::vertical()
+        .id_salt("sidebar-rail")
+        .max_height(height)
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            for slot in &slots {
+                match slot {
+                    SidebarSlot::Folder { folder_id, .. } => {
+                        let Some(folder) = app.saved.sidebar.folder(folder_id) else {
+                            continue;
+                        };
+                        let (row, response) = ui.allocate_exact_size(vec2(area.width(), 46.0), Sense::click());
+                        let box_rect = Rect::from_center_size(row.center(), Vec2::splat(38.0));
+                        let hover = hover_of(ui, &response);
+                        let tint = folder_color(folder.color);
+                        ui.painter().rect_filled(box_rect, 8.0, tint.gamma_multiply(0.14 + 0.08 * hover));
+                        ui.painter()
+                            .text(box_rect.center(), Align2::CENTER_CENTER, icon::FOLDER_SIMPLE, solid(19.0), tint);
+                        describe(&response, &folder.name);
+                        let response = response.on_hover_text(format!("{} ({})", folder.name, folder.items.len()));
+                        if response.clicked() {
+                            out.push(Action::LibraryFolder(Some(folder.id.clone())));
+                            out.push(Action::Go(Route::Library));
+                        }
+                        response.context_menu(|ui| folder_menu(ui, folder, Some(slot), out));
+                    }
+                    SidebarSlot::RootItem { browse_id, .. } | SidebarSlot::FolderItem { browse_id, .. } => {
+                        let Some(item) = app.saved.sidebar.resolve(browse_id, catalog) else {
+                            continue;
+                        };
+                        let (row, response) = ui.allocate_exact_size(vec2(area.width(), 46.0), Sense::click());
+                        let active = matches!(app.route(), Route::Browse(id) if *id == item.browse_id);
+                        let hover = hover_of(ui, &response);
+                        let art = Rect::from_center_size(row.center(), Vec2::splat(38.0));
+                        let radius = if item.is_artist { 19.0 } else { 7.0 };
+                        if active || hover > 0.0 {
+                            let stroke = if active { ACCENT } else { veil(0.25 * hover) };
+                            ui.painter()
+                                .rect_stroke(art.expand(2.5), radius + 2.0, Stroke::new(1.5, stroke), StrokeKind::Outside);
+                        }
+                        artwork(ui, &app.art, &item.thumb, art, radius);
+                        describe(&response, &item.title);
+                        let hint = if item.subtitle.is_empty() {
+                            item.title.clone()
+                        } else {
+                            format!("{}\n{}", item.title, item.subtitle)
+                        };
+                        let response = response.on_hover_text(hint);
+                        if response.clicked() {
+                            out.push(Action::Go(Route::Browse(item.browse_id.clone())));
+                        }
+                        response.context_menu(|ui| sidebar_item_menu(ui, app, item, Some(slot), out));
+                    }
+                }
+            }
+            ui.add_space(10.0);
+        });
+}
+
+fn sidebar(app: &mut App, ui: &mut Ui, out: &mut Vec<Action>) {
     let area = ui.max_rect();
-    ui.painter().vline(area.right() - 0.5, area.y_range(), Stroke::new(1.0, veil(0.06)));
-    let (brand, _) = ui.allocate_exact_size(vec2(area.width(), 76.0), Sense::hover());
-    let center = pos2(brand.left() + 37.0, brand.center().y + 3.0);
+    let catalog = app.catalog();
+    let collapsed = app.saved.sidebar.collapsed;
+
+    if collapsed {
+        ui.painter().vline(area.right() - 0.5, area.y_range(), Stroke::new(1.0, veil(0.06)));
+        sidebar_collapsed(app, ui, area, &catalog, out);
+        return;
+    }
+
+    let edge = Rect::from_min_max(pos2(area.right() - 4.0, area.top()), pos2(area.right() + 3.0, area.bottom()));
+    let resize = ui.interact(edge, Id::new("sidebar-resize"), Sense::click_and_drag());
+    let resize_hover = hover_of(ui, &resize);
+    let resizing = resize.dragged();
+    ui.ctx().data_mut(|data| data.insert_temp(Id::new("sidebar-resizing"), resizing));
+    if resize.hovered() || resizing {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+    if resizing && let Some(pointer) = ui.ctx().pointer_interact_pos() {
+        out.push(Action::SidebarWidth(pointer.x - area.left()));
+    }
+    if resize.double_clicked() {
+        out.push(Action::SidebarWidth(SIDEBAR_WIDTH_DEFAULT));
+    }
+    let line_color = if resizing {
+        ACCENT.gamma_multiply(0.75)
+    } else {
+        veil(0.06).lerp_to_gamma(ACCENT.gamma_multiply(0.5), resize_hover)
+    };
+    ui.painter().vline(area.right() - 0.5, area.y_range(), Stroke::new(1.0, line_color));
+
+    let (brand, _) = ui.allocate_exact_size(vec2(area.width(), 74.0), Sense::hover());
+    let center = pos2(brand.left() + 34.0, brand.center().y + 2.0);
     mark(ui, center, 12.0);
     ui.painter()
-        .text(pos2(center.x + 22.0, center.y), Align2::LEFT_CENTER, APP_NAME, display(29.0), TEXT);
+        .text(pos2(center.x + 22.0, center.y), Align2::LEFT_CENTER, APP_NAME, display(28.0), TEXT);
+    let collapse_slot = Rect::from_center_size(pos2(brand.right() - PANEL_TOGGLE_INSET, center.y), Vec2::splat(PANEL_TOGGLE_SIDE));
+    if panel_toggle(
+        ui,
+        collapse_slot,
+        Id::new("sidebar-collapse"),
+        icon::SIDEBAR_SIMPLE,
+        "Collapse sidebar (Ctrl+B)",
+    )
+    .clicked()
+    {
+        out.push(Action::SidebarCollapsed(true));
+    }
 
-    let count = |items: &[Item]| if items.is_empty() { String::new() } else { items.len().to_string() };
-    let links = [
+    let count = |n: usize| if n == 0 { String::new() } else { n.to_string() };
+    let mut links = vec![
         (icon::HOUSE, "Home", Route::Home, String::new()),
-        (icon::HEART, "Liked songs", Route::Liked, count(&app.saved.liked)),
-        (
+        (icon::BOOKS, "Library", Route::Library, count(catalog.len())),
+    ];
+    if app.saved.sidebar.show_liked {
+        links.push((icon::HEART, "Liked songs", Route::Liked, count(app.saved.liked.len())));
+    }
+    if app.saved.sidebar.show_recent {
+        links.push((
             icon::CLOCK_COUNTER_CLOCKWISE,
             "Recently played",
             Route::Recent,
-            count(&app.saved.recent),
-        ),
-    ];
+            count(app.saved.recent.len()),
+        ));
+    }
     for (symbol, text, route, trailing) in links {
         if nav_item(ui, symbol, text, *app.route() == route, &trailing).clicked() {
             out.push(Action::Go(route));
         }
     }
-    ui.add_space(18.0);
-    eyebrow(ui, "Library", 26.0);
+
+    ui.add_space(12.0);
+    let (header_row, _) = ui.allocate_exact_size(vec2(area.width(), 32.0), Sense::hover());
+    let section_title = match app.saved.sidebar.mode {
+        SidebarMode::Pinned => "PINNED",
+        SidebarMode::All => "LIBRARY",
+    };
+    let title_hit = Rect::from_min_max(
+        pos2(header_row.left() + 18.0, header_row.top()),
+        pos2(header_row.right() - 96.0, header_row.bottom()),
+    );
+    let title_resp = ui.interact(title_hit, Id::new("sidebar-section-link"), Sense::click());
+    let title_hover = hover_of(ui, &title_resp);
+    let title_tone = FAINT.lerp_to_gamma(TEXT, title_hover);
+    let format = TextFormat {
+        font_id: bold(11.0),
+        color: title_tone,
+        extra_letter_spacing: 1.3,
+        ..TextFormat::default()
+    };
+    let mut job = LayoutJob::default();
+    job.append(section_title, 0.0, format);
+    let galley = ui.painter().layout_job(job);
+    ui.painter().galley(
+        pos2(header_row.left() + 24.0, header_row.center().y - galley.size().y / 2.0),
+        galley,
+        title_tone,
+    );
+    describe(&title_resp, "Open Library");
+    if title_resp.on_hover_text("Open Library").clicked() {
+        out.push(Action::Go(Route::Library));
+    }
+
+    let mut btn_x = header_row.right() - 24.0;
+    let customize_slot = Rect::from_center_size(pos2(btn_x, header_row.center().y), Vec2::splat(26.0));
+    let customize_btn = icon_button(
+        ui,
+        customize_slot,
+        Id::new("sidebar-customize"),
+        icon::SLIDERS_HORIZONTAL,
+        glyph(14.0),
+        MUTED,
+        "Customize sidebar",
+    );
+    egui::Popup::menu(&customize_btn)
+        .gap(4.0)
+        .align(egui::RectAlign::BOTTOM_END)
+        .show(|ui| {
+            ui.set_width(MENU_WIDTH);
+            let pinned_mode = app.saved.sidebar.mode == SidebarMode::Pinned;
+            if menu_row(
+                ui,
+                if pinned_mode { icon::CHECK } else { "" },
+                glyph(15.0),
+                ACCENT,
+                "Pinned only (whitelist)",
+            )
+            .clicked()
+            {
+                out.push(Action::SidebarMode(SidebarMode::Pinned));
+                ui.close();
+            }
+            if menu_row(
+                ui,
+                if !pinned_mode { icon::CHECK } else { "" },
+                glyph(15.0),
+                ACCENT,
+                "All library items",
+            )
+            .clicked()
+            {
+                out.push(Action::SidebarMode(SidebarMode::All));
+                ui.close();
+            }
+            menu_divider(ui);
+            if switch_row(
+                ui,
+                vec2(MENU_WIDTH, 38.0),
+                icon::LIST_BULLETS,
+                "Compact rows",
+                app.saved.sidebar.compact,
+            ) {
+                out.push(Action::SidebarCompact(!app.saved.sidebar.compact));
+            }
+            if switch_row(
+                ui,
+                vec2(MENU_WIDTH, 38.0),
+                icon::FUNNEL_SIMPLE,
+                "Type filter bar",
+                app.saved.sidebar.show_filters,
+            ) {
+                out.push(Action::SidebarShowFilters(!app.saved.sidebar.show_filters));
+            }
+            if switch_row(
+                ui,
+                vec2(MENU_WIDTH, 38.0),
+                icon::SIDEBAR_SIMPLE,
+                "Collapse to rail",
+                app.saved.sidebar.collapsed,
+            ) {
+                out.push(Action::SidebarCollapsed(!app.saved.sidebar.collapsed));
+                ui.close();
+            }
+            menu_divider(ui);
+            if switch_row(
+                ui,
+                vec2(MENU_WIDTH, 38.0),
+                icon::HEART,
+                "Show Liked songs",
+                app.saved.sidebar.show_liked,
+            ) {
+                out.push(Action::SidebarShowLiked(!app.saved.sidebar.show_liked));
+            }
+            if switch_row(
+                ui,
+                vec2(MENU_WIDTH, 38.0),
+                icon::CLOCK_COUNTER_CLOCKWISE,
+                "Show Recently played",
+                app.saved.sidebar.show_recent,
+            ) {
+                out.push(Action::SidebarShowRecent(!app.saved.sidebar.show_recent));
+            }
+            menu_divider(ui);
+            if menu_row(ui, icon::BOOKS, glyph(16.0), MUTED, "Manage library").clicked() {
+                out.push(Action::Go(Route::Library));
+                ui.close();
+            }
+            if menu_row(ui, icon::ARROWS_COUNTER_CLOCKWISE, glyph(16.0), MUTED, "Reset sidebar").clicked() {
+                out.push(Action::SidebarReset);
+                ui.close();
+            }
+        });
+
+    btn_x -= 28.0;
+    let folder_slot = Rect::from_center_size(pos2(btn_x, header_row.center().y), Vec2::splat(26.0));
+    if icon_button(
+        ui,
+        folder_slot,
+        Id::new("sidebar-new-folder"),
+        icon::FOLDER_SIMPLE_PLUS,
+        glyph(15.0),
+        MUTED,
+        "New folder",
+    )
+    .clicked()
+    {
+        out.push(Action::OpenFolderEditor(None));
+    }
+
+    btn_x -= 28.0;
+    let search_active = app.sidebar_search_open || !app.sidebar_filter.is_empty();
+    let search_slot = Rect::from_center_size(pos2(btn_x, header_row.center().y), Vec2::splat(26.0));
+    if icon_button(
+        ui,
+        search_slot,
+        Id::new("sidebar-search-toggle"),
+        icon::MAGNIFYING_GLASS,
+        glyph(14.0),
+        if search_active { ACCENT } else { MUTED },
+        "Filter sidebar",
+    )
+    .clicked()
+    {
+        out.push(Action::SidebarToggleSearch);
+    }
+
+    if app.sidebar_search_open {
+        let (bar, _) = ui.allocate_exact_size(vec2(area.width(), 36.0), Sense::hover());
+        let field = bar.shrink2(vec2(14.0, 3.0));
+        let background = ui.painter().add(Shape::Noop);
+        ui.painter().text(
+            pos2(field.left() + 14.0, field.center().y),
+            Align2::CENTER_CENTER,
+            icon::MAGNIFYING_GLASS,
+            glyph(13.0),
+            FAINT,
+        );
+        let input = Rect::from_min_max(pos2(field.left() + 28.0, field.top()), pos2(field.right() - 28.0, field.bottom()));
+        let response = ui
+            .scope_builder(
+                UiBuilder::new().max_rect(input).layout(egui::Layout::left_to_right(Align::Center)),
+                |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.sidebar_filter)
+                            .id(Id::new("sidebar-filter"))
+                            .frame(false)
+                            .margin(Margin::ZERO)
+                            .desired_width(input.width())
+                            .font(sans(13.0))
+                            .text_color(TEXT)
+                            .hint_text(RichText::new("Filter sidebar...").color(FAINT)),
+                    )
+                },
+            )
+            .inner;
+        if std::mem::take(&mut app.sidebar_search_focus) {
+            response.request_focus();
+        }
+        if response.has_focus() && ui.input(|input| input.key_pressed(Key::Escape)) {
+            app.sidebar_filter.clear();
+            app.sidebar_search_open = false;
+        }
+        let focus = ui
+            .ctx()
+            .animate_bool_with_time(Id::new("sidebar-filter-focus"), response.has_focus(), 0.12);
+        ui.painter().set(
+            background,
+            RectShape::new(
+                field,
+                15.0,
+                veil(0.06 + 0.02 * focus),
+                Stroke::new(1.0, veil(0.08 + 0.32 * focus)),
+                StrokeKind::Inside,
+            ),
+        );
+        let clear = Rect::from_center_size(pos2(field.right() - 14.0, field.center().y), Vec2::splat(22.0));
+        if icon_button(
+            ui,
+            clear,
+            Id::new("sidebar-filter-clear"),
+            icon::X,
+            glyph(11.0),
+            MUTED,
+            "Close filter",
+        )
+        .clicked()
+        {
+            app.sidebar_filter.clear();
+            app.sidebar_search_open = false;
+        }
+    }
+
+    if app.saved.sidebar.show_filters {
+        let (bar, _) = ui.allocate_exact_size(vec2(area.width(), 32.0), Sense::hover());
+        let choices = [
+            (None, "All"),
+            (Some(ItemKind::Playlist), "Playlists"),
+            (Some(ItemKind::Album), "Albums"),
+            (Some(ItemKind::Artist), "Artists"),
+        ];
+        let galleys: Vec<_> = choices.iter().map(|(_, text)| fit(ui, text, medium(11.5), TEXT, 80.0, 1)).collect();
+        let room = bar.width() - 2.0 * SIDEBAR_CHIP_INSET;
+        let roomy =
+            |pad: f32, gap: f32| galleys.iter().map(|galley| galley.size().x + 2.0 * pad).sum::<f32>() + gap * (galleys.len() - 1) as f32;
+        let (pad, gap) = if roomy(SIDEBAR_CHIP_PAD, SIDEBAR_CHIP_GAP) <= room {
+            (SIDEBAR_CHIP_PAD, SIDEBAR_CHIP_GAP)
+        } else {
+            (SIDEBAR_CHIP_PAD_TIGHT, SIDEBAR_CHIP_GAP_TIGHT)
+        };
+        let mut x = bar.left() + SIDEBAR_CHIP_INSET;
+        for ((kind, text), galley) in choices.into_iter().zip(galleys) {
+            let active = app.sidebar_kind == kind;
+            let width = galley.size().x + 2.0 * pad;
+            let chip = Rect::from_min_size(pos2(x, bar.center().y - 12.0), vec2(width, 24.0));
+            let response = ui.interact(chip, Id::new(("sidebar-kind", text)), Sense::click());
+            let hover = hover_of(ui, &response);
+            let fill = if active {
+                ACCENT.gamma_multiply(0.2)
+            } else {
+                veil(0.05 + 0.04 * hover)
+            };
+            let ink = if active { ACCENT } else { MUTED.lerp_to_gamma(TEXT, hover) };
+            ui.painter().rect_filled(chip, 12.0, fill);
+            centered_galley(ui, chip, galley, ink);
+            describe(&response, text);
+            if response.clicked() {
+                out.push(Action::SidebarKindFilter(kind));
+            }
+            x += width + gap;
+        }
+    }
+
     let foot = Rect::from_min_max(pos2(area.left(), area.bottom() - ACCOUNT_HEIGHT), area.max);
     account(app, ui, foot, out);
     let lift = if app.update.is_some() { UPDATE_HEIGHT } else { 0.0 };
     let offer = Rect::from_min_max(pos2(area.left(), foot.top() - lift), foot.right_top());
     update_offer(app, ui, offer, out);
-    let pinned = &app.saved.pinned;
-    let own = app
-        .library
-        .iter()
-        .filter(|item| !pinned.iter().any(|saved| saved.browse_id == item.browse_id));
-    let entries: Vec<&Item> = pinned.iter().chain(own).collect();
-    if entries.is_empty() {
-        Frame::new().inner_margin(Margin::symmetric(26, 4)).show(ui, |ui| {
-            paragraph(ui, "Save an album, playlist or artist and it stays here.", sans(13.0), FAINT, 3);
+
+    let slots = app.saved.sidebar.visible_slots(&catalog, &app.sidebar_filter, app.sidebar_kind);
+    let filtering = !app.sidebar_filter.trim().is_empty() || app.sidebar_kind.is_some();
+
+    if slots.is_empty() {
+        Frame::new().inner_margin(Margin::symmetric(16, 8)).show(ui, |ui| {
+            let card_width = ui.available_width();
+            Frame::new()
+                .fill(veil(0.03))
+                .stroke(Stroke::new(1.0, veil(0.06)))
+                .corner_radius(10)
+                .inner_margin(Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_width((card_width - 28.0).max(80.0));
+                    if filtering {
+                        paragraph(ui, "No matching items in sidebar.", sans(12.5), MUTED, 2);
+                    } else if app.saved.sidebar.mode == SidebarMode::Pinned {
+                        paragraph(ui, "Your sidebar is clean.", medium(13.0), TEXT, 1);
+                        ui.add_space(4.0);
+                        paragraph(
+                            ui,
+                            "Pin playlists, albums, or artists from Library, or organize them into folders.",
+                            sans(12.0),
+                            FAINT,
+                            3,
+                        );
+                        ui.add_space(10.0);
+                        let (btn_row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+                        let open_btn = ui.interact(btn_row, Id::new("sidebar-open-library"), Sense::click());
+                        let hover = hover_of(ui, &open_btn);
+                        ui.painter().rect_filled(btn_row, 8.0, ACCENT.gamma_multiply(0.16 + 0.08 * hover));
+                        label(
+                            ui,
+                            btn_row.center(),
+                            Align2::CENTER_CENTER,
+                            "Open Library",
+                            medium(12.5),
+                            ACCENT,
+                            btn_row.width() - 12.0,
+                        );
+                        describe(&open_btn, "Open Library");
+                        if open_btn.clicked() {
+                            out.push(Action::Go(Route::Library));
+                        }
+                        if !catalog.is_empty() {
+                            ui.add_space(6.0);
+                            let (all_row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+                            let all_btn = ui.interact(all_row, Id::new("sidebar-show-all"), Sense::click());
+                            let all_hover = hover_of(ui, &all_btn);
+                            label(
+                                ui,
+                                all_row.center(),
+                                Align2::CENTER_CENTER,
+                                "Show all library items",
+                                sans(12.0),
+                                FAINT.lerp_to_gamma(TEXT, all_hover),
+                                all_row.width(),
+                            );
+                            describe(&all_btn, "Show all library items");
+                            if all_btn.clicked() {
+                                out.push(Action::SidebarMode(SidebarMode::All));
+                            }
+                        }
+                    } else {
+                        paragraph(ui, "Save an album, playlist or artist and it stays here.", sans(12.5), FAINT, 3);
+                    }
+                });
         });
         return;
     }
+
+    let compact = app.saved.sidebar.compact;
+    let item_height = if compact { SIDEBAR_COMPACT_ROW } else { SIDEBAR_ITEM_ROW };
+    let folder_height = if compact { SIDEBAR_FOLDER_COMPACT_ROW } else { SIDEBAR_FOLDER_ROW };
     let height = (offer.top() - ui.cursor().top()).max(0.0);
-    egui::ScrollArea::vertical().max_height(height).auto_shrink(false).show(ui, |ui| {
-        for item in entries {
-            let (slot, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
-            let rect = slot.shrink2(vec2(12.0, 1.0));
-            let active = matches!(app.route(), Route::Browse(id) if *id == item.browse_id);
-            let hover = hover_of(ui, &response);
-            ui.painter()
-                .rect_filled(rect, ROW_RADIUS, veil(if active { 0.08 } else { 0.05 * hover }));
-            let art = Rect::from_min_size(pos2(rect.left() + 8.0, rect.center().y - 20.0), Vec2::splat(40.0));
-            artwork(ui, &app.art, &item.thumb, art, if item.is_artist { 20.0 } else { 5.0 });
-            let (left, width) = (art.right() + 12.0, rect.right() - art.right() - 22.0);
-            let kind = if item.is_artist { "Artist" } else { item.subtitle.as_str() };
-            label(
-                ui,
-                pos2(left, rect.center().y - 9.0),
-                Align2::LEFT_CENTER,
-                &item.title,
-                medium(13.5),
-                TEXT,
-                width,
-            );
-            label(
-                ui,
-                pos2(left, rect.center().y + 9.0),
-                Align2::LEFT_CENTER,
-                kind,
-                sans(12.5),
-                MUTED,
-                width,
-            );
-            describe(&response, &item.title);
-            if response.clicked() {
-                out.push(Action::Go(Route::Browse(item.browse_id.clone())));
+    let can_drag = !filtering;
+
+    egui::ScrollArea::vertical()
+        .id_salt("sidebar-list")
+        .max_height(height)
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            let pointer = ui.ctx().pointer_interact_pos();
+            let grab_id = Id::new("sidebar-drag-grab");
+            let sense = if can_drag { Sense::click_and_drag() } else { Sense::click() };
+            let rows: Vec<(Rect, Response)> = slots
+                .iter()
+                .map(|slot| {
+                    let h = if slot.is_folder() { folder_height } else { item_height };
+                    ui.allocate_exact_size(vec2(ui.available_width(), h), sense)
+                })
+                .collect();
+            let rects: Vec<Rect> = rows.iter().map(|(rect, _)| *rect).collect();
+
+            let carried = can_drag
+                .then(|| rows.iter().position(|(_, response)| response.dragged() || response.drag_stopped()))
+                .flatten();
+            if let (Some((slot_rect, _)), Some(pointer)) = (rows.iter().find(|(_, response)| response.drag_started()), pointer) {
+                ui.data_mut(|data| data.insert_temp(grab_id, pointer.y - slot_rect.top()));
             }
-        }
-        ui.add_space(12.0);
-    });
+            let held = ui.data(|data| data.get_temp::<f32>(grab_id)).unwrap_or(item_height / 2.0);
+            let drag = carried.zip(pointer).map(|(from, pointer)| {
+                let lifted_top = pointer.y - held;
+                let lifted_mid = lifted_top + rects[from].height() / 2.0;
+                let (target, line, folder_hit) = sidebar_drop_target(&slots, &rects, from, lifted_mid);
+                (from, lifted_top, target, line, folder_hit)
+            });
+
+            let drop_folder = drag.as_ref().and_then(|(_, _, _, _, hit)| *hit);
+            for (index, (slot_rect, response)) in rows.iter().enumerate() {
+                if !ui.is_rect_visible(*slot_rect) {
+                    continue;
+                }
+                let is_dragged = drag.as_ref().is_some_and(|(from, ..)| *from == index);
+                let rect = slot_rect.shrink2(vec2(10.0, 1.0));
+                let hover = if drag.is_some() { 0.0 } else { hover_of(ui, response) };
+                match &slots[index] {
+                    SidebarSlot::Folder { folder_id, .. } => {
+                        let Some(folder) = app.saved.sidebar.folder(folder_id) else {
+                            continue;
+                        };
+                        let highlight = drop_folder == Some(index);
+                        if is_dragged {
+                            ui.painter().rect_filled(rect, ROW_RADIUS, veil(0.03));
+                        } else {
+                            paint_sidebar_folder(ui, rect, folder, hover, highlight, false);
+                        }
+                        describe(response, &folder.name);
+                        if response.clicked() {
+                            out.push(Action::ToggleFolder(folder.id.clone()));
+                        }
+                        response.context_menu(|ui| folder_menu(ui, folder, Some(&slots[index]), out));
+                    }
+                    SidebarSlot::RootItem { browse_id, .. } => {
+                        let Some(item) = app.saved.sidebar.resolve(browse_id, &catalog) else {
+                            continue;
+                        };
+                        let active = matches!(app.route(), Route::Browse(id) if *id == item.browse_id);
+                        if is_dragged {
+                            ui.painter().rect_filled(rect, ROW_RADIUS, veil(0.03));
+                        } else {
+                            paint_sidebar_row(
+                                ui,
+                                &app.art,
+                                rect,
+                                item,
+                                SidebarRowStyle {
+                                    active,
+                                    compact,
+                                    indented: false,
+                                    hover,
+                                    folder_tint: None,
+                                    ghost: false,
+                                },
+                            );
+                        }
+                        describe(response, &item.title);
+                        if response.clicked() {
+                            out.push(Action::Go(Route::Browse(item.browse_id.clone())));
+                        }
+                        response.context_menu(|ui| sidebar_item_menu(ui, app, item, Some(&slots[index]), out));
+                    }
+                    SidebarSlot::FolderItem { folder_id, browse_id, .. } => {
+                        let Some(item) = app.saved.sidebar.resolve(browse_id, &catalog) else {
+                            continue;
+                        };
+                        let tint = app.saved.sidebar.folder(folder_id).map(|folder| folder_color(folder.color));
+                        let active = matches!(app.route(), Route::Browse(id) if *id == item.browse_id);
+                        if is_dragged {
+                            ui.painter().rect_filled(rect, ROW_RADIUS, veil(0.03));
+                        } else {
+                            paint_sidebar_row(
+                                ui,
+                                &app.art,
+                                rect,
+                                item,
+                                SidebarRowStyle {
+                                    active,
+                                    compact,
+                                    indented: true,
+                                    hover,
+                                    folder_tint: tint,
+                                    ghost: false,
+                                },
+                            );
+                        }
+                        describe(response, &item.title);
+                        if response.clicked() {
+                            out.push(Action::Go(Route::Browse(item.browse_id.clone())));
+                        }
+                        response.context_menu(|ui| sidebar_item_menu(ui, app, item, Some(&slots[index]), out));
+                    }
+                }
+            }
+
+            if let Some((from, lifted_top, target, line, _)) = drag {
+                let (slot_rect, response) = &rows[from];
+                if response.drag_stopped() {
+                    out.push(Action::SidebarReorder(slots[from].clone(), target));
+                    return;
+                }
+                if let Some((line_y, indented)) = line {
+                    let left = slot_rect.left() + if indented { 28.0 } else { 14.0 };
+                    let right = slot_rect.right() - 14.0;
+                    ui.painter().hline(left..=right, line_y, Stroke::new(2.0, ACCENT));
+                    ui.painter().circle_filled(pos2(left, line_y), 3.0, ACCENT);
+                }
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                let lifted = slot_rect
+                    .translate(vec2(0.0, lifted_top - slot_rect.top()))
+                    .shrink2(vec2(10.0, 1.0));
+                let layer = egui::LayerId::new(egui::Order::Tooltip, grab_id);
+                let ghost = ui.new_child(UiBuilder::new().layer_id(layer).max_rect(lifted));
+                let shadow = Shadow {
+                    offset: [0, 8],
+                    blur: 22,
+                    spread: 0,
+                    color: shade(0.55),
+                };
+                ghost.painter().add(shadow.as_shape(lifted, ROW_RADIUS));
+                ghost.painter().rect_filled(lifted, ROW_RADIUS, FLOATING);
+                ghost
+                    .painter()
+                    .rect_stroke(lifted, ROW_RADIUS, Stroke::new(1.0, veil(0.12)), StrokeKind::Inside);
+                match &slots[from] {
+                    SidebarSlot::Folder { folder_id, .. } => {
+                        if let Some(folder) = app.saved.sidebar.folder(folder_id) {
+                            paint_sidebar_folder(&ghost, lifted, folder, 0.0, false, true);
+                        }
+                    }
+                    SidebarSlot::RootItem { browse_id, .. } | SidebarSlot::FolderItem { browse_id, .. } => {
+                        if let Some(item) = app.saved.sidebar.resolve(browse_id, &catalog) {
+                            paint_sidebar_row(
+                                &ghost,
+                                &app.art,
+                                lifted,
+                                item,
+                                SidebarRowStyle {
+                                    active: false,
+                                    compact,
+                                    indented: false,
+                                    hover: 0.0,
+                                    folder_tint: None,
+                                    ghost: true,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            ui.add_space(12.0);
+        });
 }
 
 fn update_offer(app: &App, ui: &Ui, slot: Rect, out: &mut Vec<Action>) {
@@ -2813,7 +5154,39 @@ fn browser_logo(ui: &Ui, name: &str, rect: Rect, ink: Color32) {
     }
 }
 
-fn queue_panel(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
+fn queue_panel(app: &App, ui: &mut Ui, resizable: bool, out: &mut Vec<Action>) {
+    let area = ui.max_rect();
+    if resizable {
+        let edge = Rect::from_min_max(pos2(area.left() - 3.0, area.top()), pos2(area.left() + 4.0, area.bottom()));
+        let resize = ui.interact(edge, Id::new("queue-resize"), Sense::click_and_drag());
+        if resize.hovered() || resize.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if resize.dragged()
+            && let Some(pointer) = ui.ctx().pointer_interact_pos()
+        {
+            out.push(Action::QueueWidth(ui.ctx().content_rect().right() - pointer.x));
+        }
+        if resize.double_clicked() {
+            out.push(Action::QueueWidth(QUEUE_WIDTH_DEFAULT));
+        }
+    }
+    queue_contents(app, ui, out);
+    let collapse_slot = panel_toggle_slot(area.top(), ui.ctx().content_rect().right());
+    if panel_toggle(
+        ui,
+        collapse_slot,
+        Id::new("queue-collapse"),
+        icon::CARET_LINE_RIGHT,
+        "Hide now playing panel",
+    )
+    .clicked()
+    {
+        out.push(Action::ToggleQueue);
+    }
+}
+
+fn queue_contents(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     let area = ui.max_rect();
     let cover = app.now_playing().map(|item| app.saved.covers.of(item));
     let tint = cover
@@ -2892,8 +5265,7 @@ fn tab(ui: &Ui, at: Pos2, text: &str, active: bool) -> Response {
     let hover = hover_of(ui, &response);
     ui.painter().rect_filled(rect, 16.0, veil(if active { 0.12 } else { 0.06 * hover }));
     let ink = if active { TEXT } else { MUTED.lerp_to_gamma(TEXT, hover) };
-    ui.painter()
-        .galley_with_override_text_color(rect.center() - galley.size() / 2.0, galley, ink);
+    centered_galley(ui, rect, galley, ink);
     describe(&response, text);
     response
 }
@@ -3661,6 +6033,119 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_among_filtered_rows_targets_the_real_root_position() {
+        let make = |id: &str, title: &str| crate::ytm::Item {
+            browse_id: id.to_owned(),
+            title: title.to_owned(),
+            subtitle: "Playlist".to_owned(),
+            ..crate::ytm::Item::default()
+        };
+        let items = [
+            make("VL0", "red"),
+            make("VL1", "blue one"),
+            make("VL2", "green"),
+            make("VL3", "blue two"),
+        ];
+        let mut layout = crate::library::SidebarLayout::default();
+        for item in &items {
+            layout.pin_item(item);
+        }
+        let catalog = Catalog::build(&items, &[]);
+        let slots = layout.visible_slots(&catalog, "blue", None);
+        assert_eq!(slots.len(), 2);
+        let rects = vec![
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 50.0)),
+            Rect::from_min_size(pos2(0.0, 50.0), vec2(220.0, 50.0)),
+        ];
+        let (target, ..) = sidebar_drop_target(&slots, &rects, 1, 10.0);
+        assert_eq!(target, DropTarget::Root(1));
+        layout.reorder(&slots[1], target, &catalog);
+        let order: Vec<String> = layout
+            .visible_slots(&catalog, "", None)
+            .into_iter()
+            .filter_map(|slot| match slot {
+                SidebarSlot::RootItem { browse_id, .. } => Some(browse_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, ["VL0", "VL3", "VL1", "VL2"]);
+    }
+
+    fn folder_drop_fixture(open: bool) -> (crate::library::SidebarLayout, Catalog, String) {
+        let make = |id: &str| crate::ytm::Item {
+            browse_id: id.to_owned(),
+            title: id.to_owned(),
+            subtitle: "Playlist".to_owned(),
+            ..crate::ytm::Item::default()
+        };
+        let items = [make("VLa"), make("VLb"), make("VLc")];
+        let mut layout = crate::library::SidebarLayout::default();
+        let folder = layout.create_folder("Mix");
+        layout.add_to_folder(&folder, &items[0]);
+        layout.add_to_folder(&folder, &items[1]);
+        layout.pin_item(&items[2]);
+        layout.folders[0].open = open;
+        (layout, Catalog::build(&items, &[]), folder)
+    }
+
+    fn drop_at(pointer_y: f32, open: bool) -> (Vec<String>, DropTarget, bool) {
+        let (mut layout, catalog, folder) = folder_drop_fixture(open);
+        let slots = layout.visible_slots(&catalog, "", None);
+        let rects: Vec<Rect> = (0..slots.len())
+            .map(|index| Rect::from_min_size(pos2(0.0, 36.0 * index as f32), vec2(220.0, 36.0)))
+            .collect();
+        let from = slots.len() - 1;
+        let (target, ..) = sidebar_drop_target(&slots, &rects, from, pointer_y);
+        layout.reorder(&slots[from], target.clone(), &catalog);
+        let folder = layout.folder(&folder).unwrap();
+        (folder.items.clone(), target, folder.open)
+    }
+
+    #[test]
+    fn dropping_on_the_folder_header_appends_and_dropping_on_an_indicator_inserts_there() {
+        let (items, target, _) = drop_at(18.0, true);
+        assert!(matches!(target, DropTarget::IntoFolder(_)));
+        assert_eq!(items, ["VLa", "VLb", "VLc"]);
+
+        let (items, target, _) = drop_at(34.0, true);
+        assert!(matches!(target, DropTarget::InFolder(_, 0)));
+        assert_eq!(items, ["VLc", "VLa", "VLb"]);
+
+        let (items, target, _) = drop_at(70.0, true);
+        assert!(matches!(target, DropTarget::InFolder(_, 1)));
+        assert_eq!(items, ["VLa", "VLc", "VLb"]);
+
+        let (items, target, _) = drop_at(106.0, true);
+        assert!(matches!(target, DropTarget::InFolder(_, 2)));
+        assert_eq!(items, ["VLa", "VLb", "VLc"]);
+    }
+
+    #[test]
+    fn dropping_on_a_collapsed_folder_appends_and_opens_it_while_its_lower_edge_stays_outside() {
+        let (items, target, open) = drop_at(18.0, false);
+        assert!(matches!(target, DropTarget::IntoFolder(_)));
+        assert_eq!(items, ["VLa", "VLb", "VLc"]);
+        assert!(open);
+
+        let (items, target, open) = drop_at(34.0, false);
+        assert!(matches!(target, DropTarget::Root(_)));
+        assert_eq!(items, ["VLa", "VLb"]);
+        assert!(!open);
+    }
+
+    #[test]
+    fn chip_text_is_centered_on_whole_pixels_and_sits_a_hair_above_the_row_middle() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let origin = centered_text_origin(pos2(100.3, 50.6), vec2(41.7, 15.0), scale);
+            assert!(((origin.x * scale).fract()).abs() < 1e-3 || ((origin.x * scale).fract() - 1.0).abs() < 1e-3);
+            assert!(((origin.y * scale).fract()).abs() < 1e-3 || ((origin.y * scale).fract() - 1.0).abs() < 1e-3);
+            let middle = origin.y + 7.5;
+            assert!(middle <= 50.6 + 0.5 / scale && middle >= 50.6 - 1.0 - 0.5 / scale);
+            assert!((origin.x + 41.7 / 2.0 - 100.3).abs() <= 0.5 / scale + 1e-3);
+        }
+    }
+
+    #[test]
     fn keeps_the_now_playing_tint_dark_enough_for_white_text() {
         let contrast = |ink: Color32, paper: Color32| (luminance(ink) + 0.05) / (luminance(paper) + 0.05);
         let pale = rgb(0x86917F);
@@ -3693,5 +6178,49 @@ mod tests {
                 .any(|glyph| glyph.uv_rect.size == Vec2::ZERO);
             assert!(!blank, "{name} cannot draw {text:?}");
         }
+    }
+
+    #[test]
+    fn sidebar_drop_target_resolves_root_and_folder_drops() {
+        let slots = vec![
+            SidebarSlot::Folder {
+                root_index: 0,
+                folder_id: "f1".to_owned(),
+            },
+            SidebarSlot::FolderItem {
+                folder_id: "f1".to_owned(),
+                item_index: 0,
+                browse_id: "a".to_owned(),
+            },
+            SidebarSlot::RootItem {
+                root_index: 1,
+                browse_id: "b".to_owned(),
+            },
+        ];
+        let rects = vec![
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 40.0)),
+            Rect::from_min_size(pos2(0.0, 40.0), vec2(220.0, 50.0)),
+            Rect::from_min_size(pos2(0.0, 90.0), vec2(220.0, 50.0)),
+        ];
+
+        let (target, line, hit) = sidebar_drop_target(&slots, &rects, 2, 20.0);
+        assert_eq!(target, DropTarget::IntoFolder("f1".to_owned()));
+        assert_eq!(line, None);
+        assert_eq!(hit, Some(0));
+
+        let (target, line, hit) = sidebar_drop_target(&slots, &rects, 2, 50.0);
+        assert_eq!(target, DropTarget::InFolder("f1".to_owned(), 0));
+        assert_eq!(line, Some((40.0, true)));
+        assert_eq!(hit, None);
+
+        let (target, line, hit) = sidebar_drop_target(&slots, &rects, 1, 130.0);
+        assert_eq!(target, DropTarget::Root(2));
+        assert_eq!(line, Some((140.0, false)));
+        assert_eq!(hit, None);
+
+        let (target, line, hit) = sidebar_drop_target(&slots, &rects, 0, 50.0);
+        assert_eq!(target, DropTarget::Root(1));
+        assert_eq!(line, Some((90.0, false)));
+        assert_eq!(hit, None);
     }
 }

@@ -48,6 +48,7 @@ const HOME_ORDER: usize = 200;
 const PERSONAL_PAGES: usize = 3;
 const LIKED_SONGS: &str = "VLLM";
 const TRACK_PAGES: usize = 50;
+const LIBRARY_PAGES: usize = 50;
 const REJECTION_RECHECK_DELAY: Duration = Duration::from_secs(2);
 const REJECTION_CONFIRM_AFTER: Duration = Duration::from_secs(30);
 const REJECTION_STALE_AFTER: Duration = Duration::from_secs(600);
@@ -68,6 +69,15 @@ const UNUSED_KEYS: [&str; 14] = [
     "badges",
     "playerOverlays",
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LibrarySource {
+    Playlists,
+    Albums,
+    Artists,
+}
+
+pub type LibraryParts = Vec<(LibrarySource, Option<Vec<Item>>)>;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Item {
@@ -389,18 +399,48 @@ impl Client {
         Ok(single_song_cover(&watch_page))
     }
 
-    pub fn library(&self) -> Result<Vec<Item>, String> {
-        let page = self.browse("FEmusic_liked_playlists", &|_| {})?;
-        let saved: Vec<Item> = page
-            .sections
-            .into_iter()
-            .flat_map(|section| section.items)
-            .filter(|item| !item.is_song())
-            .collect();
-        if saved.is_empty() {
+    pub fn library(&self) -> Result<LibraryParts, String> {
+        let sources = [
+            (LibrarySource::Playlists, "FEmusic_liked_playlists"),
+            (LibrarySource::Albums, "FEmusic_liked_albums"),
+            (LibrarySource::Artists, "FEmusic_library_corpus_artists"),
+        ];
+        let results: Vec<(LibrarySource, Result<Vec<Item>, String>)> = std::thread::scope(|scope| {
+            let jobs: Vec<_> = sources
+                .into_iter()
+                .map(|(source, browse_id)| (source, scope.spawn(move || self.library_source(source, browse_id))))
+                .collect();
+            jobs.into_iter()
+                .map(|(source, job)| {
+                    let result = job
+                        .join()
+                        .unwrap_or_else(|_| Err("The library request stopped unexpectedly".to_owned()));
+                    (source, result)
+                })
+                .collect()
+        });
+        if results.iter().all(|(_, result)| result.is_err()) {
+            let first = results.into_iter().find_map(|(_, result)| result.err());
+            return Err(first.unwrap_or_default());
+        }
+        let parts: LibraryParts = results.into_iter().map(|(source, result)| (source, result.ok())).collect();
+        if parts.iter().all(|(_, items)| items.as_ref().is_some_and(Vec::is_empty)) {
             self.account()?;
         }
-        Ok(saved)
+        Ok(parts)
+    }
+
+    fn library_source(&self, source: LibrarySource, browse_id: &str) -> Result<Vec<Item>, String> {
+        let response = self.music("browse", json!({ "browseId": browse_id }), &[])?;
+        let mut token = continuation(&response);
+        let mut items = normalize_library_items(parse_page(&response), source);
+        for _ in 1..LIBRARY_PAGES {
+            let Some(next) = token.take() else { break };
+            let response = self.more(&next)?;
+            items.extend(normalize_library_items(parse_page(&response), source));
+            token = continuation(&response);
+        }
+        Ok(items)
     }
 
     fn feed(&self, order: usize, pages: usize, emit: &(dyn Fn(usize, Vec<Section>) + Sync)) -> Result<(), String> {
@@ -1011,6 +1051,27 @@ pub fn sized(url: &str, px: u32) -> String {
 pub fn sharper(url: &str, px: u32) -> Option<String> {
     let id = url.split_once(VIDEO_FRAME_HOST)?.1.strip_prefix("/vi/")?.split('/').next()?;
     (px > LISTED_FRAME_SIDE).then(|| format!("https://{VIDEO_FRAME_HOST}/vi/{id}/{SHARP_FRAME}"))
+}
+
+fn normalize_library_items(page: Page, source: LibrarySource) -> Vec<Item> {
+    page.sections
+        .into_iter()
+        .flat_map(|section| section.items)
+        .filter(|item| !item.is_song() && !item.browse_id.is_empty() && item.browse_id != LIKED_SONGS)
+        .map(|mut item| {
+            if let Some(channel) = item.browse_id.strip_prefix("MPLA") {
+                item.browse_id = channel.to_owned();
+                item.is_artist = true;
+            }
+            if source == LibrarySource::Artists {
+                item.is_artist = true;
+            }
+            if source == LibrarySource::Albums && item.subtitle.is_empty() {
+                item.subtitle = "Album".to_owned();
+            }
+            item
+        })
+        .collect()
 }
 
 pub fn parse_page(response: &Value) -> Page {
@@ -1813,5 +1874,83 @@ mod tests {
         );
         assert_eq!(song("(Official Video)", "Someone"), pair("(Official Video)", "Someone"));
         assert_eq!(song("Çağrı (Lyric Video)", "Şehinşah"), pair("Çağrı", "Şehinşah"));
+    }
+
+    #[test]
+    fn normalizes_library_items_by_source_and_skips_liked_songs_playlist() {
+        let make = |id: &str, subtitle: &str| Item {
+            title: id.to_owned(),
+            subtitle: subtitle.to_owned(),
+            browse_id: id.to_owned(),
+            ..Item::default()
+        };
+        let page = Page {
+            sections: vec![Section {
+                title: String::new(),
+                layout: Layout::Cards,
+                items: vec![make("VLLM", "Playlist"), make("MPLAUC123", "")],
+                all: None,
+                brief: None,
+            }],
+            ..Page::default()
+        };
+        let artists = normalize_library_items(page, LibrarySource::Artists);
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].browse_id, "UC123");
+        assert!(artists[0].is_artist);
+
+        let albums_page = Page {
+            sections: vec![Section {
+                title: String::new(),
+                layout: Layout::Cards,
+                items: vec![make("MPREb_1", "")],
+                all: None,
+                brief: None,
+            }],
+            ..Page::default()
+        };
+        let albums = normalize_library_items(albums_page, LibrarySource::Albums);
+        assert_eq!(albums[0].subtitle, "Album");
+    }
+
+    #[test]
+    fn follows_the_grid_token_to_read_a_library_larger_than_one_page() {
+        let card = |id: &str| {
+            json!({ "musicTwoRowItemRenderer": {
+                "title": { "runs": [{ "text": id }] },
+                "navigationEndpoint": { "browseEndpoint": { "browseId": id } },
+            } })
+        };
+        let first = json!({ "contents": { "singleColumnBrowseResultsRenderer": { "tabs": [{ "tabRenderer": { "content": {
+            "sectionListRenderer": { "contents": [{ "gridRenderer": {
+                "items": [card("VLPL1"), card("VLPL2")],
+                "continuations": [{ "nextContinuationData": { "continuation": "next-page" } }],
+            } }] },
+        } } }] } } });
+        assert_eq!(continuation(&first).as_deref(), Some("next-page"));
+        let first_ids: Vec<String> = normalize_library_items(parse_page(&first), LibrarySource::Playlists)
+            .into_iter()
+            .map(|item| item.browse_id)
+            .collect();
+        assert_eq!(first_ids, ["VLPL1", "VLPL2"]);
+
+        let last = json!({ "continuationContents": { "gridContinuation": { "items": [card("VLPL3"), card("VLLM")] } } });
+        let last_ids: Vec<String> = normalize_library_items(parse_page(&last), LibrarySource::Playlists)
+            .into_iter()
+            .map(|item| item.browse_id)
+            .collect();
+        assert_eq!(last_ids, ["VLPL3"]);
+        assert_eq!(continuation(&last), None);
+    }
+
+    #[test]
+    fn an_empty_subscriptions_page_yields_no_artists_and_no_token() {
+        let empty = json!({ "contents": { "singleColumnBrowseResultsRenderer": { "tabs": [{ "tabRenderer": { "content": {
+            "sectionListRenderer": { "contents": [{ "itemSectionRenderer": { "contents": [{ "messageRenderer": {
+                "text": { "runs": [{ "text": "No subscriptions yet" }] },
+            } }] } }] },
+        } } }] } } });
+        assert!(normalize_library_items(parse_page(&empty), LibrarySource::Artists).is_empty());
+        assert_eq!(continuation(&empty), None);
     }
 }

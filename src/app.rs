@@ -2,6 +2,10 @@ use crate::art::Art;
 use crate::auth;
 use crate::discord::{Discord, Headline};
 use crate::hotkeys::{self, Combo, Command, Hotkeys};
+use crate::library::{
+    self, Catalog, DropTarget, ItemKind, LibrarySort, LibraryTab, LibraryView, SidebarLayout, SidebarMode, SidebarSlot,
+    usable_sidebar_width,
+};
 use crate::media::Media;
 use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
@@ -9,7 +13,7 @@ use crate::tray::{self, Closing, Tray};
 use crate::ui;
 use crate::update::{self, Plan};
 use crate::wake;
-use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
+use crate::ytm::{Account, Client, Item, LibraryParts, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
 use serde::{Deserialize, Serialize};
@@ -38,11 +42,15 @@ pub const OVERLAY_OPACITY_MIN: f32 = 0.3;
 const OVERLAY_OPACITY_DEFAULT: f32 = 0.9;
 const WINDOW_KEY: &str = "window";
 pub const WINDOW_SIZE: [f32; 2] = [1360.0, 860.0];
+pub const QUEUE_WIDTH_DEFAULT: f32 = 336.0;
+pub const QUEUE_WIDTH_MIN: f32 = 280.0;
+pub const QUEUE_WIDTH_MAX: f32 = 480.0;
 pub const WINDOW_MIN: [f32; 2] = [940.0, 600.0];
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Route {
     Home,
+    Library,
     Search(String),
     Browse(String),
     Liked,
@@ -72,8 +80,10 @@ pub struct Saved {
     pub signed_out_liked: Option<Vec<Item>>,
     pub recent: Vec<Item>,
     pub pinned: Vec<Item>,
+    pub sidebar: SidebarLayout,
     pub visitor: String,
     pub queue_open: bool,
+    pub queue_width: f32,
     pub shuffle: bool,
     pub repeat: Repeat,
     pub account: Option<Account>,
@@ -147,6 +157,19 @@ pub struct SignIn {
     pub picking: bool,
 }
 
+pub struct FolderEditor {
+    pub id: Option<String>,
+    pub name: String,
+    pub color: u8,
+    pub focus: bool,
+}
+
+pub struct TagEditor {
+    pub item: Item,
+    pub draft: String,
+    pub focus: bool,
+}
+
 impl Default for Saved {
     fn default() -> Self {
         Self {
@@ -155,8 +178,10 @@ impl Default for Saved {
             signed_out_liked: None,
             recent: Vec::new(),
             pinned: Vec::new(),
+            sidebar: SidebarLayout::default(),
             visitor: String::new(),
             queue_open: true,
+            queue_width: QUEUE_WIDTH_DEFAULT,
             shuffle: false,
             repeat: Repeat::Off,
             account: None,
@@ -229,7 +254,42 @@ pub enum Action {
     Like(Item),
     Share(Item),
     Pin(Item),
+    ToggleSidebarPin(Item),
+    SidebarMode(SidebarMode),
+    SidebarCompact(bool),
+    SidebarCollapsed(bool),
+    SidebarWidth(f32),
+    SidebarShowLiked(bool),
+    SidebarShowRecent(bool),
+    SidebarShowFilters(bool),
+    SidebarKindFilter(Option<ItemKind>),
+    SidebarToggleSearch,
+    SidebarReorder(SidebarSlot, DropTarget),
+    SidebarMoveStep(SidebarSlot, isize),
+    SidebarReset,
+    ToggleFolder(String),
+    OpenFolderEditor(Option<String>),
+    CloseFolderEditor,
+    SaveFolder {
+        id: Option<String>,
+        name: String,
+        color: u8,
+    },
+    SetFolderColor(String, u8),
+    DeleteFolder(String),
+    AddToFolder(String, Item),
+    RemoveFromFolder(String, String),
+    OpenTagEditor(Item),
+    CloseTagEditor,
+    AddTag(String, String),
+    RemoveTag(String, String),
+    LibraryTab(LibraryTab),
+    LibraryView(LibraryView),
+    LibrarySort(LibrarySort),
+    LibraryTag(Option<String>),
+    LibraryFolder(Option<String>),
     ToggleQueue,
+    QueueWidth(f32),
     ToggleShuffle,
     CycleRepeat,
     OpenSignIn,
@@ -276,7 +336,7 @@ enum Event {
     FullSection(Route, usize, Target, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     AccountRestored(String, Result<Account, String>),
-    Library(Vec<Item>),
+    Library(LibraryParts),
     Accounts(Vec<Account>),
     Liked(Vec<Item>),
     LikeRejected(Item, String),
@@ -315,6 +375,17 @@ pub struct App {
     speaker: Speaker,
     synced: u64,
     pub sign_in: Option<SignIn>,
+    pub folder_editor: Option<FolderEditor>,
+    pub tag_editor: Option<TagEditor>,
+    pub sidebar_filter: String,
+    pub sidebar_search_open: bool,
+    pub sidebar_search_focus: bool,
+    pub sidebar_kind: Option<ItemKind>,
+    pub library_tab: LibraryTab,
+    pub library_filter: String,
+    pub library_tag: Option<String>,
+    pub library_folder: Option<String>,
+    catalog: Arc<Catalog>,
     pub library: Vec<Item>,
     pub accounts: Vec<Account>,
     pub player: Status,
@@ -353,6 +424,11 @@ impl App {
         ui::install(&cc.egui_ctx);
         wake::point_at_window(cc.egui_ctx.clone());
         let mut saved = starting_state(cc);
+        let returning_user = saved.account.is_some() || !saved.pinned.is_empty() || !saved.recent.is_empty() || !saved.liked.is_empty();
+        saved.sidebar.migrate(&saved.pinned, returning_user);
+        let catalog = Arc::new(Catalog::build(&saved.pinned, &[]));
+        saved.sidebar.width = usable_sidebar_width(saved.sidebar.width);
+        saved.queue_width = usable_queue_width(saved.queue_width);
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
         if !yt.signed_in() {
@@ -413,6 +489,17 @@ impl App {
             speaker,
             synced: 0,
             sign_in: None,
+            folder_editor: None,
+            tag_editor: None,
+            sidebar_filter: String::new(),
+            sidebar_search_open: false,
+            sidebar_search_focus: false,
+            sidebar_kind: None,
+            library_tab: LibraryTab::All,
+            library_filter: String::new(),
+            library_tag: None,
+            library_folder: None,
+            catalog,
             library: Vec::new(),
             accounts: Vec::new(),
             player: status,
@@ -577,6 +664,7 @@ impl App {
     fn refresh(&mut self) {
         self.pages.clear();
         self.library.clear();
+        self.rebuild_catalog();
         self.ensure(&self.route().clone());
         self.load_library();
         self.restore_account();
@@ -648,8 +736,16 @@ impl App {
         self.saved.current.is_some() && !self.player.paused()
     }
 
+    pub fn catalog(&self) -> Arc<Catalog> {
+        Arc::clone(&self.catalog)
+    }
+
+    fn rebuild_catalog(&mut self) {
+        self.catalog = Arc::new(Catalog::build(&self.saved.pinned, &self.library));
+    }
+
     fn ensure(&mut self, route: &Route) {
-        if self.pages.contains_key(route) || matches!(route, Route::Liked | Route::Recent | Route::Settings) {
+        if self.pages.contains_key(route) || matches!(route, Route::Library | Route::Liked | Route::Recent | Route::Settings) {
             return;
         }
         if self.pages.len() >= CACHED_PAGES {
@@ -682,7 +778,7 @@ impl App {
                     let _ = sender.send(Event::Page(route.clone(), Ok(Box::new(page.clone()))));
                     wake::wake();
                 }),
-                Route::Liked | Route::Recent | Route::Settings => return,
+                Route::Library | Route::Liked | Route::Recent | Route::Settings => return,
             };
             let _ = sender.send(Event::Page(route, result.map(Box::new)));
             wake::wake();
@@ -800,7 +896,12 @@ impl App {
                     }
                 }
                 Event::Page(route, Err(message)) => drop(self.pages.insert(route, Load::Failed(message))),
-                Event::Library(items) => self.library = items,
+                Event::Library(parts) => {
+                    self.library = library::merge_library(&self.library, parts);
+                    self.rebuild_catalog();
+                    self.saved.sidebar.refresh_metadata(&self.catalog);
+                    self.saved.sidebar.forget_missing(&self.catalog);
+                }
                 Event::Accounts(accounts) if self.yt.signed_in() => self.accounts = accounts,
                 Event::Accounts(_) => {}
                 Event::Liked(items) if self.yt.signed_in() => {
@@ -994,10 +1095,14 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut out = Vec::new();
-        let free = !ctx.wants_keyboard_input() && ctx.memory(|memory| memory.focused().is_none());
+        let ctx_wants_keyboard = ctx.wants_keyboard_input();
+        let free = !ctx_wants_keyboard && ctx.memory(|memory| memory.focused().is_none());
         ctx.input_mut(|input| {
             if input.consume_key(Modifiers::COMMAND, Key::K) || (free && input.consume_key(Modifiers::NONE, Key::Slash)) {
                 self.focus_search = true;
+            }
+            if !ctx_wants_keyboard && input.consume_key(Modifiers::COMMAND, Key::B) {
+                out.push(Action::SidebarCollapsed(!self.saved.sidebar.collapsed));
             }
             if input.consume_key(Modifiers::ALT, Key::ArrowLeft) || input.pointer.button_pressed(PointerButton::Extra1) {
                 out.push(Action::Back);
@@ -1054,8 +1159,12 @@ impl App {
             }
             Action::Reload => {
                 let route = self.route().clone();
-                self.pages.remove(&route);
-                self.ensure(&route);
+                if route == Route::Library {
+                    self.load_library();
+                } else {
+                    self.pages.remove(&route);
+                    self.ensure(&route);
+                }
             }
             Action::Play(items, index) => {
                 let growing = self.growing_list(&items);
@@ -1123,8 +1232,163 @@ impl App {
                 self.ctx.copy_text(link);
                 self.notify("Copied share link");
             }
-            Action::Pin(item) => toggle(&mut self.saved.pinned, item),
+            Action::Pin(item) => {
+                let was_saved = self.saved.pinned.iter().any(|known| known.key() == item.key());
+                toggle(&mut self.saved.pinned, item.clone());
+                self.rebuild_catalog();
+                if was_saved {
+                    if !self.library.iter().any(|remote| remote.browse_id == item.browse_id) {
+                        self.saved.sidebar.unpin_item(&item.browse_id);
+                    }
+                    self.notify("Removed from library");
+                } else {
+                    let action = (!self.saved.sidebar.shows_in_sidebar(&item.browse_id))
+                        .then_some(("Add to sidebar", Action::ToggleSidebarPin(item)));
+                    self.notice = Some(Notice {
+                        text: "Saved to library".to_owned(),
+                        action,
+                        until: Instant::now() + NOTICE_TIME,
+                    });
+                }
+            }
+            Action::ToggleSidebarPin(item) => {
+                let pinned = self.saved.sidebar.toggle_sidebar_item(&item);
+                self.notify(if pinned { "Added to sidebar" } else { "Removed from sidebar" });
+            }
+            Action::SidebarMode(mode) => self.saved.sidebar.mode = mode,
+            Action::SidebarCompact(compact) => self.saved.sidebar.compact = compact,
+            Action::SidebarCollapsed(collapsed) => {
+                self.saved.sidebar.collapsed = collapsed;
+                if collapsed {
+                    self.sidebar_search_open = false;
+                    self.sidebar_filter.clear();
+                }
+            }
+            Action::SidebarWidth(width) => self.saved.sidebar.width = usable_sidebar_width(width),
+            Action::SidebarShowLiked(show) => self.saved.sidebar.show_liked = show,
+            Action::SidebarShowRecent(show) => self.saved.sidebar.show_recent = show,
+            Action::SidebarShowFilters(show) => {
+                self.saved.sidebar.show_filters = show;
+                if !show {
+                    self.sidebar_kind = None;
+                }
+            }
+            Action::SidebarKindFilter(kind) => self.sidebar_kind = kind,
+            Action::SidebarToggleSearch => {
+                self.sidebar_search_open ^= true;
+                if self.sidebar_search_open {
+                    self.sidebar_search_focus = true;
+                } else {
+                    self.sidebar_filter.clear();
+                }
+            }
+            Action::SidebarReorder(slot, target) => {
+                let all = self.catalog();
+                self.saved.sidebar.reorder(&slot, target, &all);
+            }
+            Action::SidebarMoveStep(slot, delta) => {
+                let all = self.catalog();
+                self.saved.sidebar.move_step(&slot, delta, &all);
+            }
+            Action::SidebarReset => {
+                self.saved.sidebar.reset_sidebar();
+                self.sidebar_filter.clear();
+                self.sidebar_search_open = false;
+                self.sidebar_kind = None;
+                self.library_folder = None;
+                self.notify("Sidebar reset to defaults");
+            }
+            Action::ToggleFolder(folder_id) => self.saved.sidebar.toggle_folder_open(&folder_id),
+            Action::OpenFolderEditor(id) => {
+                let (name, color) = id
+                    .as_deref()
+                    .and_then(|folder_id| self.saved.sidebar.folder(folder_id))
+                    .map_or((String::new(), 0), |folder| (folder.name.clone(), folder.color));
+                self.folder_editor = Some(FolderEditor {
+                    id,
+                    name,
+                    color,
+                    focus: true,
+                });
+            }
+            Action::CloseFolderEditor => self.folder_editor = None,
+            Action::SaveFolder { id, name, color } => {
+                match id {
+                    Some(folder_id) => {
+                        self.saved.sidebar.rename_folder(&folder_id, &name);
+                        self.saved.sidebar.set_folder_color(&folder_id, color);
+                    }
+                    None => {
+                        let created = self.saved.sidebar.create_folder(&name);
+                        self.saved.sidebar.set_folder_color(&created, color);
+                    }
+                }
+                self.folder_editor = None;
+            }
+            Action::SetFolderColor(folder_id, color) => self.saved.sidebar.set_folder_color(&folder_id, color),
+            Action::DeleteFolder(folder_id) => {
+                if self.library_folder.as_deref() == Some(folder_id.as_str()) {
+                    self.library_folder = None;
+                }
+                self.saved.sidebar.delete_folder(&folder_id);
+                self.notify("Deleted folder");
+            }
+            Action::AddToFolder(folder_id, item) => {
+                self.saved.sidebar.add_to_folder(&folder_id, &item);
+                if let Some(folder) = self.saved.sidebar.folder(&folder_id) {
+                    let name = folder.name.clone();
+                    self.notify(format!("Added to {name}"));
+                }
+            }
+            Action::RemoveFromFolder(folder_id, browse_id) => {
+                self.saved.sidebar.remove_from_folder(&folder_id, &browse_id);
+            }
+            Action::OpenTagEditor(item) => {
+                self.tag_editor = Some(TagEditor {
+                    item,
+                    draft: String::new(),
+                    focus: true,
+                });
+            }
+            Action::CloseTagEditor => self.tag_editor = None,
+            Action::AddTag(browse_id, tag) => {
+                self.saved.sidebar.add_tag(&browse_id, &tag);
+                if let Some(editor) = &mut self.tag_editor {
+                    editor.draft.clear();
+                    editor.focus = true;
+                }
+            }
+            Action::RemoveTag(browse_id, tag) => {
+                self.saved.sidebar.remove_tag(&browse_id, &tag);
+                if self.library_tag.as_deref().is_some_and(|active| {
+                    active.eq_ignore_ascii_case(&tag)
+                        && !self
+                            .saved
+                            .sidebar
+                            .all_tags()
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(active))
+                }) {
+                    self.library_tag = None;
+                }
+            }
+            Action::LibraryTab(tab) => {
+                self.library_tab = tab;
+                if tab != LibraryTab::Folders {
+                    self.library_folder = None;
+                }
+            }
+            Action::LibraryView(view) => self.saved.sidebar.library_view = view,
+            Action::LibrarySort(sort) => self.saved.sidebar.library_sort = sort,
+            Action::LibraryTag(tag) => self.library_tag = tag,
+            Action::LibraryFolder(folder_id) => {
+                self.library_folder = folder_id;
+                if self.library_folder.is_some() {
+                    self.library_tab = LibraryTab::Folders;
+                }
+            }
             Action::ToggleQueue => self.saved.queue_open ^= true,
+            Action::QueueWidth(width) => self.saved.queue_width = usable_queue_width(width),
             Action::ToggleShuffle => playback.toggle_shuffle(),
             Action::CycleRepeat => playback.cycle_repeat(),
             Action::OpenSignIn => {
@@ -1438,6 +1702,14 @@ fn overlay_after_toggle(enabled: bool, open: bool) -> bool {
     enabled && !open
 }
 
+pub fn usable_queue_width(width: f32) -> f32 {
+    if width.is_nan() {
+        QUEUE_WIDTH_DEFAULT
+    } else {
+        width.clamp(QUEUE_WIDTH_MIN, QUEUE_WIDTH_MAX)
+    }
+}
+
 pub fn usable_opacity(opacity: f32) -> f32 {
     if opacity.is_nan() {
         OVERLAY_OPACITY_DEFAULT
@@ -1528,6 +1800,56 @@ mod tests {
         assert!(saved.overlay_controls && saved.overlay_next_up);
         let saved: Saved = serde_json::from_str(r#"{"overlay_controls":false}"#).unwrap();
         assert!(!saved.overlay_controls && saved.overlay_next_up);
+    }
+
+    #[test]
+    fn old_saves_get_default_sidebar_layout() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5}"#).unwrap();
+        assert_eq!(saved.sidebar.mode, SidebarMode::Pinned);
+        assert!(saved.sidebar.show_liked && saved.sidebar.show_recent);
+        assert!(!saved.sidebar.collapsed && !saved.sidebar.compact);
+    }
+
+    #[test]
+    fn a_save_from_before_the_sidebar_work_migrates_to_the_view_the_user_had() {
+        let mut saved: Saved = serde_json::from_str(r#"{"volume":0.5,"account":{"name":"A","photo":"","page":""}}"#).unwrap();
+        saved.sidebar.migrate(&saved.pinned, true);
+        assert_eq!(saved.sidebar.mode, SidebarMode::All);
+        assert!(saved.sidebar.migrated);
+        let reloaded: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(reloaded.sidebar.mode, SidebarMode::All);
+        assert!(reloaded.sidebar.migrated);
+    }
+
+    #[test]
+    fn an_unknown_sidebar_value_does_not_reset_the_rest_of_the_save() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5,"overlay":true,"sidebar":{"mode":"Sideways","compact":true}}"#).unwrap();
+        assert_eq!(saved.volume, 0.5);
+        assert!(saved.overlay);
+        assert_eq!(saved.sidebar.mode, SidebarMode::Pinned);
+        assert!(saved.sidebar.compact);
+    }
+
+    #[test]
+    fn an_old_save_opens_the_now_playing_panel_at_its_default_width() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5}"#).unwrap();
+        assert!(saved.queue_open);
+        assert_eq!(saved.queue_width, QUEUE_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn the_now_playing_panel_state_round_trips_and_its_width_stays_in_bounds() {
+        let saved = Saved {
+            queue_open: false,
+            queue_width: 400.0,
+            ..Saved::default()
+        };
+        let back: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(!back.queue_open);
+        assert_eq!(back.queue_width, 400.0);
+        assert_eq!(usable_queue_width(f32::NAN), QUEUE_WIDTH_DEFAULT);
+        assert_eq!(usable_queue_width(10.0), QUEUE_WIDTH_MIN);
+        assert_eq!(usable_queue_width(9000.0), QUEUE_WIDTH_MAX);
     }
 
     #[test]
