@@ -98,6 +98,7 @@ pub struct Saved {
     pub notes_seen: String,
     pub browser: String,
     pub beta_updates: bool,
+    pub beta_stay: bool,
 }
 
 pub enum Words {
@@ -181,6 +182,7 @@ impl Default for Saved {
             notes_seen: String::new(),
             browser: String::new(),
             beta_updates: false,
+            beta_stay: false,
         }
     }
 }
@@ -337,7 +339,6 @@ pub struct App {
     pub update: Option<String>,
     pub updating: bool,
     pub beta_supported: bool,
-    pub beta_choice: bool,
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
@@ -436,7 +437,6 @@ impl App {
             update: None,
             updating: false,
             beta_supported: matches!(update::plan(), Plan::InPlace),
-            beta_choice: false,
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
@@ -467,6 +467,10 @@ impl App {
         app.restore_account();
         app.check_for_update(true);
         app
+    }
+
+    pub fn beta_choice(&self) -> bool {
+        self.beta_supported && update::is_beta(VERSION) && !self.saved.beta_updates && !self.saved.beta_stay
     }
 
     fn check_for_update(&self, refresh_clients: bool) {
@@ -1216,25 +1220,27 @@ impl App {
             }
             Action::BetaUpdates(enabled) => {
                 self.saved.beta_updates = enabled;
-                self.beta_choice = !enabled && update::is_beta(VERSION);
+                self.saved.beta_stay = false;
                 if self.update.as_deref().is_some_and(update::is_beta) {
                     self.update = None;
                 }
                 self.check_for_update(false);
             }
-            Action::StayOnBeta => self.beta_choice = false,
+            Action::StayOnBeta => self.saved.beta_stay = true,
             Action::LeaveBeta => {
-                self.beta_choice = false;
                 if self.updating {
                     return;
                 }
+                let Ok(live_state) = serde_json::to_vec(&self.saved) else {
+                    self.notify("Your data could not be prepared for a backup, so nothing was changed.");
+                    return;
+                };
                 self.updating = true;
                 self.offer(
                     format!("Going back to the latest stable release. Your data is backed up first. {APP_NAME} restarts by itself."),
                     None,
                     UPDATE_NOTICE_TIME,
                 );
-                let live_state = serde_json::to_vec(&self.saved).unwrap_or_default();
                 self.background(move |yt| Some(Event::Updated(update::downgrade_to_stable(&yt.agent, &live_state, VERSION))));
             }
             Action::OpenRelease => {

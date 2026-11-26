@@ -2256,13 +2256,13 @@ fn updates_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     if !app.beta_supported {
         return;
     }
-    let choice = if app.beta_choice { SETTING_ROW } else { 0.0 };
+    let choice = if app.beta_choice() { SETTING_ROW } else { 0.0 };
     let card = section(ui, "Updates", 2.0 * CARD_PAD + SETTING_ROW + choice, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
         if switch_row(ui, size, icon::FLASK, "Beta updates", app.saved.beta_updates) {
             out.push(Action::BetaUpdates(!app.saved.beta_updates));
         }
-        if app.beta_choice {
+        if app.beta_choice() {
             let (row, _) = ui.allocate_exact_size(size, Sense::hover());
             let middle = row.center().y;
             let stay = text_button(ui, pos2(row.right() - 14.0, middle), Id::new("beta-stay"), "Stay on this build");
@@ -2285,7 +2285,7 @@ fn updates_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
             );
         }
     });
-    let text = if app.beta_choice {
+    let text = if app.beta_choice() {
         "Staying waits for the next stable release. Going back installs the latest stable now, after backing up your data.".to_owned()
     } else {
         format!("Also offers early builds of every change, which can be rough. You are on {VERSION}.")

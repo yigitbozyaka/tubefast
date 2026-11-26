@@ -14,6 +14,7 @@ const BACKUPS_KEPT: usize = 3;
 const LIVE_STATE_FILE: &str = "live-state.json";
 const UNREADABLE_STATE_PREFIX: &str = "unreadable-state-";
 const FILES_NOT_BACKED_UP: [&str; 2] = ["crash.log", "session.lock"];
+const FOLDERS_NOT_BACKED_UP: [&str; 1] = ["signin-profile"];
 const PROGRAM: &str = "tubefast.exe";
 const LINUX_PROGRAM: &str = "tubefast-linux-x64";
 const LINUX_APPIMAGE: &str = "Tubefast-x86_64.AppImage";
@@ -272,6 +273,18 @@ fn private_folder(folder: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)?.flatten() {
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if from.is_file() {
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
+}
+
 fn forget_old_backups(storage: &Path) {
     let Ok(entries) = std::fs::read_dir(storage) else { return };
     let mut backups: Vec<PathBuf> = entries
@@ -300,10 +313,12 @@ fn back_up_into(storage: &Path, live_state: &[u8], from_version: &str, seconds: 
     private_folder(&backup).map_err(failed)?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let skipped =
-            name.starts_with(BACKUP_PREFIX) || name.starts_with(UNREADABLE_STATE_PREFIX) || FILES_NOT_BACKED_UP.contains(&name.as_str());
-        if entry.path().is_file() && !skipped {
-            std::fs::copy(entry.path(), backup.join(&name)).map_err(failed)?;
+        let skipped = name.starts_with(BACKUP_PREFIX)
+            || name.starts_with(UNREADABLE_STATE_PREFIX)
+            || FILES_NOT_BACKED_UP.contains(&name.as_str())
+            || FOLDERS_NOT_BACKED_UP.contains(&name.as_str());
+        if !skipped {
+            copy_tree(&entry.path(), &backup.join(&name)).map_err(failed)?;
         }
     }
     std::fs::write(backup.join(LIVE_STATE_FILE), live_state).map_err(failed)?;
@@ -317,14 +332,37 @@ pub fn downgrade_to_stable(agent: &ureq::Agent, live_state: &[u8], from_version:
     back_up_into(&storage, live_state, from_version, now_seconds())?;
     install(agent, &version)
 }
+fn keep_unreadable_into(storage: &Path, raw: &str, seconds: u64) {
+    let mut kept: Vec<PathBuf> = std::fs::read_dir(storage)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(UNREADABLE_STATE_PREFIX))
+        })
+        .collect();
+    let already_kept = kept.iter().any(|path| std::fs::read_to_string(path).is_ok_and(|text| text == raw));
+    if !already_kept {
+        let file = storage.join(format!("{UNREADABLE_STATE_PREFIX}{seconds:020}.ron"));
+        if std::fs::write(&file, raw).is_ok() {
+            kept.push(file);
+        }
+    }
+    kept.sort();
+    kept.pop();
+    for older in kept {
+        let _ = std::fs::remove_file(older);
+    }
+}
 
 pub fn keep_unreadable_state(raw: &str) {
     let Some(storage) = eframe::storage_dir(crate::app_id()) else {
         return;
     };
-    let file = storage.join(format!("{UNREADABLE_STATE_PREFIX}{}.ron", now_seconds()));
-    if std::fs::create_dir_all(&storage).is_ok() && !file.exists() {
-        let _ = std::fs::write(file, raw);
+    if std::fs::create_dir_all(&storage).is_ok() {
+        keep_unreadable_into(&storage, raw, now_seconds());
     }
 }
 
@@ -519,6 +557,41 @@ mod tests {
         let missing = storage.join("nothing-here");
         assert!(back_up_into(&missing, b"{}", "0.12.0", 1).is_err());
         assert!(!missing.exists());
+        std::fs::remove_dir_all(&storage).unwrap();
+    }
+
+    #[test]
+    fn keeps_only_the_newest_distinct_unreadable_state() {
+        let storage = scratch_storage("unreadable");
+        let names = |storage: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(storage)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        keep_unreadable_into(&storage, "first", 10);
+        keep_unreadable_into(&storage, "first", 20);
+        assert_eq!(names(&storage).len(), 1);
+        keep_unreadable_into(&storage, "second", 30);
+        let left = names(&storage);
+        assert_eq!(left.len(), 1);
+        assert_eq!(std::fs::read_to_string(storage.join(&left[0])).unwrap(), "second");
+        std::fs::remove_dir_all(&storage).unwrap();
+    }
+
+    #[test]
+    fn backs_up_nested_data_but_not_the_sign_in_browser_profile() {
+        let storage = scratch_storage("backup-nested");
+        std::fs::create_dir_all(storage.join("extra")).unwrap();
+        std::fs::write(storage.join("extra").join("kept.txt"), "kept").unwrap();
+        std::fs::create_dir_all(storage.join("signin-profile")).unwrap();
+        std::fs::write(storage.join("signin-profile").join("cache"), "big").unwrap();
+        let backup = back_up_into(&storage, b"{}", "0.12.0", 5).unwrap();
+        assert_eq!(std::fs::read_to_string(backup.join("extra").join("kept.txt")).unwrap(), "kept");
+        assert!(!backup.join("signin-profile").exists());
         std::fs::remove_dir_all(&storage).unwrap();
     }
 }
