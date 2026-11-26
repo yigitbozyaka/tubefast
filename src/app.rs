@@ -2,15 +2,19 @@ use crate::art::Art;
 use crate::auth;
 use crate::discord::{Discord, Headline};
 use crate::hotkeys::{self, Combo, Command, Hotkeys};
+use crate::library::{
+    self, Catalog, DropTarget, ItemKind, LibrarySort, LibraryTab, LibraryView, SidebarLayout, SidebarMode, SidebarSlot,
+    usable_sidebar_width,
+};
 use crate::media::Media;
 use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
 use crate::translate::{self, Failure};
 use crate::tray::{self, Closing, Tray};
 use crate::ui;
-use crate::update::{self, Plan};
+use crate::update::{self, LATEST_RELEASE, Plan};
 use crate::wake;
-use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
+use crate::ytm::{Account, Client, Item, LibraryParts, LibrarySource, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::{self, Key, Modifiers, PointerButton};
 use serde::{Deserialize, Serialize};
@@ -30,7 +34,6 @@ const TRANSLATIONS_KEPT: usize = 30;
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
 const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
-const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const HOME_SEEDS: usize = 3;
 const COVER_LOOKUPS: usize = 2;
@@ -40,11 +43,15 @@ pub const OVERLAY_OPACITY_MIN: f32 = 0.3;
 const OVERLAY_OPACITY_DEFAULT: f32 = 0.9;
 const WINDOW_KEY: &str = "window";
 pub const WINDOW_SIZE: [f32; 2] = [1360.0, 860.0];
+pub const QUEUE_WIDTH_DEFAULT: f32 = 336.0;
+pub const QUEUE_WIDTH_MIN: f32 = 280.0;
+pub const QUEUE_WIDTH_MAX: f32 = 480.0;
 pub const WINDOW_MIN: [f32; 2] = [940.0, 600.0];
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Route {
     Home,
+    Library,
     Search(String),
     Browse(String),
     Liked,
@@ -74,8 +81,10 @@ pub struct Saved {
     pub signed_out_liked: Option<Vec<Item>>,
     pub recent: Vec<Item>,
     pub pinned: Vec<Item>,
+    pub sidebar: SidebarLayout,
     pub visitor: String,
     pub queue_open: bool,
+    pub queue_width: f32,
     pub shuffle: bool,
     pub repeat: Repeat,
     pub account: Option<Account>,
@@ -102,6 +111,9 @@ pub struct Saved {
     pub overlay_next_up: bool,
     pub notes_seen: String,
     pub browser: String,
+    pub beta_updates: bool,
+    pub beta_stay: bool,
+    pub ui_scale: Option<f32>,
 }
 
 pub enum Words {
@@ -157,6 +169,19 @@ pub struct SignIn {
     pub picking: bool,
 }
 
+pub struct FolderEditor {
+    pub id: Option<String>,
+    pub name: String,
+    pub color: u8,
+    pub focus: bool,
+}
+
+pub struct TagEditor {
+    pub item: Item,
+    pub draft: String,
+    pub focus: bool,
+}
+
 impl Default for Saved {
     fn default() -> Self {
         Self {
@@ -165,8 +190,10 @@ impl Default for Saved {
             signed_out_liked: None,
             recent: Vec::new(),
             pinned: Vec::new(),
+            sidebar: SidebarLayout::default(),
             visitor: String::new(),
             queue_open: true,
+            queue_width: QUEUE_WIDTH_DEFAULT,
             shuffle: false,
             repeat: Repeat::Off,
             account: None,
@@ -192,6 +219,9 @@ impl Default for Saved {
             overlay_next_up: true,
             notes_seen: String::new(),
             browser: String::new(),
+            beta_updates: false,
+            beta_stay: false,
+            ui_scale: None,
         }
     }
 }
@@ -241,7 +271,42 @@ pub enum Action {
     Like(Item),
     Share(Item),
     Pin(Item),
+    ToggleSidebarPin(Item),
+    SidebarMode(SidebarMode),
+    SidebarCompact(bool),
+    SidebarCollapsed(bool),
+    SidebarWidth(f32),
+    SidebarShowLiked(bool),
+    SidebarShowRecent(bool),
+    SidebarShowFilters(bool),
+    SidebarKindFilter(Option<ItemKind>),
+    SidebarToggleSearch,
+    SidebarReorder(SidebarSlot, DropTarget),
+    SidebarMoveStep(SidebarSlot, isize),
+    SidebarReset,
+    ToggleFolder(String),
+    OpenFolderEditor(Option<String>),
+    CloseFolderEditor,
+    SaveFolder {
+        id: Option<String>,
+        name: String,
+        color: u8,
+    },
+    SetFolderColor(String, u8),
+    DeleteFolder(String),
+    AddToFolder(String, Item),
+    RemoveFromFolder(String, String),
+    OpenTagEditor(Item),
+    CloseTagEditor,
+    AddTag(String, String),
+    RemoveTag(String, String),
+    LibraryTab(LibraryTab),
+    LibraryView(LibraryView),
+    LibrarySort(LibrarySort),
+    LibraryTag(Option<String>),
+    LibraryFolder(Option<String>),
     ToggleQueue,
+    QueueWidth(f32),
     ToggleShuffle,
     CycleRepeat,
     OpenSignIn,
@@ -254,6 +319,9 @@ pub enum Action {
     SwitchAccount(Account),
     Undo,
     GetUpdate,
+    BetaUpdates(bool),
+    StayOnBeta,
+    LeaveBeta,
     OpenRelease,
     CloseNotes,
     #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
@@ -274,6 +342,8 @@ pub enum Action {
     VolumeBy(f32),
     GlobalHotkeys(bool),
     HideOnClose(bool),
+    UiScale(f32),
+    ScaleStep(i8),
     Record(Option<Command>),
     ResetHotkeys,
     ToggleOverlay,
@@ -292,7 +362,7 @@ enum Event {
     FullSection(Route, usize, Target, Vec<Item>),
     SignedIn(Result<(Account, String), String>),
     AccountRestored(String, Result<Account, String>),
-    Library(Vec<Item>),
+    Library(LibraryParts),
     Accounts(Vec<Account>),
     Liked(Vec<Item>),
     LikeRejected(Item, String),
@@ -326,12 +396,29 @@ pub struct App {
     tray: Option<Tray>,
     window: isize,
     fitted: Option<egui::Vec2>,
+    native_pixels: Option<f32>,
+    zoom_pending: Option<(f32, Instant)>,
+    zoom_immediate: bool,
+    sized_for_zoom: f32,
+    monitor_fit: Option<f32>,
     replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
     playback: Arc<Mutex<Playback>>,
     speaker: Speaker,
     synced: u64,
     pub sign_in: Option<SignIn>,
+    pub folder_editor: Option<FolderEditor>,
+    pub tag_editor: Option<TagEditor>,
+    pub sidebar_filter: String,
+    pub sidebar_search_open: bool,
+    pub sidebar_search_focus: bool,
+    pub sidebar_kind: Option<ItemKind>,
+    pub library_tab: LibraryTab,
+    pub library_filter: String,
+    pub library_tag: Option<String>,
+    pub library_folder: Option<String>,
+    catalog: Arc<Catalog>,
+    library_loaded: Vec<LibrarySource>,
     pub library: Vec<Item>,
     pub accounts: Vec<Account>,
     pub player: Status,
@@ -353,6 +440,7 @@ pub struct App {
     pub notice: Option<Notice>,
     pub update: Option<String>,
     pub updating: bool,
+    pub beta_supported: bool,
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
@@ -372,14 +460,23 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool, updated: bool) -> Self {
         ui::install(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         wake::point_at_window(cc.egui_ctx.clone());
         let mut saved = starting_state(cc);
         let translation_key = auth::load_translation_key().unwrap_or_default();
+        let returning_user = saved.account.is_some() || !saved.pinned.is_empty() || !saved.recent.is_empty() || !saved.liked.is_empty();
+        saved.sidebar.migrate(&saved.pinned, returning_user);
+        saved.sidebar.width = usable_sidebar_width(saved.sidebar.width);
+        saved.queue_width = usable_queue_width(saved.queue_width);
+        saved.ui_scale = saved.ui_scale.and_then(crate::scale::sanitized);
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
-        if !yt.signed_in() {
+        let signed_in = yt.signed_in();
+        if !signed_in {
             saved.leave_account();
         }
+        let cached = if signed_in { saved.sidebar.cached_items(&[]) } else { Vec::new() };
+        let catalog = Arc::new(Catalog::with_cache(&saved.pinned, &[], &cached));
         yt.act_as(saved.account.as_ref().map_or("", |account| &account.page));
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
         let fresh_version = saved.notes_seen != VERSION && (updated || !saved.notes_seen.is_empty());
@@ -429,12 +526,29 @@ impl App {
             tray: None,
             window: tray::window_of(cc),
             fitted: None,
+            native_pixels: None,
+            zoom_pending: None,
+            zoom_immediate: true,
+            sized_for_zoom: 1.0,
+            monitor_fit: None,
             replaced: None,
             growing: None,
             playback,
             speaker,
             synced: 0,
             sign_in: None,
+            folder_editor: None,
+            tag_editor: None,
+            sidebar_filter: String::new(),
+            sidebar_search_open: false,
+            sidebar_search_focus: false,
+            sidebar_kind: None,
+            library_tab: LibraryTab::All,
+            library_filter: String::new(),
+            library_tag: None,
+            library_folder: None,
+            catalog,
+            library_loaded: Vec::new(),
             library: Vec::new(),
             accounts: Vec::new(),
             player: status,
@@ -455,6 +569,7 @@ impl App {
             notice: None,
             update: None,
             updating: false,
+            beta_supported: matches!(update::plan(), Plan::InPlace),
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
@@ -483,12 +598,22 @@ impl App {
         auth::secure_session_storage();
         auth::remove_leftover_sign_in_profiles();
         app.restore_account();
-        app.background(|yt| {
-            yt.refresh_clients();
-            let latest = yt.agent.head(LATEST_RELEASE).call().ok()?;
-            newer_version(latest.get_url(), VERSION).map(Event::Release)
-        });
+        app.check_for_update(true);
         app
+    }
+
+    pub fn beta_choice(&self) -> bool {
+        self.beta_supported && update::is_beta(VERSION) && !self.saved.beta_updates && !self.saved.beta_stay
+    }
+
+    fn check_for_update(&self, refresh_clients: bool) {
+        let beta = self.saved.beta_updates && self.beta_supported;
+        self.background(move |yt| {
+            if refresh_clients {
+                yt.refresh_clients();
+            }
+            update::latest(&yt.agent, beta, VERSION).map(Event::Release)
+        });
     }
 
     fn collect_saved(&mut self) {
@@ -645,6 +770,8 @@ impl App {
     fn refresh(&mut self) {
         self.pages.clear();
         self.library.clear();
+        self.library_loaded.clear();
+        self.rebuild_catalog();
         self.ensure(&self.route().clone());
         self.load_library();
         self.restore_account();
@@ -703,6 +830,72 @@ impl App {
         &self.history[self.at]
     }
 
+    pub fn ui_scale(&self) -> Option<f32> {
+        let native = self.native_pixels?;
+        Some(crate::scale::compose(
+            self.desktop_scale(native),
+            self.saved.ui_scale,
+            self.monitor_fit_or_unknown(),
+        ))
+    }
+
+    pub fn relative_fit(&self) -> f32 {
+        let absolute = crate::scale::largest_option_up_to(self.monitor_fit_or_unknown());
+        (absolute / self.desktop_scale(self.native_pixels.unwrap_or(1.0))).clamp(crate::scale::RELATIVE_MIN, crate::scale::RELATIVE_MAX)
+    }
+
+    fn desktop_scale(&self, native: f32) -> f32 {
+        if native > 1.0 { native } else { crate::scale::detected() }
+    }
+
+    fn monitor_fit_or_unknown(&self) -> f32 {
+        self.monitor_fit.unwrap_or(crate::scale::UNKNOWN_FIT)
+    }
+
+    fn step_scale(&mut self, direction: i8) {
+        let fit = self.relative_fit();
+        let options: Vec<f32> = crate::scale::RELATIVE.into_iter().filter(|scale| *scale <= fit + 0.01).collect();
+        let current = self.saved.ui_scale.unwrap_or(1.0);
+        let next = if direction > 0 {
+            options.into_iter().find(|scale| *scale > current + 0.01)
+        } else {
+            options.into_iter().rev().find(|scale| *scale < current - 0.01)
+        };
+        if let Some(scale) = next {
+            self.saved.ui_scale = Some(scale);
+            self.zoom_immediate = true;
+            self.notify(format!("Interface scale {}", crate::scale::label(scale)));
+        }
+    }
+
+    fn keep_window_on_screen(
+        &mut self,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        monitor: Option<egui::Vec2>,
+        minimized: bool,
+        resizable: bool,
+    ) {
+        let fit = |target: [f32; 2]| match monitor {
+            Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
+            None => egui::vec2(target[0], target[1]),
+        };
+        let (wanted, floor) = (fit(WINDOW_SIZE), fit(WINDOW_MIN));
+        let overflows = monitor.is_some_and(|monitor| size.x > monitor.x + 1.0 || size.y > monitor.y + 1.0);
+        if !overflows {
+            self.fitted = None;
+        }
+        if !minimized && resizable && overflows {
+            if self.fitted != Some(wanted) {
+                self.fitted = Some(wanted);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+            }
+        } else if !minimized && (size.x < floor.x - 1.0 || size.y < floor.y - 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        }
+    }
+
     pub fn now_playing(&self) -> Option<&Item> {
         self.saved.queue.get(self.saved.current?)
     }
@@ -716,8 +909,21 @@ impl App {
         self.saved.current.is_some() && !self.player.paused()
     }
 
+    pub fn catalog(&self) -> Arc<Catalog> {
+        Arc::clone(&self.catalog)
+    }
+
+    fn rebuild_catalog(&mut self) {
+        let cached = if self.yt.signed_in() {
+            self.saved.sidebar.cached_items(&self.library_loaded)
+        } else {
+            Vec::new()
+        };
+        self.catalog = Arc::new(Catalog::with_cache(&self.saved.pinned, &self.library, &cached));
+    }
+
     fn ensure(&mut self, route: &Route) {
-        if self.pages.contains_key(route) || matches!(route, Route::Liked | Route::Recent | Route::Settings) {
+        if self.pages.contains_key(route) || matches!(route, Route::Library | Route::Liked | Route::Recent | Route::Settings) {
             return;
         }
         if self.pages.len() >= CACHED_PAGES {
@@ -750,7 +956,7 @@ impl App {
                     let _ = sender.send(Event::Page(route.clone(), Ok(Box::new(page.clone()))));
                     wake::wake();
                 }),
-                Route::Liked | Route::Recent | Route::Settings => return,
+                Route::Library | Route::Liked | Route::Recent | Route::Settings => return,
             };
             let _ = sender.send(Event::Page(route, result.map(Box::new)));
             wake::wake();
@@ -868,7 +1074,18 @@ impl App {
                     }
                 }
                 Event::Page(route, Err(message)) => drop(self.pages.insert(route, Load::Failed(message))),
-                Event::Library(items) => self.library = items,
+                Event::Library(parts) => {
+                    for (source, items) in &parts {
+                        if items.is_some() && !self.library_loaded.contains(source) {
+                            self.library_loaded.push(*source);
+                        }
+                    }
+                    self.library = library::merge_library(&self.library, parts);
+                    self.saved
+                        .sidebar
+                        .reconcile(&self.saved.pinned, &self.library, &self.library_loaded);
+                    self.rebuild_catalog();
+                }
                 Event::Accounts(accounts) if self.yt.signed_in() => self.accounts = accounts,
                 Event::Accounts(_) => {}
                 Event::Liked(items) if self.yt.signed_in() => {
@@ -945,6 +1162,7 @@ impl App {
                         self.translation = Some((video_id, target, state));
                     }
                 }
+                Event::Release(version) if update::is_beta(&version) && !self.saved.beta_updates => {}
                 Event::Release(version) => {
                     self.offer(
                         format!("{APP_NAME} {version} is out"),
@@ -1081,10 +1299,14 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut out = Vec::new();
-        let free = !ctx.wants_keyboard_input() && ctx.memory(|memory| memory.focused().is_none());
+        let ctx_wants_keyboard = ctx.wants_keyboard_input();
+        let free = !ctx_wants_keyboard && ctx.memory(|memory| memory.focused().is_none());
         ctx.input_mut(|input| {
             if input.consume_key(Modifiers::COMMAND, Key::K) || (free && input.consume_key(Modifiers::NONE, Key::Slash)) {
                 self.focus_search = true;
+            }
+            if !ctx_wants_keyboard && input.consume_key(Modifiers::COMMAND, Key::B) {
+                out.push(Action::SidebarCollapsed(!self.saved.sidebar.collapsed));
             }
             if input.consume_key(Modifiers::ALT, Key::ArrowLeft) || input.pointer.button_pressed(PointerButton::Extra1) {
                 out.push(Action::Back);
@@ -1109,6 +1331,15 @@ impl App {
             }
             if self.expanded && free && input.consume_key(Modifiers::NONE, Key::Escape) {
                 out.push(Action::Expand(false));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Equals) || input.consume_key(Modifiers::COMMAND, Key::Plus) {
+                out.push(Action::ScaleStep(1));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Minus) {
+                out.push(Action::ScaleStep(-1));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Num0) {
+                out.push(Action::UiScale(1.0));
             }
         });
         out
@@ -1141,8 +1372,12 @@ impl App {
             }
             Action::Reload => {
                 let route = self.route().clone();
-                self.pages.remove(&route);
-                self.ensure(&route);
+                if route == Route::Library {
+                    self.load_library();
+                } else {
+                    self.pages.remove(&route);
+                    self.ensure(&route);
+                }
             }
             Action::Play(items, index) => {
                 let growing = self.growing_list(&items);
@@ -1168,6 +1403,13 @@ impl App {
                 self.saved.hide_on_close = enabled;
                 self.restart_tray();
             }
+            Action::UiScale(scale) => {
+                self.saved.ui_scale = crate::scale::sanitized(scale);
+                self.zoom_immediate = true;
+                let label = crate::scale::label(self.saved.ui_scale.unwrap_or(1.0));
+                self.notify(format!("Interface scale {label}"));
+            }
+            Action::ScaleStep(direction) => self.step_scale(direction),
             Action::Record(command) => self.set_recording(command),
             Action::ResetHotkeys => {
                 self.saved.hotkey_combos = hotkeys::standard_combos();
@@ -1210,8 +1452,167 @@ impl App {
                 self.ctx.copy_text(link);
                 self.notify("Copied share link");
             }
-            Action::Pin(item) => toggle(&mut self.saved.pinned, item),
+            Action::Pin(item) => {
+                let was_saved = self.saved.pinned.iter().any(|known| known.key() == item.key());
+                toggle(&mut self.saved.pinned, item.clone());
+                self.rebuild_catalog();
+                if was_saved {
+                    if !self.library.iter().any(|remote| remote.browse_id == item.browse_id) {
+                        self.saved.sidebar.unpin_item(&item.browse_id);
+                    }
+                    self.notify("Removed from library");
+                } else {
+                    let action = (!self.saved.sidebar.shows_in_sidebar(&item.browse_id))
+                        .then_some(("Add to sidebar", Action::ToggleSidebarPin(item)));
+                    self.notice = Some(Notice {
+                        text: "Saved to library".to_owned(),
+                        action,
+                        until: Instant::now() + NOTICE_TIME,
+                    });
+                }
+            }
+            Action::ToggleSidebarPin(item) => {
+                if self.catalog.get(&item.browse_id).is_none() && !item.is_song() && !item.browse_id.is_empty() {
+                    self.saved.pinned.push(item.clone());
+                    self.rebuild_catalog();
+                }
+                let pinned = self.saved.sidebar.toggle_sidebar_item(&item);
+                self.notify(if pinned { "Added to sidebar" } else { "Removed from sidebar" });
+            }
+            Action::SidebarMode(mode) => self.saved.sidebar.mode = mode,
+            Action::SidebarCompact(compact) => self.saved.sidebar.compact = compact,
+            Action::SidebarCollapsed(collapsed) => {
+                self.saved.sidebar.collapsed = collapsed;
+                if collapsed {
+                    self.sidebar_search_open = false;
+                    self.sidebar_filter.clear();
+                }
+            }
+            Action::SidebarWidth(width) => self.saved.sidebar.width = usable_sidebar_width(width),
+            Action::SidebarShowLiked(show) => self.saved.sidebar.show_liked = show,
+            Action::SidebarShowRecent(show) => self.saved.sidebar.show_recent = show,
+            Action::SidebarShowFilters(show) => {
+                self.saved.sidebar.show_filters = show;
+                if !show {
+                    self.sidebar_kind = None;
+                }
+            }
+            Action::SidebarKindFilter(kind) => self.sidebar_kind = kind,
+            Action::SidebarToggleSearch => {
+                self.sidebar_search_open ^= true;
+                if self.sidebar_search_open {
+                    self.sidebar_search_focus = true;
+                } else {
+                    self.sidebar_filter.clear();
+                }
+            }
+            Action::SidebarReorder(slot, target) => {
+                let all = self.catalog();
+                self.saved.sidebar.reorder(&slot, target, &all);
+            }
+            Action::SidebarMoveStep(slot, delta) => {
+                let all = self.catalog();
+                self.saved.sidebar.move_step(&slot, delta, &all);
+            }
+            Action::SidebarReset => {
+                self.saved.sidebar.reset_sidebar();
+                self.sidebar_filter.clear();
+                self.sidebar_search_open = false;
+                self.sidebar_kind = None;
+                self.library_folder = None;
+                self.notify("Sidebar reset to defaults");
+            }
+            Action::ToggleFolder(folder_id) => self.saved.sidebar.toggle_folder_open(&folder_id),
+            Action::OpenFolderEditor(id) => {
+                let (name, color) = id
+                    .as_deref()
+                    .and_then(|folder_id| self.saved.sidebar.folder(folder_id))
+                    .map_or((String::new(), 0), |folder| (folder.name.clone(), folder.color));
+                self.folder_editor = Some(FolderEditor {
+                    id,
+                    name,
+                    color,
+                    focus: true,
+                });
+            }
+            Action::CloseFolderEditor => self.folder_editor = None,
+            Action::SaveFolder { id, name, color } => {
+                match id {
+                    Some(folder_id) => {
+                        self.saved.sidebar.rename_folder(&folder_id, &name);
+                        self.saved.sidebar.set_folder_color(&folder_id, color);
+                    }
+                    None => {
+                        let created = self.saved.sidebar.create_folder(&name);
+                        self.saved.sidebar.set_folder_color(&created, color);
+                    }
+                }
+                self.folder_editor = None;
+            }
+            Action::SetFolderColor(folder_id, color) => self.saved.sidebar.set_folder_color(&folder_id, color),
+            Action::DeleteFolder(folder_id) => {
+                if self.library_folder.as_deref() == Some(folder_id.as_str()) {
+                    self.library_folder = None;
+                }
+                self.saved.sidebar.delete_folder(&folder_id);
+                self.notify("Deleted folder");
+            }
+            Action::AddToFolder(folder_id, item) => {
+                self.saved.sidebar.add_to_folder(&folder_id, &item);
+                if let Some(folder) = self.saved.sidebar.folder(&folder_id) {
+                    let name = folder.name.clone();
+                    self.notify(format!("Added to {name}"));
+                }
+            }
+            Action::RemoveFromFolder(folder_id, browse_id) => {
+                self.saved.sidebar.remove_from_folder(&folder_id, &browse_id);
+            }
+            Action::OpenTagEditor(item) => {
+                self.tag_editor = Some(TagEditor {
+                    item,
+                    draft: String::new(),
+                    focus: true,
+                });
+            }
+            Action::CloseTagEditor => self.tag_editor = None,
+            Action::AddTag(browse_id, tag) => {
+                self.saved.sidebar.add_tag(&browse_id, &tag);
+                if let Some(editor) = &mut self.tag_editor {
+                    editor.draft.clear();
+                    editor.focus = true;
+                }
+            }
+            Action::RemoveTag(browse_id, tag) => {
+                self.saved.sidebar.remove_tag(&browse_id, &tag);
+                if self.library_tag.as_deref().is_some_and(|active| {
+                    active.eq_ignore_ascii_case(&tag)
+                        && !self
+                            .saved
+                            .sidebar
+                            .all_tags()
+                            .iter()
+                            .any(|existing| existing.eq_ignore_ascii_case(active))
+                }) {
+                    self.library_tag = None;
+                }
+            }
+            Action::LibraryTab(tab) => {
+                self.library_tab = tab;
+                if tab != LibraryTab::Folders {
+                    self.library_folder = None;
+                }
+            }
+            Action::LibraryView(view) => self.saved.sidebar.library_view = view,
+            Action::LibrarySort(sort) => self.saved.sidebar.library_sort = sort,
+            Action::LibraryTag(tag) => self.library_tag = tag,
+            Action::LibraryFolder(folder_id) => {
+                self.library_folder = folder_id;
+                if self.library_folder.is_some() {
+                    self.library_tab = LibraryTab::Folders;
+                }
+            }
             Action::ToggleQueue => self.saved.queue_open ^= true,
+            Action::QueueWidth(width) => self.saved.queue_width = usable_queue_width(width),
             Action::ToggleShuffle => playback.toggle_shuffle(),
             Action::CycleRepeat => playback.cycle_repeat(),
             Action::OpenSignIn => {
@@ -1285,6 +1686,31 @@ impl App {
                     }
                     Plan::DownloadPage => self.apply(Action::OpenRelease, playback),
                 }
+            }
+            Action::BetaUpdates(enabled) => {
+                self.saved.beta_updates = enabled;
+                self.saved.beta_stay = false;
+                if self.update.as_deref().is_some_and(update::is_beta) {
+                    self.update = None;
+                }
+                self.check_for_update(false);
+            }
+            Action::StayOnBeta => self.saved.beta_stay = true,
+            Action::LeaveBeta => {
+                if self.updating {
+                    return;
+                }
+                let Ok(live_state) = serde_json::to_vec(&self.saved) else {
+                    self.notify("Your data could not be prepared for a backup, so nothing was changed.");
+                    return;
+                };
+                self.updating = true;
+                self.offer(
+                    format!("Going back to the latest stable release. Your data is backed up first. {APP_NAME} restarts by itself."),
+                    None,
+                    UPDATE_NOTICE_TIME,
+                );
+                self.background(move |yt| Some(Event::Updated(update::downgrade_to_stable(&yt.agent, &live_state, VERSION))));
             }
             Action::OpenRelease => {
                 self.notice = None;
@@ -1363,7 +1789,9 @@ impl App {
 
     pub fn attach(&mut self, cc: &eframe::CreationContext<'_>) {
         ui::install(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         self.ctx = cc.egui_ctx.clone();
+        self.zoom_immediate = true;
         wake::point_at_window(self.ctx.clone());
         self.art = Art::new(wake::wake, self.yt.agent.clone());
         self.title_bar = ui::TitleBar::new(cc);
@@ -1439,32 +1867,51 @@ impl eframe::App for App {
         } else if cfg!(all(unix, not(target_os = "macos"))) && tray::quitting() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let (size, minimized, monitor, resizable) = ctx.input(|input| {
+        let (size, minimized, monitor, resizable, native) = ctx.input(|input| {
             let viewport = input.viewport();
             (
                 input.content_rect().size(),
                 viewport.minimized == Some(true),
                 viewport.monitor_size,
                 viewport.maximized != Some(true) && viewport.fullscreen != Some(true),
+                viewport.native_pixels_per_point,
             )
         });
-        let fit = |target: [f32; 2]| match monitor {
-            Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
-            None => egui::vec2(target[0], target[1]),
-        };
-        let (wanted, floor) = (fit(WINDOW_SIZE), fit(WINDOW_MIN));
-        let overflows = monitor.is_some_and(|monitor| size.x > monitor.x + 1.0 || size.y > monitor.y + 1.0);
-        if !overflows {
+        self.native_pixels = native;
+        let zoom_settled = ctx.zoom_factor() == self.sized_for_zoom;
+        if !zoom_settled {
+            self.sized_for_zoom = ctx.zoom_factor();
             self.fitted = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(WINDOW_MIN.into()));
         }
-        if !minimized && resizable && overflows {
-            if self.fitted != Some(wanted) {
-                self.fitted = Some(wanted);
-                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        if zoom_settled
+            && let Some(monitor) = monitor
+            && native.is_some()
+        {
+            let pixels = ctx.pixels_per_point();
+            self.monitor_fit = Some(crate::scale::largest_fit((monitor.x * pixels, monitor.y * pixels)));
+        }
+        let wanted_zoom = self.ui_scale().zip(native).map(|(absolute, native)| absolute / native);
+        if let Some(scale) = wanted_zoom
+            && ctx.zoom_factor() != scale
+        {
+            let since = self
+                .zoom_pending
+                .filter(|(held, _)| *held == scale)
+                .map_or(Instant::now(), |(_, since)| since);
+            if self.zoom_immediate || since.elapsed() > Duration::from_millis(300) {
+                self.zoom_immediate = false;
+                ctx.set_zoom_factor(scale);
+                self.zoom_pending = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(60));
+                self.zoom_pending = Some((scale, since));
             }
-        } else if !minimized && (size.x < floor.x - 1.0 || size.y < floor.y - 1.0) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        } else {
+            self.zoom_pending = None;
+        }
+        if zoom_settled {
+            self.keep_window_on_screen(ctx, size, monitor, minimized, resizable);
         }
         self.art.begin_frame(ctx);
         let playback = self.playback.clone();
@@ -1518,14 +1965,23 @@ impl eframe::App for App {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
-    crate::parked::recover(cc.storage.and_then(|storage| eframe::get_value(storage, eframe::APP_KEY)))
+    crate::parked::recover(stored_state(cc))
+}
+
+fn stored_state(cc: &eframe::CreationContext<'_>) -> Option<Saved> {
+    let storage = cc.storage?;
+    let state = eframe::get_value(storage, eframe::APP_KEY);
+    if state.is_none()
+        && let Some(raw) = storage.get_string(eframe::APP_KEY)
+    {
+        update::keep_unreadable_state(&raw);
+    }
+    state
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
-    cc.storage
-        .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
-        .unwrap_or_default()
+    stored_state(cc).unwrap_or_default()
 }
 
 impl Drop for App {
@@ -1546,18 +2002,20 @@ fn overlay_after_toggle(enabled: bool, open: bool) -> bool {
     enabled && !open
 }
 
+pub fn usable_queue_width(width: f32) -> f32 {
+    if width.is_nan() {
+        QUEUE_WIDTH_DEFAULT
+    } else {
+        width.clamp(QUEUE_WIDTH_MIN, QUEUE_WIDTH_MAX)
+    }
+}
+
 pub fn usable_opacity(opacity: f32) -> f32 {
     if opacity.is_nan() {
         OVERLAY_OPACITY_DEFAULT
     } else {
         opacity.clamp(OVERLAY_OPACITY_MIN, 1.0)
     }
-}
-
-fn newer_version(release_url: &str, current: &str) -> Option<String> {
-    let numbers = |version: &str| version.split('.').map(|part| part.parse().ok()).collect::<Option<Vec<u32>>>();
-    let latest = release_url.rsplit_once("/tag/v")?.1;
-    (numbers(latest)? > numbers(current)?).then(|| latest.to_owned())
 }
 
 fn toggle(list: &mut Vec<Item>, item: Item) {
@@ -1639,6 +2097,56 @@ mod tests {
     }
 
     #[test]
+    fn old_saves_get_default_sidebar_layout() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5}"#).unwrap();
+        assert_eq!(saved.sidebar.mode, SidebarMode::Pinned);
+        assert!(saved.sidebar.show_liked && saved.sidebar.show_recent);
+        assert!(!saved.sidebar.collapsed && !saved.sidebar.compact);
+    }
+
+    #[test]
+    fn a_save_from_before_the_sidebar_work_migrates_to_the_view_the_user_had() {
+        let mut saved: Saved = serde_json::from_str(r#"{"volume":0.5,"account":{"name":"A","photo":"","page":""}}"#).unwrap();
+        saved.sidebar.migrate(&saved.pinned, true);
+        assert_eq!(saved.sidebar.mode, SidebarMode::All);
+        assert!(saved.sidebar.migrated);
+        let reloaded: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(reloaded.sidebar.mode, SidebarMode::All);
+        assert!(reloaded.sidebar.migrated);
+    }
+
+    #[test]
+    fn an_unknown_sidebar_value_does_not_reset_the_rest_of_the_save() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5,"overlay":true,"sidebar":{"mode":"Sideways","compact":true}}"#).unwrap();
+        assert_eq!(saved.volume, 0.5);
+        assert!(saved.overlay);
+        assert_eq!(saved.sidebar.mode, SidebarMode::Pinned);
+        assert!(saved.sidebar.compact);
+    }
+
+    #[test]
+    fn an_old_save_opens_the_now_playing_panel_at_its_default_width() {
+        let saved: Saved = serde_json::from_str(r#"{"volume":0.5}"#).unwrap();
+        assert!(saved.queue_open);
+        assert_eq!(saved.queue_width, QUEUE_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn the_now_playing_panel_state_round_trips_and_its_width_stays_in_bounds() {
+        let saved = Saved {
+            queue_open: false,
+            queue_width: 400.0,
+            ..Saved::default()
+        };
+        let back: Saved = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert!(!back.queue_open);
+        assert_eq!(back.queue_width, 400.0);
+        assert_eq!(usable_queue_width(f32::NAN), QUEUE_WIDTH_DEFAULT);
+        assert_eq!(usable_queue_width(10.0), QUEUE_WIDTH_MIN);
+        assert_eq!(usable_queue_width(9000.0), QUEUE_WIDTH_MAX);
+    }
+
+    #[test]
     fn the_overlay_only_opens_when_enabled() {
         assert!(!overlay_after_toggle(false, false));
         assert!(overlay_after_toggle(true, false));
@@ -1661,14 +2169,45 @@ mod tests {
         assert_eq!(notes, ["Faster search", "Lyrics stay in sync"]);
     }
 
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
+
+    fn stored(ron: &str) -> MemoryStorage {
+        let mut storage = MemoryStorage::default();
+        eframe::Storage::set_string(&mut storage, eframe::APP_KEY, ron.to_owned());
+        storage
+    }
+
     #[test]
-    fn offers_only_releases_newer_than_this_build() {
-        let release = |tag: &str| format!("https://github.com/yigitbozyaka/tubefast/releases/tag/{tag}");
-        assert_eq!(newer_version(&release("v0.2.0"), "0.1.9").as_deref(), Some("0.2.0"));
-        assert_eq!(newer_version(&release("v0.10.0"), "0.9.1").as_deref(), Some("0.10.0"));
-        assert_eq!(newer_version(&release("v0.1.0"), "0.1.0"), None);
-        assert_eq!(newer_version(&release("v0.1.0"), "0.2.0"), None);
-        assert_eq!(newer_version(&release("nightly"), "0.1.0"), None);
-        assert_eq!(newer_version("https://github.com/yigitbozyaka/tubefast/releases", "0.1.0"), None);
+    fn a_save_from_a_newer_build_with_extra_fields_still_loads() {
+        let storage = stored("(volume: 0.25, shuffle: true, a_setting_from_the_future: 7, beta_updates: true)");
+        let saved: Saved = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!((saved.volume, saved.shuffle, saved.beta_updates), (0.25, true, true));
+    }
+
+    #[test]
+    fn a_save_from_before_beta_updates_loads_with_them_off() {
+        let storage = stored("(volume: 0.25)");
+        let saved: Saved = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert!(!saved.beta_updates);
+    }
+
+    #[test]
+    fn an_unreadable_save_is_reported_as_unreadable_instead_of_empty() {
+        let storage = stored("(volume: not_a_number");
+        assert!(eframe::get_value::<Saved>(&storage, eframe::APP_KEY).is_none());
+        assert!(eframe::Storage::get_string(&storage, eframe::APP_KEY).is_some());
     }
 }

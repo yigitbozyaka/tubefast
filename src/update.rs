@@ -3,7 +3,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub const UPDATED_FLAG: &str = "--updated";
+pub const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const DOWNLOADS: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/download");
+const BETA_TAG: &str = "beta";
+const BETA_MANIFEST: &str = "version.txt";
+const BETA_MARKER: &str = "-beta.";
+const STABLE_TAG_MARKER: &str = "/tag/v";
+const BACKUP_PREFIX: &str = "backup-";
+const BACKUPS_KEPT: usize = 3;
+const LIVE_STATE_FILE: &str = "live-state.json";
+const UNREADABLE_STATE_PREFIX: &str = "unreadable-state-";
+const FILES_NOT_BACKED_UP: [&str; 2] = ["crash.log", "session.lock"];
+const FOLDERS_NOT_BACKED_UP: [&str; 1] = ["signin-profile"];
 const PROGRAM: &str = "tubefast.exe";
 const LINUX_PROGRAM: &str = "tubefast-linux-x64";
 const LINUX_APPIMAGE: &str = "Tubefast-x86_64.AppImage";
@@ -14,6 +25,62 @@ const CHECKSUMS: &str = "SHA256SUMS.txt";
 const PROGRAM_BYTES: u64 = 64 * 1024 * 1024;
 const SCOOP_FOLDER: &str = "\\scoop\\apps\\";
 const SCOOP_COMMAND: &str = "scoop update tubefast";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Version {
+    base: (u32, u32, u32),
+    beta: u32,
+}
+
+fn parse_version(text: &str) -> Option<Version> {
+    let (base, beta) = match text.split_once(BETA_MARKER) {
+        Some((base, number)) => (base, number.parse().ok().filter(|number| *number > 0)?),
+        None => (text, 0),
+    };
+    let mut parts = base.split('.').map(|part| part.parse::<u32>().ok());
+    let base = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(Version { base, beta })
+}
+
+pub fn is_beta(version: &str) -> bool {
+    version.contains(BETA_MARKER)
+}
+
+fn newest_offer(current: &str, stable: Option<String>, beta: Option<String>) -> Option<String> {
+    let current = parse_version(current)?;
+    [stable, beta]
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| Some((parse_version(&candidate)?, candidate)))
+        .filter(|(version, _)| *version > current)
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, candidate)| candidate)
+}
+
+pub fn stable_version(agent: &ureq::Agent) -> Option<String> {
+    let latest = agent.head(LATEST_RELEASE).call().ok()?;
+    let version = latest.get_url().rsplit_once(STABLE_TAG_MARKER)?.1;
+    parse_version(version).filter(|parsed| parsed.beta == 0).map(|_| version.to_owned())
+}
+
+fn beta_version(agent: &ureq::Agent) -> Option<String> {
+    let manifest = agent.get(&format!("{DOWNLOADS}/{BETA_TAG}/{BETA_MANIFEST}")).call().ok()?;
+    let version = manifest.into_string().ok()?.trim().to_owned();
+    (is_beta(&version) && parse_version(&version).is_some()).then_some(version)
+}
+
+pub fn latest(agent: &ureq::Agent, beta: bool, current: &str) -> Option<String> {
+    let stable = stable_version(agent);
+    newest_offer(current, stable, beta.then(|| beta_version(agent)).flatten())
+}
+
+fn release_folder(version: &str) -> String {
+    if is_beta(version) {
+        format!("{DOWNLOADS}/{BETA_TAG}")
+    } else {
+        format!("{DOWNLOADS}/v{version}")
+    }
+}
 
 pub enum Plan {
     InPlace,
@@ -167,7 +234,7 @@ pub fn install(agent: &ureq::Agent, version: &str) -> Result<PathBuf, String> {
     let program = std::env::current_exe().map_err(|e| e.to_string())?;
     let placement = placement().ok_or("this installation cannot update itself")?;
     let downloaded = placement.replace.with_extension("new");
-    download(agent, &format!("{DOWNLOADS}/v{version}"), placement.asset, &downloaded)?;
+    download(agent, &release_folder(version), placement.asset, &downloaded)?;
     if placement.bundle {
         let unpacked = placement.replace.with_extension("unpacked");
         let fresh = unpack(&downloaded, &unpacked)?;
@@ -179,6 +246,124 @@ pub fn install(agent: &ureq::Agent, version: &str) -> Result<PathBuf, String> {
     make_executable(&downloaded)?;
     swap(&placement.replace, &downloaded)?;
     Ok(placement.replace)
+}
+
+fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn backup_age(folder: &Path) -> u64 {
+    folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit('-').next())
+        .and_then(|seconds| seconds.parse().ok())
+        .unwrap_or(0)
+}
+
+fn private_folder(folder: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(folder)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)?.flatten() {
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else if from.is_file() {
+        std::fs::copy(from, to)?;
+    }
+    Ok(())
+}
+
+fn forget_old_backups(storage: &Path) {
+    let Ok(entries) = std::fs::read_dir(storage) else { return };
+    let mut backups: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(BACKUP_PREFIX))
+        })
+        .collect();
+    backups.sort_by_key(|backup| std::cmp::Reverse(backup_age(backup)));
+    for old in backups.into_iter().skip(BACKUPS_KEPT) {
+        remove_path(&old);
+    }
+}
+
+fn back_up_into(storage: &Path, live_state: &[u8], from_version: &str, seconds: u64) -> Result<PathBuf, String> {
+    let backup = storage.join(format!("{BACKUP_PREFIX}{from_version}-{seconds}"));
+    let failed = |error: std::io::Error| {
+        remove_path(&backup);
+        format!("your data could not be backed up first ({error})")
+    };
+    let entries = std::fs::read_dir(storage).map_err(failed)?;
+    private_folder(&backup).map_err(failed)?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let skipped = name.starts_with(BACKUP_PREFIX)
+            || name.starts_with(UNREADABLE_STATE_PREFIX)
+            || FILES_NOT_BACKED_UP.contains(&name.as_str())
+            || FOLDERS_NOT_BACKED_UP.contains(&name.as_str());
+        if !skipped {
+            copy_tree(&entry.path(), &backup.join(&name)).map_err(failed)?;
+        }
+    }
+    std::fs::write(backup.join(LIVE_STATE_FILE), live_state).map_err(failed)?;
+    forget_old_backups(storage);
+    Ok(backup)
+}
+
+pub fn downgrade_to_stable(agent: &ureq::Agent, live_state: &[u8], from_version: &str) -> Result<PathBuf, String> {
+    let storage = eframe::storage_dir(crate::app_id()).ok_or("there is no folder to back your data up in")?;
+    let version = stable_version(agent).ok_or("the latest stable release could not be found")?;
+    back_up_into(&storage, live_state, from_version, now_seconds())?;
+    install(agent, &version)
+}
+fn keep_unreadable_into(storage: &Path, raw: &str, seconds: u64) {
+    let mut kept: Vec<PathBuf> = std::fs::read_dir(storage)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(UNREADABLE_STATE_PREFIX))
+        })
+        .collect();
+    let already_kept = kept.iter().any(|path| std::fs::read_to_string(path).is_ok_and(|text| text == raw));
+    if !already_kept {
+        let file = storage.join(format!("{UNREADABLE_STATE_PREFIX}{seconds:020}.ron"));
+        if std::fs::write(&file, raw).is_ok() {
+            kept.push(file);
+        }
+    }
+    kept.sort();
+    kept.pop();
+    for older in kept {
+        let _ = std::fs::remove_file(older);
+    }
+}
+
+pub fn keep_unreadable_state(raw: &str) {
+    let Some(storage) = eframe::storage_dir(crate::app_id()) else {
+        return;
+    };
+    if std::fs::create_dir_all(&storage).is_ok() {
+        keep_unreadable_into(&storage, raw, now_seconds());
+    }
 }
 
 pub fn restart(program: &Path, arguments: &[String]) {
@@ -268,5 +453,145 @@ mod tests {
         assert_eq!(std::fs::read(folder.join("Tubefast.old")).unwrap(), b"the running version");
         assert!(!fresh.exists());
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    fn some(version: &str) -> Option<String> {
+        Some(version.to_owned())
+    }
+
+    #[test]
+    fn orders_betas_between_the_stable_before_and_the_stable_after() {
+        let order = |older: &str, newer: &str| parse_version(older).unwrap() < parse_version(newer).unwrap();
+        assert!(order("0.11.0-beta.42", "0.12.0"));
+        assert!(order("0.12.0", "0.12.0-beta.43"));
+        assert!(order("0.12.0-beta.9", "0.12.0-beta.10"));
+        assert!(order("0.12.0-beta.43", "0.12.1"));
+        assert!(order("0.9.1", "0.10.0"));
+        assert_eq!(parse_version("0.12.0"), parse_version("0.12.0"));
+    }
+
+    #[test]
+    fn parses_only_whole_versions() {
+        assert!(parse_version("0.12.0-beta.43").is_some());
+        for broken in [
+            "",
+            "nightly",
+            "0.12",
+            "0.12.0.1",
+            "0.12.x",
+            "0.12.0-beta.",
+            "0.12.0-beta.0",
+            "0.12.0-beta.x",
+            "v0.12.0",
+        ] {
+            assert_eq!(parse_version(broken), None, "{broken}");
+        }
+        assert!(is_beta("0.12.0-beta.1") && !is_beta("0.12.0"));
+    }
+
+    #[test]
+    fn offers_the_newest_candidate_that_beats_this_build() {
+        assert_eq!(newest_offer("0.11.0", some("0.12.0"), None).as_deref(), Some("0.12.0"));
+        assert_eq!(
+            newest_offer("0.11.0", some("0.12.0"), some("0.12.0-beta.7")).as_deref(),
+            Some("0.12.0-beta.7")
+        );
+        assert_eq!(
+            newest_offer("0.11.0", some("0.12.0"), some("0.11.0-beta.30")).as_deref(),
+            Some("0.12.0")
+        );
+        assert_eq!(newest_offer("0.12.0-beta.7", some("0.12.0"), some("0.12.0-beta.7")), None);
+        assert_eq!(
+            newest_offer("0.12.0-beta.7", some("0.12.0"), some("0.12.0-beta.8")).as_deref(),
+            Some("0.12.0-beta.8")
+        );
+        assert_eq!(newest_offer("0.12.0-beta.7", some("0.12.1"), None).as_deref(), Some("0.12.1"));
+        assert_eq!(newest_offer("0.11.0", some("garbage"), None), None);
+        assert_eq!(newest_offer("0.11.0", None, None), None);
+    }
+
+    #[test]
+    fn beta_builds_download_from_the_rolling_release() {
+        assert!(release_folder("0.12.0-beta.43").ends_with("/releases/download/beta"));
+        assert!(release_folder("0.12.0").ends_with("/releases/download/v0.12.0"));
+    }
+
+    fn scratch_storage(name: &str) -> PathBuf {
+        let folder = std::env::temp_dir().join(format!("tubefast-{name}-{}", std::process::id()));
+        remove_path(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    #[test]
+    fn backs_up_every_data_file_and_keeps_only_the_latest_backups() {
+        let storage = scratch_storage("backup");
+        std::fs::write(storage.join("app.ron"), "state").unwrap();
+        std::fs::write(storage.join("session.bin"), "cookie").unwrap();
+        std::fs::write(storage.join("crash.log"), "log").unwrap();
+        for seconds in [100, 200, 300, 400] {
+            let backup = back_up_into(&storage, b"{}", "0.12.0-beta.5", seconds).unwrap();
+            assert_eq!(std::fs::read_to_string(backup.join("app.ron")).unwrap(), "state");
+            assert_eq!(std::fs::read_to_string(backup.join("session.bin")).unwrap(), "cookie");
+            assert_eq!(std::fs::read(backup.join(LIVE_STATE_FILE)).unwrap(), b"{}");
+            assert!(!backup.join("crash.log").exists());
+        }
+        let mut remaining: Vec<String> = std::fs::read_dir(&storage)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(BACKUP_PREFIX))
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            ["backup-0.12.0-beta.5-200", "backup-0.12.0-beta.5-300", "backup-0.12.0-beta.5-400"]
+        );
+        assert_eq!(std::fs::read_to_string(storage.join("app.ron")).unwrap(), "state");
+        std::fs::remove_dir_all(&storage).unwrap();
+    }
+
+    #[test]
+    fn a_failed_backup_leaves_nothing_behind() {
+        let storage = scratch_storage("backup-failed");
+        let missing = storage.join("nothing-here");
+        assert!(back_up_into(&missing, b"{}", "0.12.0", 1).is_err());
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(&storage).unwrap();
+    }
+
+    #[test]
+    fn keeps_only_the_newest_distinct_unreadable_state() {
+        let storage = scratch_storage("unreadable");
+        let names = |storage: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(storage)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        keep_unreadable_into(&storage, "first", 10);
+        keep_unreadable_into(&storage, "first", 20);
+        assert_eq!(names(&storage).len(), 1);
+        keep_unreadable_into(&storage, "second", 30);
+        let left = names(&storage);
+        assert_eq!(left.len(), 1);
+        assert_eq!(std::fs::read_to_string(storage.join(&left[0])).unwrap(), "second");
+        std::fs::remove_dir_all(&storage).unwrap();
+    }
+
+    #[test]
+    fn backs_up_nested_data_but_not_the_sign_in_browser_profile() {
+        let storage = scratch_storage("backup-nested");
+        std::fs::create_dir_all(storage.join("extra")).unwrap();
+        std::fs::write(storage.join("extra").join("kept.txt"), "kept").unwrap();
+        std::fs::create_dir_all(storage.join("signin-profile")).unwrap();
+        std::fs::write(storage.join("signin-profile").join("cache"), "big").unwrap();
+        let backup = back_up_into(&storage, b"{}", "0.12.0", 5).unwrap();
+        assert_eq!(std::fs::read_to_string(backup.join("extra").join("kept.txt")).unwrap(), "kept");
+        assert!(!backup.join("signin-profile").exists());
+        std::fs::remove_dir_all(&storage).unwrap();
     }
 }
