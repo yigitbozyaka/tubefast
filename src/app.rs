@@ -11,7 +11,7 @@ use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
 use crate::tray::{self, Closing, Tray};
 use crate::ui;
-use crate::update::{self, Plan};
+use crate::update::{self, LATEST_RELEASE, Plan};
 use crate::wake;
 use crate::ytm::{Account, Client, Item, LibraryParts, LibrarySource, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
@@ -32,7 +32,6 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
 const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
-const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const HOME_SEEDS: usize = 3;
 const COVER_LOOKUPS: usize = 2;
@@ -108,6 +107,9 @@ pub struct Saved {
     pub overlay_next_up: bool,
     pub notes_seen: String,
     pub browser: String,
+    pub beta_updates: bool,
+    pub beta_stay: bool,
+    pub ui_scale: Option<f32>,
 }
 
 pub enum Words {
@@ -205,6 +207,9 @@ impl Default for Saved {
             overlay_next_up: true,
             notes_seen: String::new(),
             browser: String::new(),
+            beta_updates: false,
+            beta_stay: false,
+            ui_scale: None,
         }
     }
 }
@@ -302,6 +307,9 @@ pub enum Action {
     SwitchAccount(Account),
     Undo,
     GetUpdate,
+    BetaUpdates(bool),
+    StayOnBeta,
+    LeaveBeta,
     OpenRelease,
     CloseNotes,
     #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
@@ -318,6 +326,8 @@ pub enum Action {
     VolumeBy(f32),
     GlobalHotkeys(bool),
     HideOnClose(bool),
+    UiScale(f32),
+    ScaleStep(i8),
     Record(Option<Command>),
     ResetHotkeys,
     ToggleOverlay,
@@ -369,6 +379,11 @@ pub struct App {
     tray: Option<Tray>,
     window: isize,
     fitted: Option<egui::Vec2>,
+    native_pixels: Option<f32>,
+    zoom_pending: Option<(f32, Instant)>,
+    zoom_immediate: bool,
+    sized_for_zoom: f32,
+    monitor_fit: Option<f32>,
     replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
     playback: Arc<Mutex<Playback>>,
@@ -404,6 +419,7 @@ pub struct App {
     pub notice: Option<Notice>,
     pub update: Option<String>,
     pub updating: bool,
+    pub beta_supported: bool,
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
@@ -423,12 +439,14 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, query: Option<String>, autoplay: bool, updated: bool) -> Self {
         ui::install(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         wake::point_at_window(cc.egui_ctx.clone());
         let mut saved = starting_state(cc);
         let returning_user = saved.account.is_some() || !saved.pinned.is_empty() || !saved.recent.is_empty() || !saved.liked.is_empty();
         saved.sidebar.migrate(&saved.pinned, returning_user);
         saved.sidebar.width = usable_sidebar_width(saved.sidebar.width);
         saved.queue_width = usable_queue_width(saved.queue_width);
+        saved.ui_scale = saved.ui_scale.and_then(crate::scale::sanitized);
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
         let signed_in = yt.signed_in();
@@ -486,6 +504,11 @@ impl App {
             tray: None,
             window: tray::window_of(cc),
             fitted: None,
+            native_pixels: None,
+            zoom_pending: None,
+            zoom_immediate: true,
+            sized_for_zoom: 1.0,
+            monitor_fit: None,
             replaced: None,
             growing: None,
             playback,
@@ -520,6 +543,7 @@ impl App {
             notice: None,
             update: None,
             updating: false,
+            beta_supported: matches!(update::plan(), Plan::InPlace),
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
@@ -548,12 +572,22 @@ impl App {
         auth::secure_session_storage();
         auth::remove_leftover_sign_in_profiles();
         app.restore_account();
-        app.background(|yt| {
-            yt.refresh_clients();
-            let latest = yt.agent.head(LATEST_RELEASE).call().ok()?;
-            newer_version(latest.get_url(), VERSION).map(Event::Release)
-        });
+        app.check_for_update(true);
         app
+    }
+
+    pub fn beta_choice(&self) -> bool {
+        self.beta_supported && update::is_beta(VERSION) && !self.saved.beta_updates && !self.saved.beta_stay
+    }
+
+    fn check_for_update(&self, refresh_clients: bool) {
+        let beta = self.saved.beta_updates && self.beta_supported;
+        self.background(move |yt| {
+            if refresh_clients {
+                yt.refresh_clients();
+            }
+            update::latest(&yt.agent, beta, VERSION).map(Event::Release)
+        });
     }
 
     fn collect_saved(&mut self) {
@@ -726,6 +760,72 @@ impl App {
 
     pub fn route(&self) -> &Route {
         &self.history[self.at]
+    }
+
+    pub fn ui_scale(&self) -> Option<f32> {
+        let native = self.native_pixels?;
+        Some(crate::scale::compose(
+            self.desktop_scale(native),
+            self.saved.ui_scale,
+            self.monitor_fit_or_unknown(),
+        ))
+    }
+
+    pub fn relative_fit(&self) -> f32 {
+        let absolute = crate::scale::largest_option_up_to(self.monitor_fit_or_unknown());
+        (absolute / self.desktop_scale(self.native_pixels.unwrap_or(1.0))).clamp(crate::scale::RELATIVE_MIN, crate::scale::RELATIVE_MAX)
+    }
+
+    fn desktop_scale(&self, native: f32) -> f32 {
+        if native > 1.0 { native } else { crate::scale::detected() }
+    }
+
+    fn monitor_fit_or_unknown(&self) -> f32 {
+        self.monitor_fit.unwrap_or(crate::scale::UNKNOWN_FIT)
+    }
+
+    fn step_scale(&mut self, direction: i8) {
+        let fit = self.relative_fit();
+        let options: Vec<f32> = crate::scale::RELATIVE.into_iter().filter(|scale| *scale <= fit + 0.01).collect();
+        let current = self.saved.ui_scale.unwrap_or(1.0);
+        let next = if direction > 0 {
+            options.into_iter().find(|scale| *scale > current + 0.01)
+        } else {
+            options.into_iter().rev().find(|scale| *scale < current - 0.01)
+        };
+        if let Some(scale) = next {
+            self.saved.ui_scale = Some(scale);
+            self.zoom_immediate = true;
+            self.notify(format!("Interface scale {}", crate::scale::label(scale)));
+        }
+    }
+
+    fn keep_window_on_screen(
+        &mut self,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        monitor: Option<egui::Vec2>,
+        minimized: bool,
+        resizable: bool,
+    ) {
+        let fit = |target: [f32; 2]| match monitor {
+            Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
+            None => egui::vec2(target[0], target[1]),
+        };
+        let (wanted, floor) = (fit(WINDOW_SIZE), fit(WINDOW_MIN));
+        let overflows = monitor.is_some_and(|monitor| size.x > monitor.x + 1.0 || size.y > monitor.y + 1.0);
+        if !overflows {
+            self.fitted = None;
+        }
+        if !minimized && resizable && overflows {
+            if self.fitted != Some(wanted) {
+                self.fitted = Some(wanted);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+            }
+        } else if !minimized && (size.x < floor.x - 1.0 || size.y < floor.y - 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        }
     }
 
     pub fn now_playing(&self) -> Option<&Item> {
@@ -975,6 +1075,7 @@ impl App {
                         };
                     }
                 }
+                Event::Release(version) if update::is_beta(&version) && !self.saved.beta_updates => {}
                 Event::Release(version) => {
                     self.offer(
                         format!("{APP_NAME} {version} is out"),
@@ -1144,6 +1245,15 @@ impl App {
             if self.expanded && free && input.consume_key(Modifiers::NONE, Key::Escape) {
                 out.push(Action::Expand(false));
             }
+            if input.consume_key(Modifiers::COMMAND, Key::Equals) || input.consume_key(Modifiers::COMMAND, Key::Plus) {
+                out.push(Action::ScaleStep(1));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Minus) {
+                out.push(Action::ScaleStep(-1));
+            }
+            if input.consume_key(Modifiers::COMMAND, Key::Num0) {
+                out.push(Action::UiScale(1.0));
+            }
         });
         out
     }
@@ -1206,6 +1316,13 @@ impl App {
                 self.saved.hide_on_close = enabled;
                 self.restart_tray();
             }
+            Action::UiScale(scale) => {
+                self.saved.ui_scale = crate::scale::sanitized(scale);
+                self.zoom_immediate = true;
+                let label = crate::scale::label(self.saved.ui_scale.unwrap_or(1.0));
+                self.notify(format!("Interface scale {label}"));
+            }
+            Action::ScaleStep(direction) => self.step_scale(direction),
             Action::Record(command) => self.set_recording(command),
             Action::ResetHotkeys => {
                 self.saved.hotkey_combos = hotkeys::standard_combos();
@@ -1483,6 +1600,31 @@ impl App {
                     Plan::DownloadPage => self.apply(Action::OpenRelease, playback),
                 }
             }
+            Action::BetaUpdates(enabled) => {
+                self.saved.beta_updates = enabled;
+                self.saved.beta_stay = false;
+                if self.update.as_deref().is_some_and(update::is_beta) {
+                    self.update = None;
+                }
+                self.check_for_update(false);
+            }
+            Action::StayOnBeta => self.saved.beta_stay = true,
+            Action::LeaveBeta => {
+                if self.updating {
+                    return;
+                }
+                let Ok(live_state) = serde_json::to_vec(&self.saved) else {
+                    self.notify("Your data could not be prepared for a backup, so nothing was changed.");
+                    return;
+                };
+                self.updating = true;
+                self.offer(
+                    format!("Going back to the latest stable release. Your data is backed up first. {APP_NAME} restarts by itself."),
+                    None,
+                    UPDATE_NOTICE_TIME,
+                );
+                self.background(move |yt| Some(Event::Updated(update::downgrade_to_stable(&yt.agent, &live_state, VERSION))));
+            }
             Action::OpenRelease => {
                 self.notice = None;
                 self.ctx.open_url(egui::OpenUrl::new_tab(LATEST_RELEASE));
@@ -1540,7 +1682,9 @@ impl App {
 
     pub fn attach(&mut self, cc: &eframe::CreationContext<'_>) {
         ui::install(&cc.egui_ctx);
+        cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         self.ctx = cc.egui_ctx.clone();
+        self.zoom_immediate = true;
         wake::point_at_window(self.ctx.clone());
         self.art = Art::new(wake::wake, self.yt.agent.clone());
         self.title_bar = ui::TitleBar::new(cc);
@@ -1616,32 +1760,51 @@ impl eframe::App for App {
         } else if cfg!(all(unix, not(target_os = "macos"))) && tray::quitting() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let (size, minimized, monitor, resizable) = ctx.input(|input| {
+        let (size, minimized, monitor, resizable, native) = ctx.input(|input| {
             let viewport = input.viewport();
             (
                 input.content_rect().size(),
                 viewport.minimized == Some(true),
                 viewport.monitor_size,
                 viewport.maximized != Some(true) && viewport.fullscreen != Some(true),
+                viewport.native_pixels_per_point,
             )
         });
-        let fit = |target: [f32; 2]| match monitor {
-            Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
-            None => egui::vec2(target[0], target[1]),
-        };
-        let (wanted, floor) = (fit(WINDOW_SIZE), fit(WINDOW_MIN));
-        let overflows = monitor.is_some_and(|monitor| size.x > monitor.x + 1.0 || size.y > monitor.y + 1.0);
-        if !overflows {
+        self.native_pixels = native;
+        let zoom_settled = ctx.zoom_factor() == self.sized_for_zoom;
+        if !zoom_settled {
+            self.sized_for_zoom = ctx.zoom_factor();
             self.fitted = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(WINDOW_MIN.into()));
         }
-        if !minimized && resizable && overflows {
-            if self.fitted != Some(wanted) {
-                self.fitted = Some(wanted);
-                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        if zoom_settled
+            && let Some(monitor) = monitor
+            && native.is_some()
+        {
+            let pixels = ctx.pixels_per_point();
+            self.monitor_fit = Some(crate::scale::largest_fit((monitor.x * pixels, monitor.y * pixels)));
+        }
+        let wanted_zoom = self.ui_scale().zip(native).map(|(absolute, native)| absolute / native);
+        if let Some(scale) = wanted_zoom
+            && ctx.zoom_factor() != scale
+        {
+            let since = self
+                .zoom_pending
+                .filter(|(held, _)| *held == scale)
+                .map_or(Instant::now(), |(_, since)| since);
+            if self.zoom_immediate || since.elapsed() > Duration::from_millis(300) {
+                self.zoom_immediate = false;
+                ctx.set_zoom_factor(scale);
+                self.zoom_pending = None;
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(60));
+                self.zoom_pending = Some((scale, since));
             }
-        } else if !minimized && (size.x < floor.x - 1.0 || size.y < floor.y - 1.0) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        } else {
+            self.zoom_pending = None;
+        }
+        if zoom_settled {
+            self.keep_window_on_screen(ctx, size, monitor, minimized, resizable);
         }
         self.art.begin_frame(ctx);
         let playback = self.playback.clone();
@@ -1694,14 +1857,23 @@ impl eframe::App for App {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
-    crate::parked::recover(cc.storage.and_then(|storage| eframe::get_value(storage, eframe::APP_KEY)))
+    crate::parked::recover(stored_state(cc))
+}
+
+fn stored_state(cc: &eframe::CreationContext<'_>) -> Option<Saved> {
+    let storage = cc.storage?;
+    let state = eframe::get_value(storage, eframe::APP_KEY);
+    if state.is_none()
+        && let Some(raw) = storage.get_string(eframe::APP_KEY)
+    {
+        update::keep_unreadable_state(&raw);
+    }
+    state
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
-    cc.storage
-        .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
-        .unwrap_or_default()
+    stored_state(cc).unwrap_or_default()
 }
 
 impl Drop for App {
@@ -1736,12 +1908,6 @@ pub fn usable_opacity(opacity: f32) -> f32 {
     } else {
         opacity.clamp(OVERLAY_OPACITY_MIN, 1.0)
     }
-}
-
-fn newer_version(release_url: &str, current: &str) -> Option<String> {
-    let numbers = |version: &str| version.split('.').map(|part| part.parse().ok()).collect::<Option<Vec<u32>>>();
-    let latest = release_url.rsplit_once("/tag/v")?.1;
-    (numbers(latest)? > numbers(current)?).then(|| latest.to_owned())
 }
 
 fn toggle(list: &mut Vec<Item>, item: Item) {
@@ -1895,14 +2061,45 @@ mod tests {
         assert_eq!(notes, ["Faster search", "Lyrics stay in sync"]);
     }
 
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
+
+    fn stored(ron: &str) -> MemoryStorage {
+        let mut storage = MemoryStorage::default();
+        eframe::Storage::set_string(&mut storage, eframe::APP_KEY, ron.to_owned());
+        storage
+    }
+
     #[test]
-    fn offers_only_releases_newer_than_this_build() {
-        let release = |tag: &str| format!("https://github.com/yigitbozyaka/tubefast/releases/tag/{tag}");
-        assert_eq!(newer_version(&release("v0.2.0"), "0.1.9").as_deref(), Some("0.2.0"));
-        assert_eq!(newer_version(&release("v0.10.0"), "0.9.1").as_deref(), Some("0.10.0"));
-        assert_eq!(newer_version(&release("v0.1.0"), "0.1.0"), None);
-        assert_eq!(newer_version(&release("v0.1.0"), "0.2.0"), None);
-        assert_eq!(newer_version(&release("nightly"), "0.1.0"), None);
-        assert_eq!(newer_version("https://github.com/yigitbozyaka/tubefast/releases", "0.1.0"), None);
+    fn a_save_from_a_newer_build_with_extra_fields_still_loads() {
+        let storage = stored("(volume: 0.25, shuffle: true, a_setting_from_the_future: 7, beta_updates: true)");
+        let saved: Saved = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!((saved.volume, saved.shuffle, saved.beta_updates), (0.25, true, true));
+    }
+
+    #[test]
+    fn a_save_from_before_beta_updates_loads_with_them_off() {
+        let storage = stored("(volume: 0.25)");
+        let saved: Saved = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert!(!saved.beta_updates);
+    }
+
+    #[test]
+    fn an_unreadable_save_is_reported_as_unreadable_instead_of_empty() {
+        let storage = stored("(volume: not_a_number");
+        assert!(eframe::get_value::<Saved>(&storage, eframe::APP_KEY).is_none());
+        assert!(eframe::Storage::get_string(&storage, eframe::APP_KEY).is_some());
     }
 }

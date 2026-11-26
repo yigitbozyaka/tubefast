@@ -10,6 +10,7 @@ use crate::library::{
 };
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::overlay_wayland;
+use crate::scale;
 use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
@@ -2332,12 +2333,120 @@ fn hotkey_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
 }
 
 fn window_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    section(ui, "Window", 2.0 * CARD_PAD + SETTING_ROW, |ui| {
+    let card = section(ui, "Window", 2.0 * CARD_PAD + 2.0 * SETTING_ROW, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
         if switch_row(ui, size, icon::APP_WINDOW, "Minimize to tray on close", app.saved.hide_on_close) {
             out.push(Action::HideOnClose(!app.saved.hide_on_close));
         }
+        if let Some(scale) = scale_row(ui, size, app.saved.ui_scale.unwrap_or(1.0), app.relative_fit()) {
+            out.push(Action::UiScale(scale));
+        }
     });
+    let text = "Window scale is relative to your desktop's scaling.";
+    let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
+    label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
+}
+
+fn scale_row(ui: &mut Ui, size: Vec2, chosen: f32, fit: f32) -> Option<f32> {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let middle = rect.center().y;
+    ui.painter().text(
+        pos2(rect.left() + 22.0, middle),
+        Align2::CENTER_CENTER,
+        icon::TEXT_AA,
+        glyph(17.0),
+        MUTED,
+    );
+    let options: Vec<(String, f32)> = scale::RELATIVE.map(|value| (scale::label(value), value)).into();
+    let each = 54.0;
+    let row_width = each * options.len() as f32;
+    let name_width = rect.right() - row_width - 70.0 - rect.left();
+    label(
+        ui,
+        pos2(rect.left() + 46.0, middle),
+        Align2::LEFT_CENTER,
+        "Scale",
+        medium(13.5),
+        TEXT,
+        name_width.max(0.0),
+    );
+    let right = rect.right() - 12.0;
+    for (index, (text, value)) in options.iter().enumerate() {
+        let segment =
+            Rect::from_min_size(pos2(right - row_width + each * index as f32, middle - 14.0), vec2(each, 28.0)).shrink2(vec2(2.0, 0.0));
+        let allowed = *value <= fit + 0.01;
+        let lit = allowed && (chosen - value).abs() < 0.01;
+        let response = ui.interact(
+            segment,
+            Id::new(("scale", index)),
+            if allowed { Sense::click() } else { Sense::hover() },
+        );
+        let hover = hover_of(ui, &response);
+        let fill = match (allowed, lit) {
+            (false, _) => veil(0.03),
+            (_, true) => ACCENT.lerp_to_gamma(Color32::WHITE, 0.12 * hover),
+            (_, false) => veil(0.09 + 0.05 * hover),
+        };
+        ui.painter().rect_filled(segment, 8.0, fill);
+        let ink = match (allowed, lit) {
+            (false, _) => FAINT,
+            (_, true) => ON_ACCENT,
+            (_, false) => TEXT,
+        };
+        ui.painter().text(segment.center(), Align2::CENTER_CENTER, text, sans(12.5), ink);
+        if allowed {
+            response.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, lit, text));
+            if response.clicked() {
+                return Some(*value);
+            }
+        } else {
+            let reason = format!("{text}, not enough room on this screen");
+            response.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, false, false, &reason));
+        }
+    }
+    None
+}
+
+fn updates_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    if !app.beta_supported {
+        return;
+    }
+    let choice = if app.beta_choice() { SETTING_ROW } else { 0.0 };
+    let card = section(ui, "Updates", 2.0 * CARD_PAD + SETTING_ROW + choice, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        if switch_row(ui, size, icon::FLASK, "Beta updates", app.saved.beta_updates) {
+            out.push(Action::BetaUpdates(!app.saved.beta_updates));
+        }
+        if app.beta_choice() {
+            let (row, _) = ui.allocate_exact_size(size, Sense::hover());
+            let middle = row.center().y;
+            let stay = text_button(ui, pos2(row.right() - 14.0, middle), Id::new("beta-stay"), "Stay on this build");
+            let leave = text_button(ui, pos2(row.right() - 154.0, middle), Id::new("beta-leave"), "Go back to stable");
+            if stay.clicked() {
+                out.push(Action::StayOnBeta);
+            }
+            if leave.clicked() {
+                out.push(Action::LeaveBeta);
+            }
+            let text = "This is a beta build. Stay on it, or go back now?";
+            label(
+                ui,
+                pos2(row.left() + 46.0, middle),
+                Align2::LEFT_CENTER,
+                text,
+                medium(13.5),
+                MUTED,
+                row.width() - 340.0,
+            );
+        }
+    });
+    let text = if app.beta_choice() {
+        "Staying waits for the next stable release. Going back installs the latest stable now, after backing up your data.".to_owned()
+    } else {
+        format!("Also offers early builds of every change, which can be rough. You are on {VERSION}.")
+    };
+    let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
+    label(ui, at, Align2::LEFT_CENTER, &text, sans(12.0), FAINT, card.width());
 }
 
 fn slider_row(ui: &mut Ui, size: Vec2, symbol: &str, text: &str, value: f32, enabled: bool) -> Option<f32> {
@@ -3605,6 +3714,7 @@ fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     hotkey_section(ui, app, out);
     window_section(ui, app, out);
     overlay_section(ui, app, out);
+    updates_section(ui, app, out);
 }
 
 fn nav_item(ui: &mut Ui, symbol: &str, text: &str, active: bool, trailing: &str) -> Response {

@@ -1,4 +1,6 @@
 - Sign in with Brave Origin or Helium on Linux as well
+- On Linux the interface follows your desktop's scaling, such as Xfce's 2x, so text no longer looks tiny
+- Settings has a Scale row to make everything larger or smaller, and Ctrl + and Ctrl - change it too
 - The media overlay now also works on Linux Wayland desktops that support layer shell, such as KDE Plasma, Sway and Hyprland. It does not work on GNOME, and Settings says so
 - On Linux Wayland, closing the window to the tray now really hides it (it leaves the taskbar and Alt+Tab while the music plays on), Quit in the tray menu works even when the window is minimized, and a desktop with no tray makes the close button quit as usual
 - Turning shuffle off puts the queue back in its normal order
@@ -8,3 +10,4 @@
 - The collapsed sidebar now has a visible button to open it again, and the now playing panel on the right can be hidden, shown and resized
 - Podcasts and videos play their original audio instead of an automatically dubbed language
 - Songs that are no longer available are skipped
+- New Beta updates switch in Settings to try early builds. Turning it off on a beta lets you stay put or go back to the latest stable release, with your data backed up first
