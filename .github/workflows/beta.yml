@@ -1,0 +1,56 @@
+name: Beta
+
+on:
+  push:
+    branches: [master]
+    paths-ignore: ["docs/**"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: beta
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      beta_number: ${{ github.run_number }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            Cargo.toml
+            RELEASE_NOTES.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BETA_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          echo "${cargo_version}-beta.${BETA_NUMBER}" > dist/version.txt
+          cd dist
+          rm -f tubefast.json
+          sha256sum tubefast-windows-x64.zip tubefast.exe tubefast-macos-universal.zip tubefast-linux-x64 tubefast-linux-x64.tar.gz Tubefast-x86_64.AppImage > SHA256SUMS.txt
+          if ! gh release view beta > /dev/null 2>&1; then
+            gh release create beta --prerelease --latest=false --target "$GITHUB_SHA" --title "Tubefast beta" --notes-file ../RELEASE_NOTES.md
+          fi
+          gh api --method PATCH "repos/$GH_REPO/git/refs/tags/beta" -f sha="$GITHUB_SHA" -F force=true
+          gh release edit beta --prerelease --latest=false --target "$GITHUB_SHA" --title "Tubefast beta $(cat version.txt)" --notes-file ../RELEASE_NOTES.md
+          gh release upload beta tubefast-windows-x64.zip tubefast.exe tubefast-macos-universal.zip tubefast-linux-x64 tubefast-linux-x64.tar.gz Tubefast-x86_64.AppImage --clobber
+          gh release upload beta SHA256SUMS.txt --clobber
+          gh release upload beta version.txt --clobber

@@ -7,7 +7,7 @@ use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
 use crate::tray::{self, Closing, Tray};
 use crate::ui;
-use crate::update::{self, Plan};
+use crate::update::{self, LATEST_RELEASE, Plan};
 use crate::wake;
 use crate::ytm::{Account, Client, Item, Lyrics, Page, QUICK_PICKS, Section, Target, VIDEO_FRAME_HOST};
 use crate::{APP_NAME, VERSION};
@@ -28,7 +28,6 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
 const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
-const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
 const PROGRESS_TICK: Duration = Duration::from_millis(250);
 const HOME_SEEDS: usize = 3;
 const COVER_LOOKUPS: usize = 2;
@@ -98,6 +97,7 @@ pub struct Saved {
     pub overlay_next_up: bool,
     pub notes_seen: String,
     pub browser: String,
+    pub beta_updates: bool,
 }
 
 pub enum Words {
@@ -180,6 +180,7 @@ impl Default for Saved {
             overlay_next_up: true,
             notes_seen: String::new(),
             browser: String::new(),
+            beta_updates: false,
         }
     }
 }
@@ -242,6 +243,9 @@ pub enum Action {
     SwitchAccount(Account),
     Undo,
     GetUpdate,
+    BetaUpdates(bool),
+    StayOnBeta,
+    LeaveBeta,
     OpenRelease,
     CloseNotes,
     #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
@@ -332,6 +336,8 @@ pub struct App {
     pub notice: Option<Notice>,
     pub update: Option<String>,
     pub updating: bool,
+    pub beta_supported: bool,
+    pub beta_choice: bool,
     pub discord_linked: Option<bool>,
     pub hotkey_taken: Vec<Command>,
     pub recording: Option<Command>,
@@ -429,6 +435,8 @@ impl App {
             notice: None,
             update: None,
             updating: false,
+            beta_supported: matches!(update::plan(), Plan::InPlace),
+            beta_choice: false,
             discord_linked: None,
             hotkey_taken: Vec::new(),
             recording: None,
@@ -457,12 +465,18 @@ impl App {
         auth::secure_session_storage();
         auth::remove_leftover_sign_in_profiles();
         app.restore_account();
-        app.background(|yt| {
-            yt.refresh_clients();
-            let latest = yt.agent.head(LATEST_RELEASE).call().ok()?;
-            newer_version(latest.get_url(), VERSION).map(Event::Release)
-        });
+        app.check_for_update(true);
         app
+    }
+
+    fn check_for_update(&self, refresh_clients: bool) {
+        let beta = self.saved.beta_updates && self.beta_supported;
+        self.background(move |yt| {
+            if refresh_clients {
+                yt.refresh_clients();
+            }
+            update::latest(&yt.agent, beta, VERSION).map(Event::Release)
+        });
     }
 
     fn collect_saved(&mut self) {
@@ -858,6 +872,7 @@ impl App {
                         };
                     }
                 }
+                Event::Release(version) if update::is_beta(&version) && !self.saved.beta_updates => {}
                 Event::Release(version) => {
                     self.offer(
                         format!("{APP_NAME} {version} is out"),
@@ -1199,6 +1214,29 @@ impl App {
                     Plan::DownloadPage => self.apply(Action::OpenRelease, playback),
                 }
             }
+            Action::BetaUpdates(enabled) => {
+                self.saved.beta_updates = enabled;
+                self.beta_choice = !enabled && update::is_beta(VERSION);
+                if self.update.as_deref().is_some_and(update::is_beta) {
+                    self.update = None;
+                }
+                self.check_for_update(false);
+            }
+            Action::StayOnBeta => self.beta_choice = false,
+            Action::LeaveBeta => {
+                self.beta_choice = false;
+                if self.updating {
+                    return;
+                }
+                self.updating = true;
+                self.offer(
+                    format!("Going back to the latest stable release. Your data is backed up first. {APP_NAME} restarts by itself."),
+                    None,
+                    UPDATE_NOTICE_TIME,
+                );
+                let live_state = serde_json::to_vec(&self.saved).unwrap_or_default();
+                self.background(move |yt| Some(Event::Updated(update::downgrade_to_stable(&yt.agent, &live_state, VERSION))));
+            }
             Action::OpenRelease => {
                 self.notice = None;
                 self.ctx.open_url(egui::OpenUrl::new_tab(LATEST_RELEASE));
@@ -1410,14 +1448,23 @@ impl eframe::App for App {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
-    crate::parked::recover(cc.storage.and_then(|storage| eframe::get_value(storage, eframe::APP_KEY)))
+    crate::parked::recover(stored_state(cc))
+}
+
+fn stored_state(cc: &eframe::CreationContext<'_>) -> Option<Saved> {
+    let storage = cc.storage?;
+    let state = eframe::get_value(storage, eframe::APP_KEY);
+    if state.is_none()
+        && let Some(raw) = storage.get_string(eframe::APP_KEY)
+    {
+        update::keep_unreadable_state(&raw);
+    }
+    state
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn starting_state(cc: &eframe::CreationContext<'_>) -> Saved {
-    cc.storage
-        .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
-        .unwrap_or_default()
+    stored_state(cc).unwrap_or_default()
 }
 
 impl Drop for App {
@@ -1444,12 +1491,6 @@ pub fn usable_opacity(opacity: f32) -> f32 {
     } else {
         opacity.clamp(OVERLAY_OPACITY_MIN, 1.0)
     }
-}
-
-fn newer_version(release_url: &str, current: &str) -> Option<String> {
-    let numbers = |version: &str| version.split('.').map(|part| part.parse().ok()).collect::<Option<Vec<u32>>>();
-    let latest = release_url.rsplit_once("/tag/v")?.1;
-    (numbers(latest)? > numbers(current)?).then(|| latest.to_owned())
 }
 
 fn toggle(list: &mut Vec<Item>, item: Item) {
@@ -1553,14 +1594,45 @@ mod tests {
         assert_eq!(notes, ["Faster search", "Lyrics stay in sync"]);
     }
 
+    #[derive(Default)]
+    struct MemoryStorage(HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_owned(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
+
+    fn stored(ron: &str) -> MemoryStorage {
+        let mut storage = MemoryStorage::default();
+        eframe::Storage::set_string(&mut storage, eframe::APP_KEY, ron.to_owned());
+        storage
+    }
+
     #[test]
-    fn offers_only_releases_newer_than_this_build() {
-        let release = |tag: &str| format!("https://github.com/yigitbozyaka/tubefast/releases/tag/{tag}");
-        assert_eq!(newer_version(&release("v0.2.0"), "0.1.9").as_deref(), Some("0.2.0"));
-        assert_eq!(newer_version(&release("v0.10.0"), "0.9.1").as_deref(), Some("0.10.0"));
-        assert_eq!(newer_version(&release("v0.1.0"), "0.1.0"), None);
-        assert_eq!(newer_version(&release("v0.1.0"), "0.2.0"), None);
-        assert_eq!(newer_version(&release("nightly"), "0.1.0"), None);
-        assert_eq!(newer_version("https://github.com/yigitbozyaka/tubefast/releases", "0.1.0"), None);
+    fn a_save_from_a_newer_build_with_extra_fields_still_loads() {
+        let storage = stored("(volume: 0.25, shuffle: true, a_setting_from_the_future: 7, beta_updates: true)");
+        let saved: Saved = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert_eq!((saved.volume, saved.shuffle, saved.beta_updates), (0.25, true, true));
+    }
+
+    #[test]
+    fn a_save_from_before_beta_updates_loads_with_them_off() {
+        let storage = stored("(volume: 0.25)");
+        let saved: Saved = eframe::get_value(&storage, eframe::APP_KEY).unwrap();
+        assert!(!saved.beta_updates);
+    }
+
+    #[test]
+    fn an_unreadable_save_is_reported_as_unreadable_instead_of_empty() {
+        let storage = stored("(volume: not_a_number");
+        assert!(eframe::get_value::<Saved>(&storage, eframe::APP_KEY).is_none());
+        assert!(eframe::Storage::get_string(&storage, eframe::APP_KEY).is_some());
     }
 }
