@@ -2199,11 +2199,16 @@ fn discord_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
 }
 
 fn translation_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
-    let note_height = 44.0;
-    let height = 2.0 * CARD_PAD + 2.0 * SETTING_ROW + note_height;
-    section(ui, "Lyrics translation", height, |ui| {
+    let height = 2.0 * CARD_PAD + 2.0 * SETTING_ROW;
+    let card = section(ui, "Lyrics translation", height, |ui| {
         let size = vec2(ui.available_width(), SETTING_ROW);
         let (row, _) = ui.allocate_exact_size(size, Sense::hover());
+        let field_id = Id::new("deepl-key");
+        let focused = ui.memory(|memory| memory.has_focus(field_id));
+        let lit = ui
+            .ctx()
+            .animate_bool_with_time(field_id.with("lit"), focused || ui.rect_contains_pointer(row), HOVER_TIME);
+        ui.painter().rect_filled(row, 7.0, veil(0.08 * lit));
         ui.painter().text(
             pos2(row.left() + 22.0, row.center().y),
             Align2::CENTER_CENTER,
@@ -2211,14 +2216,10 @@ fn translation_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
             glyph(17.0),
             MUTED,
         );
-        let field = Rect::from_min_max(
-            pos2(row.left() + 46.0, row.top() + 7.0),
-            pos2(row.right() - 8.0, row.bottom() - 7.0),
-        );
-        ui.painter().rect_filled(field, 7.0, veil(0.07));
+        let field = Rect::from_min_max(pos2(row.left() + 46.0, row.top()), pos2(row.right() - 12.0, row.bottom()));
         let mut key = app.translation_draft.clone();
         let edit = egui::TextEdit::singleline(&mut key)
-            .id(Id::new("deepl-key"))
+            .id(field_id)
             .password(true)
             .frame(false)
             .margin(Margin::ZERO)
@@ -2226,7 +2227,7 @@ fn translation_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
             .text_color(TEXT)
             .vertical_align(Align::Center)
             .hint_text(RichText::new("DeepL API key").color(FAINT));
-        let typed = ui.put(field.shrink2(vec2(10.0, 0.0)), edit);
+        let typed = ui.put(field, edit);
         typed.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "DeepL API key"));
         if typed.changed() {
             out.push(Action::TranslationKeyTyped(key));
@@ -2258,12 +2259,10 @@ fn translation_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
                 }
             });
         });
-        let (note, _) = ui.allocate_exact_size(vec2(size.x, note_height), Sense::hover());
-        let text = "Bring your own DeepL key. Lyrics are sent to DeepL only while Show translation is on in the lyrics panel.";
-        let galley = fit(ui, text, sans(12.0), MUTED, size.x - 58.0, 3);
-        ui.painter()
-            .galley(pos2(note.left() + 46.0, note.center().y - galley.size().y / 2.0), galley, MUTED);
     });
+    let text = "Your own DeepL key. Lyrics go to DeepL only while Show translation is on in the lyrics panel.";
+    let at = pos2(card.left() + 4.0, card.bottom() + SECTION_GAP / 2.0);
+    label(ui, at, Align2::LEFT_CENTER, text, sans(12.0), FAINT, card.width());
 }
 
 fn notice_section(ui: &mut Ui, title: &str, symbol: &str, reason: &str) {
