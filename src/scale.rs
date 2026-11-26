@@ -10,9 +10,13 @@ pub fn label(scale: f32) -> String {
     format!("{}%", (scale * 100.0).round())
 }
 
-pub fn largest_fit(monitor: (f32, f32), native: f32) -> f32 {
-    let width = monitor.0 / (crate::app::WINDOW_MIN[0] * native);
-    let height = monitor.1 / (crate::app::WINDOW_MIN[1] * native);
+pub fn sanitized(scale: f32) -> Option<f32> {
+    scale.is_finite().then(|| scale.clamp(RELATIVE_MIN, RELATIVE_MAX))
+}
+
+pub fn largest_fit(monitor: (f32, f32)) -> f32 {
+    let width = monitor.0 / crate::app::WINDOW_MIN[0];
+    let height = monitor.1 / crate::app::WINDOW_MIN[1];
     width.min(height).clamp(1.0, ABSOLUTE_MAX)
 }
 
@@ -121,12 +125,20 @@ mod tests {
 
     #[test]
     fn never_allows_a_scale_where_the_window_cannot_fit() {
-        assert_eq!(largest_fit((3840.0, 2160.0), 1.0), 3.0);
-        assert!((largest_fit((1920.0, 1080.0), 1.0) - 1.8).abs() < 0.01);
-        assert!((largest_fit((1080.0, 1920.0), 1.0) - 1080.0f32 / 940.0).abs() < 0.01);
-        assert_eq!(largest_fit((1024.0, 768.0), 1.0), (1024.0f32 / 940.0).min(768.0 / 600.0));
-        assert_eq!(largest_fit((800.0, 500.0), 1.0), 1.0);
+        assert_eq!(largest_fit((3840.0, 2160.0)), 3.0);
+        assert!((largest_fit((1920.0, 1080.0)) - 1.8).abs() < 0.01);
+        assert!((largest_fit((1080.0, 1920.0)) - 1080.0f32 / 940.0).abs() < 0.01);
+        assert_eq!(largest_fit((1024.0, 768.0)), (1024.0f32 / 940.0).min(768.0 / 600.0));
+        assert_eq!(largest_fit((800.0, 500.0)), 1.0);
         assert_eq!(compose(2.0, Some(2.0), 1.8), 1.5);
+    }
+
+    #[test]
+    fn saved_scales_out_of_range_are_clamped() {
+        assert_eq!(sanitized(0.0), Some(RELATIVE_MIN));
+        assert_eq!(sanitized(50.0), Some(RELATIVE_MAX));
+        assert_eq!(sanitized(1.25), Some(1.25));
+        assert_eq!(sanitized(f32::NAN), None);
     }
 
     #[test]

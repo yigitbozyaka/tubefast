@@ -316,6 +316,7 @@ pub struct App {
     native_pixels: Option<f32>,
     zoom_pending: Option<(f32, Instant)>,
     zoom_immediate: bool,
+    sized_for_zoom: f32,
     monitor_fit: Option<f32>,
     replaced: Option<Replaced>,
     growing: Option<(Route, usize, usize)>,
@@ -362,9 +363,7 @@ impl App {
         cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         wake::point_at_window(cc.egui_ctx.clone());
         let mut saved = starting_state(cc);
-        saved.ui_scale = saved
-            .ui_scale
-            .map(|scale| scale.clamp(crate::scale::RELATIVE_MIN, crate::scale::RELATIVE_MAX));
+        saved.ui_scale = saved.ui_scale.and_then(crate::scale::sanitized);
         let yt = Arc::new(Client::new(saved.visitor.clone()));
         yt.set_session(auth::load());
         if !yt.signed_in() {
@@ -421,7 +420,8 @@ impl App {
             fitted: None,
             native_pixels: None,
             zoom_pending: None,
-            zoom_immediate: false,
+            zoom_immediate: true,
+            sized_for_zoom: 1.0,
             monitor_fit: None,
             replaced: None,
             growing: None,
@@ -686,6 +686,34 @@ impl App {
             self.saved.ui_scale = Some(scale);
             self.zoom_immediate = true;
             self.notify(format!("Interface scale {}", crate::scale::label(scale)));
+        }
+    }
+
+    fn keep_window_on_screen(
+        &mut self,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        monitor: Option<egui::Vec2>,
+        minimized: bool,
+        resizable: bool,
+    ) {
+        let fit = |target: [f32; 2]| match monitor {
+            Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
+            None => egui::vec2(target[0], target[1]),
+        };
+        let (wanted, floor) = (fit(WINDOW_SIZE), fit(WINDOW_MIN));
+        let overflows = monitor.is_some_and(|monitor| size.x > monitor.x + 1.0 || size.y > monitor.y + 1.0);
+        if !overflows {
+            self.fitted = None;
+        }
+        if !minimized && resizable && overflows {
+            if self.fitted != Some(wanted) {
+                self.fitted = Some(wanted);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+            }
+        } else if !minimized && (size.x < floor.x - 1.0 || size.y < floor.y - 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
         }
     }
 
@@ -1145,7 +1173,7 @@ impl App {
                 self.restart_tray();
             }
             Action::UiScale(scale) => {
-                self.saved.ui_scale = Some(scale.clamp(crate::scale::RELATIVE_MIN, crate::scale::RELATIVE_MAX));
+                self.saved.ui_scale = crate::scale::sanitized(scale);
                 self.zoom_immediate = true;
                 let label = crate::scale::label(self.saved.ui_scale.unwrap_or(1.0));
                 self.notify(format!("Interface scale {label}"));
@@ -1328,6 +1356,7 @@ impl App {
         ui::install(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         self.ctx = cc.egui_ctx.clone();
+        self.zoom_immediate = true;
         wake::point_at_window(self.ctx.clone());
         self.art = Art::new(wake::wake, self.yt.agent.clone());
         self.title_bar = ui::TitleBar::new(cc);
@@ -1414,9 +1443,18 @@ impl eframe::App for App {
             )
         });
         self.native_pixels = native;
-        if let (Some(native), Some(monitor)) = (native, monitor) {
+        let zoom_settled = ctx.zoom_factor() == self.sized_for_zoom;
+        if !zoom_settled {
+            self.sized_for_zoom = ctx.zoom_factor();
+            self.fitted = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(WINDOW_MIN.into()));
+        }
+        if zoom_settled
+            && let Some(monitor) = monitor
+            && native.is_some()
+        {
             let pixels = ctx.pixels_per_point();
-            self.monitor_fit = Some(crate::scale::largest_fit((monitor.x * pixels, monitor.y * pixels), native));
+            self.monitor_fit = Some(crate::scale::largest_fit((monitor.x * pixels, monitor.y * pixels)));
         }
         let wanted_zoom = self.ui_scale().zip(native).map(|(absolute, native)| absolute / native);
         if let Some(scale) = wanted_zoom
@@ -1437,23 +1475,8 @@ impl eframe::App for App {
         } else {
             self.zoom_pending = None;
         }
-        let fit = |target: [f32; 2]| match monitor {
-            Some(monitor) => egui::vec2(target[0].min(monitor.x * 0.95), target[1].min(monitor.y * 0.9)),
-            None => egui::vec2(target[0], target[1]),
-        };
-        let (wanted, floor) = (fit(WINDOW_SIZE), fit(WINDOW_MIN));
-        let overflows = monitor.is_some_and(|monitor| size.x > monitor.x + 1.0 || size.y > monitor.y + 1.0);
-        if !overflows {
-            self.fitted = None;
-        }
-        if !minimized && resizable && overflows {
-            if self.fitted != Some(wanted) {
-                self.fitted = Some(wanted);
-                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(floor));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
-            }
-        } else if !minimized && (size.x < floor.x - 1.0 || size.y < floor.y - 1.0) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        if zoom_settled {
+            self.keep_window_on_screen(ctx, size, monitor, minimized, resizable);
         }
         self.art.begin_frame(ctx);
         let playback = self.playback.clone();
