@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const APP_NAME: &str = "Tubefast";
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = env!("TUBEFAST_VERSION");
 const APP_ID: &str = "tubefast";
 const CRASH_LOG: &str = "crash.log";
 const CRASH_LOG_BYTES: u64 = 64 * 1024;

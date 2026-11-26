@@ -8,3 +8,4 @@
 - The queue panel now shows the whole queue, including songs that already played, and you can click any song to jump to it
 - Podcasts and videos play their original audio instead of an automatically dubbed language
 - Songs that are no longer available are skipped
+- New Beta updates switch in Settings to try early builds. Turning it off on a beta lets you stay put or go back to the latest stable release, with your data backed up first

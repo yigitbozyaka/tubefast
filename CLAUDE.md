@@ -39,6 +39,7 @@ Big files: `ui.rs` (~2.9k lines), `ytm.rs` (~1.5k) and `app.rs` (~1.3k). Grep fo
 ## Rules
 
 - No code comments. Intent goes in names.
+- Changes to Saved must stay readable by older builds: only add fields with defaults, never rename a field or change its type, because a downgrade has an older build read the newer save.
 - No new dependency without a strong reason. Memory and startup time are features.
 - `rustfmt.toml` sets `max_width = 140`.
 - `master` is protected. Work on a branch, open a PR, PRs are squashed. Commit and PR titles are one plain user-facing sentence, e.g. "Loud songs no longer crackle".
