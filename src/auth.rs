@@ -412,6 +412,24 @@ pub fn load() -> Option<String> {
     read_session(&session_file()?)
 }
 
+fn translation_key_file() -> Option<PathBuf> {
+    Some(eframe::storage_dir(app_id())?.join("deepl.bin"))
+}
+
+pub fn store_translation_key(key: &str) -> Result<(), String> {
+    let file = translation_key_file().ok_or("There is no folder to keep the key in.")?;
+    let _lock = lock_session(&file);
+    if key.is_empty() {
+        let _ = std::fs::remove_file(file);
+        return Ok(());
+    }
+    write_session(&file, key).map_err(|_| "The key could not be kept on this system.".to_owned())
+}
+
+pub fn load_translation_key() -> Option<String> {
+    read_session(&translation_key_file()?)
+}
+
 pub fn forget() {
     if let Some(file) = session_file() {
         let _lock = lock_session(&file);

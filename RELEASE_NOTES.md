@@ -10,4 +10,5 @@
 - The collapsed sidebar now has a visible button to open it again, and the now playing panel on the right can be hidden, shown and resized
 - Podcasts and videos play their original audio instead of an automatically dubbed language
 - Songs that are no longer available are skipped
+- Lyrics can be translated line by line with your own DeepL key, under the original lines, off until you turn it on
 - New Beta updates switch in Settings to try early builds. Turning it off on a beta lets you stay put or go back to the latest stable release, with your data backed up first

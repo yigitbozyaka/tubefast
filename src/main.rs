@@ -16,6 +16,7 @@ mod playback;
 mod player;
 mod romanize;
 mod scale;
+mod translate;
 mod tray;
 mod ui;
 mod update;

@@ -9,6 +9,7 @@ use crate::library::{
 use crate::media::Media;
 use crate::playback::{self, Playback, Replaced, Signal};
 use crate::player::{Player, Speaker, Status};
+use crate::translate::{self, Failure};
 use crate::tray::{self, Closing, Tray};
 use crate::ui;
 use crate::update::{self, LATEST_RELEASE, Plan};
@@ -29,6 +30,7 @@ const RECENT_LIMIT: usize = 100;
 const CACHED_PAGES: usize = 24;
 const PAGES_KEPT_ON_TRIM: usize = 8;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
+const TRANSLATIONS_KEPT: usize = 30;
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
 const RELEASE_NOTES: &str = include_str!("../RELEASE_NOTES.md");
@@ -93,6 +95,8 @@ pub struct Saved {
     pub position_ms: u64,
     pub lyrics_open: bool,
     pub lyrics_romanized: bool,
+    pub lyrics_translated: bool,
+    pub translation_language: String,
     pub discord: bool,
     pub discord_headline: Headline,
     pub discord_name: String,
@@ -117,6 +121,12 @@ pub enum Words {
     Ready(Lyrics),
     Missing,
     Failed,
+}
+
+pub enum Translation {
+    Loading,
+    Ready(Vec<Option<String>>),
+    Failed(Failure),
 }
 
 pub struct Notice {
@@ -194,6 +204,8 @@ impl Default for Saved {
             position_ms: 0,
             lyrics_open: false,
             lyrics_romanized: false,
+            lyrics_translated: false,
+            translation_language: translate::system_language(),
             discord: false,
             discord_headline: Headline::App,
             discord_name: String::new(),
@@ -318,6 +330,10 @@ pub enum Action {
     Expand(bool),
     ShowLyrics(bool),
     RomanizeLyrics(bool),
+    TranslateLyrics(bool),
+    TranslationLanguage(String),
+    TranslationKeyTyped(String),
+    TranslationKeyKept,
     ClearHistory,
     RestoreHistory(Vec<Item>),
     ShowOnDiscord(bool),
@@ -354,6 +370,7 @@ enum Event {
     Release(String),
     Updated(Result<PathBuf, String>),
     Lyrics(String, Result<Option<Lyrics>, String>),
+    Translation(String, String, Result<Vec<Option<String>>, Failure>),
     Discord(bool),
     Pressed(Action),
 }
@@ -414,6 +431,10 @@ pub struct App {
     pub focus_search: bool,
     pub expanded: bool,
     pub lyrics: Option<(String, Words)>,
+    pub translation: Option<(String, String, Translation)>,
+    pub translation_key: String,
+    pub translation_draft: String,
+    translations: HashMap<(String, String), Vec<Option<String>>>,
     pub title_bar: ui::TitleBar,
     pub saved: Saved,
     pub notice: Option<Notice>,
@@ -442,6 +463,7 @@ impl App {
         cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
         wake::point_at_window(cc.egui_ctx.clone());
         let mut saved = starting_state(cc);
+        let translation_key = auth::load_translation_key().unwrap_or_default();
         let returning_user = saved.account.is_some() || !saved.pinned.is_empty() || !saved.recent.is_empty() || !saved.liked.is_empty();
         saved.sidebar.migrate(&saved.pinned, returning_user);
         saved.sidebar.width = usable_sidebar_width(saved.sidebar.width);
@@ -538,6 +560,10 @@ impl App {
             focus_search: false,
             expanded: false,
             lyrics: None,
+            translation: None,
+            translation_draft: translation_key.clone(),
+            translation_key,
+            translations: HashMap::new(),
             title_bar: ui::TitleBar::new(cc),
             saved,
             notice: None,
@@ -656,6 +682,48 @@ impl App {
         self.background(move |yt| {
             let found = yt.lyrics(&song, seconds);
             Some(Event::Lyrics(song.video_id, found))
+        });
+    }
+
+    fn look_up_translation(&mut self) {
+        let wanted = self.saved.lyrics_translated && self.saved.lyrics_open && self.expanded && !self.translation_key.is_empty();
+        if !wanted {
+            return;
+        }
+        let (video_id, lines) = match &self.lyrics {
+            Some((video_id, Words::Ready(lyrics))) => (
+                video_id.clone(),
+                lyrics.lines.iter().map(|(_, line)| line.clone()).collect::<Vec<_>>(),
+            ),
+            _ => return,
+        };
+        let target = self.saved.translation_language.clone();
+        if self
+            .translation
+            .as_ref()
+            .is_some_and(|(known, language, _)| *known == video_id && *language == target)
+        {
+            return;
+        }
+        if let Some(done) = self.translations.get(&(video_id.clone(), target.clone())) {
+            self.translation = Some((video_id, target, Translation::Ready(done.clone())));
+            return;
+        }
+        let key = self.translation_key.clone();
+        self.translation = Some((video_id.clone(), target.clone(), Translation::Loading));
+        self.background(move |yt| {
+            let found = match translate::read_cache(&video_id, &target, lines.len()) {
+                Some(stored) => Ok(stored),
+                None => {
+                    let texts: Vec<&str> = lines.iter().map(String::as_str).collect();
+                    let fresh = translate::translate(&yt.agent, &key, &texts, &target);
+                    if let Ok(done) = &fresh {
+                        translate::write_cache(&video_id, &target, done);
+                    }
+                    fresh
+                }
+            };
+            Some(Event::Translation(video_id, target, found))
         });
     }
 
@@ -1073,6 +1141,25 @@ impl App {
                             Ok(None) => Words::Missing,
                             Err(_) => Words::Failed,
                         };
+                    }
+                }
+                Event::Translation(video_id, target, found) => {
+                    let current = self
+                        .translation
+                        .as_ref()
+                        .is_some_and(|(known, language, _)| *known == video_id && *language == target);
+                    if current {
+                        let state = match found {
+                            Ok(lines) => {
+                                if self.translations.len() > TRANSLATIONS_KEPT {
+                                    self.translations.clear();
+                                }
+                                self.translations.insert((video_id.clone(), target.clone()), lines.clone());
+                                Translation::Ready(lines)
+                            }
+                            Err(failure) => Translation::Failed(failure),
+                        };
+                        self.translation = Some((video_id, target, state));
                     }
                 }
                 Event::Release(version) if update::is_beta(&version) && !self.saved.beta_updates => {}
@@ -1633,6 +1720,26 @@ impl App {
             Action::Move(from, gap) => playback.reorder(from, gap),
             Action::Expand(open) => self.expanded = open && self.saved.current.is_some(),
             Action::RomanizeLyrics(romanized) => self.saved.lyrics_romanized = romanized,
+            Action::TranslateLyrics(on) => {
+                self.saved.lyrics_translated = on;
+                if matches!(self.translation, Some((_, _, Translation::Failed(_)))) {
+                    self.translation = None;
+                }
+            }
+            Action::TranslationLanguage(code) => self.saved.translation_language = code,
+            Action::TranslationKeyTyped(text) => self.translation_draft = text,
+            Action::TranslationKeyKept => {
+                let key = self.translation_draft.trim().to_owned();
+                if key != self.translation_key {
+                    match auth::store_translation_key(&key) {
+                        Ok(()) => {
+                            self.translation_key = key;
+                            self.translation = None;
+                        }
+                        Err(reason) => self.offer(reason, None, NOTICE_TIME),
+                    }
+                }
+            }
             Action::ShowLyrics(open) => {
                 self.saved.lyrics_open = open;
                 if matches!(self.lyrics, Some((_, Words::Failed))) {
@@ -1824,6 +1931,7 @@ impl eframe::App for App {
         drop(playback);
         self.look_up_covers();
         self.look_up_lyrics();
+        self.look_up_translation();
         if self.playing() || self.player.loading() {
             ctx.request_repaint_after(PROGRESS_TICK);
         }
