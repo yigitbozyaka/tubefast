@@ -14,6 +14,7 @@ mod parked;
 mod playback;
 mod player;
 mod romanize;
+mod translate;
 mod tray;
 mod ui;
 mod update;

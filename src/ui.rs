@@ -1,9 +1,10 @@
-use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, Words, usable_opacity};
+use crate::app::{Action, App, Covers, Load, OVERLAY_OPACITY_MIN, Repeat, Route, Translation, Words, usable_opacity};
 use crate::art::Art;
 use crate::discord::Headline;
 use crate::hotkeys::{self, Command};
 #[cfg(all(unix, not(target_os = "macos")))]
 use crate::overlay_wayland;
+use crate::translate;
 use crate::ytm::{Item, Layout, Section};
 use crate::{APP_NAME, VERSION};
 use eframe::egui::ecolor::Hsva;
@@ -2197,6 +2198,74 @@ fn discord_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     });
 }
 
+fn translation_section(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
+    let note_height = 44.0;
+    let height = 2.0 * CARD_PAD + 2.0 * SETTING_ROW + note_height;
+    section(ui, "Lyrics translation", height, |ui| {
+        let size = vec2(ui.available_width(), SETTING_ROW);
+        let (row, _) = ui.allocate_exact_size(size, Sense::hover());
+        ui.painter().text(
+            pos2(row.left() + 22.0, row.center().y),
+            Align2::CENTER_CENTER,
+            icon::KEY,
+            glyph(17.0),
+            MUTED,
+        );
+        let field = Rect::from_min_max(
+            pos2(row.left() + 46.0, row.top() + 7.0),
+            pos2(row.right() - 8.0, row.bottom() - 7.0),
+        );
+        ui.painter().rect_filled(field, 7.0, veil(0.07));
+        let mut key = app.translation_draft.clone();
+        let edit = egui::TextEdit::singleline(&mut key)
+            .id(Id::new("deepl-key"))
+            .password(true)
+            .frame(false)
+            .margin(Margin::ZERO)
+            .font(medium(13.5))
+            .text_color(TEXT)
+            .vertical_align(Align::Center)
+            .hint_text(RichText::new("DeepL API key").color(FAINT));
+        let typed = ui.put(field.shrink2(vec2(10.0, 0.0)), edit);
+        typed.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "DeepL API key"));
+        if typed.changed() {
+            out.push(Action::TranslationKeyTyped(key));
+        }
+        if typed.lost_focus() {
+            out.push(Action::TranslationKeyKept);
+        }
+        let chosen = app.saved.translation_language.as_str();
+        let name = format!("Translate to {}", translate::language_name(chosen));
+        let picker = wide_row(ui, size, icon::TRANSLATE, glyph(17.0), MUTED, &name);
+        ui.painter().text(
+            pos2(picker.rect.right() - 22.0, picker.rect.center().y),
+            Align2::CENTER_CENTER,
+            icon::CARET_DOWN,
+            glyph(14.0),
+            FAINT,
+        );
+        egui::Popup::menu(&picker).gap(4.0).show(|ui| {
+            ui.set_width(MENU_WIDTH);
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for (code, language) in translate::LANGUAGES {
+                    let selected = code == chosen;
+                    let symbol = if selected { icon::CHECK } else { "" };
+                    let row = menu_row(ui, symbol, glyph(15.0), ACCENT, language);
+                    row.widget_info(|| WidgetInfo::selected(WidgetType::RadioButton, true, selected, language));
+                    if row.clicked() && !selected {
+                        out.push(Action::TranslationLanguage(code.to_owned()));
+                    }
+                }
+            });
+        });
+        let (note, _) = ui.allocate_exact_size(vec2(size.x, note_height), Sense::hover());
+        let text = "Bring your own DeepL key. Lyrics are sent to DeepL only while Show translation is on in the lyrics panel.";
+        let galley = fit(ui, text, sans(12.0), MUTED, size.x - 58.0, 3);
+        ui.painter()
+            .galley(pos2(note.left() + 46.0, note.center().y - galley.size().y / 2.0), galley, MUTED);
+    });
+}
+
 fn notice_section(ui: &mut Ui, title: &str, symbol: &str, reason: &str) {
     let text_width = ui.available_width().min(SETTINGS_WIDTH) - 2.0 * CARD_PAD - 58.0;
     let galley = fit(ui, reason, medium(13.5), MUTED, text_width, 8);
@@ -2348,6 +2417,7 @@ fn settings(ui: &mut Ui, app: &App, out: &mut Vec<Action>) {
     let at = pos2(title.left() + (full - width) / 2.0, title.bottom() - 12.0);
     label(ui, at, Align2::LEFT_BOTTOM, "Settings", display(40.0), TEXT, width);
     discord_section(ui, app, out);
+    translation_section(ui, app, out);
     hotkey_section(ui, app, out);
     window_section(ui, app, out);
     overlay_section(ui, app, out);
@@ -2938,6 +3008,26 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
     if lyrics.romanized.iter().any(Option::is_some) && switch_row(ui, vec2(width, 38.0), icon::TRANSLATE, "Show romanization", romanized) {
         out.push(Action::RomanizeLyrics(!romanized));
     }
+    let translated = app.saved.lyrics_translated;
+    if !app.translation_key.is_empty() {
+        if switch_row(ui, vec2(width, 38.0), icon::GLOBE, "Show translation", translated) {
+            out.push(Action::TranslateLyrics(!translated));
+        }
+        let status = match &app.translation {
+            Some((_, _, Translation::Loading)) if translated => Some("Translating...".to_owned()),
+            Some((_, _, Translation::Failed(failure))) if translated => Some(failure.message()),
+            _ => None,
+        };
+        if let Some(status) = status {
+            ui.add_space(2.0);
+            paragraph(ui, &status, sans(12.0), MUTED, 3);
+            ui.add_space(6.0);
+        }
+    }
+    let translations = match &app.translation {
+        Some((_, _, Translation::Ready(lines))) if translated && !app.translation_key.is_empty() => Some(lines),
+        _ => None,
+    };
     let sense = if lyrics.synced { Sense::click() } else { Sense::hover() };
     for (index, (start, line)) in lyrics.lines.iter().enumerate() {
         if line.is_empty() {
@@ -2951,9 +3041,14 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
             .and_then(Option::as_deref)
             .filter(|_| romanized)
             .map(|reading| fit(ui, reading, sans(15.0), TEXT, width, 3));
+        let meaning = translations
+            .and_then(|lines| lines.get(index))
+            .and_then(Option::as_deref)
+            .map(|meaning| fit(ui, meaning, sans(15.0), TEXT, width, 3));
+        let meaning_height = meaning.as_ref().map_or(0.0, |meaning| meaning.size().y + 2.0);
         let reading_height = reading.as_ref().map_or(0.0, |reading| reading.size().y + 2.0);
         let line_height = galley.size().y;
-        let (rect, response) = ui.allocate_exact_size(vec2(width, line_height + reading_height + 14.0), sense);
+        let (rect, response) = ui.allocate_exact_size(vec2(width, line_height + reading_height + meaning_height + 14.0), sense);
         let current = sung == Some(index);
         if current && moved {
             ui.scroll_to_rect(rect, Some(Align::Center));
@@ -2971,6 +3066,12 @@ fn lyrics_view(app: &App, ui: &mut Ui, out: &mut Vec<Action>) {
             let tone = ink.gamma_multiply(0.7);
             ui.painter()
                 .galley_with_override_text_color(rect.min + vec2(0.0, 9.0 + line_height), reading, tone);
+        }
+        if let Some(meaning) = meaning {
+            let tone = ink.gamma_multiply(0.7);
+            let below = 9.0 + line_height + reading_height;
+            ui.painter()
+                .galley_with_override_text_color(rect.min + vec2(0.0, below), meaning, tone);
         }
         if lyrics.synced {
             point_at(&response);

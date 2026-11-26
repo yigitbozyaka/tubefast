@@ -6,3 +6,4 @@
 - The queue panel now shows the whole queue, including songs that already played, and you can click any song to jump to it
 - Podcasts and videos play their original audio instead of an automatically dubbed language
 - Songs that are no longer available are skipped
+- Lyrics can be translated line by line with your own DeepL key, under the original lines, off until you turn it on
